@@ -14,12 +14,10 @@ use crate::gray::Gray16;
 pub enum Command {
     /// 画像の読み込み。これ自体もコマンド履歴の 1 要素として扱う。
     InsertImage { path: PathBuf },
-    /// 画素と実寸法の対応。`x_pixels` 画素が `x_length` `unit` に相当する。
+    /// 画素と実寸法の対応。`pixels` 画素が `length` `unit` に相当する。
     SetScale {
-        x_pixels: f64,
-        x_length: f64,
-        y_pixels: f64,
-        y_length: f64,
+        pixels: f64,
+        length: f64,
         unit: LengthUnit,
     },
     /// 画像サイズ固定・等倍のまま中心まわりに回転（時計回り）。
@@ -31,13 +29,10 @@ pub enum Command {
 impl Command {
     /// メタデータから読んだ画素サイズを、そのままスケール設定コマンドにする。
     pub fn scale_from(scale: Scale) -> Self {
-        let unit = LengthUnit::best_for(scale.nm_per_px_x);
         Self::SetScale {
-            x_pixels: 1.0,
-            x_length: scale.nm_per_px_x / unit.nm(),
-            y_pixels: 1.0,
-            y_length: scale.nm_per_px_y / unit.nm(),
-            unit,
+            pixels: 1.0,
+            length: scale.per_px(),
+            unit: scale.unit,
         }
     }
 
@@ -59,22 +54,23 @@ impl Command {
         }
     }
 
-    /// スケール設定コマンドなら、その内容を nm/px に直したもの。
+    /// スケール設定コマンドなら、その内容を画素の実寸法に直したもの。
     /// 画素数が 0 や負のときなど、値として成り立たない場合は `None`。
+    /// 単位はコマンドのものがそのまま保持され、表示・測長に使われる。
     pub fn scale(&self) -> Option<Scale> {
         let Self::SetScale {
-            x_pixels,
-            x_length,
-            y_pixels,
-            y_length,
+            pixels,
+            length,
             unit,
         } = self
         else {
             return None;
         };
-        let x = x_length * unit.nm() / x_pixels;
-        let y = y_length * unit.nm() / y_pixels;
-        (x.is_finite() && y.is_finite() && x > 0.0 && y > 0.0).then(|| Scale::new(x, y))
+        let nm = length * unit.nm() / pixels;
+        (nm.is_finite() && nm > 0.0).then_some(Scale {
+            nm_per_px: nm,
+            unit: *unit,
+        })
     }
 
     /// 入力画像を必要とするか（`InsertImage` だけが入力なしで動く）。
@@ -149,8 +145,9 @@ impl CommandItem {
     }
 }
 
-/// スケールをコマンドとして持つようになった版が 2。
-pub const HISTORY_FORMAT_VERSION: u32 = 2;
+/// x/y 別々のスケールを廃止し、1 つのスケールと単位を持つようになった版が 3。
+/// （version 2 以前の履歴は構造が違うため読み込まない。）
+pub const HISTORY_FORMAT_VERSION: u32 = 3;
 
 /// `.json` に書き出すコマンド履歴。
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -204,26 +201,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scale_command_converts_pixel_length_pairs() {
+    fn scale_command_converts_pixel_length_pair() {
         // 512 px = 47.9 nm というスケールバー読み取り相当の入力。
         let cmd = Command::SetScale {
-            x_pixels: 512.0,
-            x_length: 47.9,
-            y_pixels: 512.0,
-            y_length: 47.9,
+            pixels: 512.0,
+            length: 47.9,
             unit: LengthUnit::Nanometer,
         };
         let scale = cmd.scale().expect("正の値なので換算できること");
-        assert!((scale.nm_per_px_x - 47.9 / 512.0).abs() < 1e-12);
+        assert!((scale.nm_per_px - 47.9 / 512.0).abs() < 1e-12);
+        assert_eq!(scale.unit, LengthUnit::Nanometer);
     }
 
     #[test]
     fn scale_command_rejects_zero_pixels() {
         let cmd = Command::SetScale {
-            x_pixels: 0.0,
-            x_length: 1.0,
-            y_pixels: 1.0,
-            y_length: 1.0,
+            pixels: 0.0,
+            length: 1.0,
             unit: LengthUnit::Nanometer,
         };
         assert!(cmd.scale().is_none());
@@ -232,10 +226,10 @@ mod tests {
     /// メタデータ由来のスケールが、そのまま読める単位のコマンドになること。
     #[test]
     fn scale_from_metadata_round_trips() {
-        let scale = Scale::new(0.093517, 0.093517);
+        let scale = Scale::new(0.093517);
         let cmd = Command::scale_from(scale);
         let back = cmd.scale().expect("換算できること");
-        assert!((back.nm_per_px_x - scale.nm_per_px_x).abs() < 1e-12);
+        assert!((back.nm_per_px - scale.nm_per_px).abs() < 1e-12);
         assert_eq!(cmd.label(), "スケール設定: 1 px = 0.09352 nm");
     }
 }

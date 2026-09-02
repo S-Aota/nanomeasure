@@ -310,34 +310,51 @@ impl TemApp {
         let doc = &self.docs[self.active];
         if let Some(frame) = doc.result() {
             let img = &frame.image;
-            let scale = frame.scale;
-            let (extent_unit, ex, ey) = scale.extent(img.width, img.height);
-            let (px_unit, nm_x, nm_y) = scale.pixel_size();
-
-            ui.label(format!(
-                "{} × {} px  ({} × {} {})",
-                img.width,
-                img.height,
-                format_length(ex),
-                format_length(ey),
-                extent_unit.label()
-            ));
-            ui.separator();
-            ui.label(format!("{:.0} %", doc.view.zoom * 100.0));
-            ui.separator();
-            ui.label(scale.describe())
-                .on_hover_text("スケール設定コマンドで変更できます");
-            ui.separator();
-            // カーソル位置は画素と実寸法の両方を出す。
-            match (self.last_hover.hover_px, self.last_hover.hover_value) {
-                (Some((x, y)), Some(v)) => ui.monospace(format!(
-                    "({x}, {y}) px = ({}, {}) {}  I={v}",
-                    format_length(x as f64 * nm_x),
-                    format_length(y as f64 * nm_y),
-                    px_unit.label()
-                )),
-                _ => ui.monospace("(-, -)"),
-            };
+            match frame.scale {
+                Some(scale) => {
+                    let (extent_unit, ex, ey) = scale.extent(img.width, img.height);
+                    ui.label(format!(
+                        "{} × {} px  ({} × {} {})",
+                        img.width,
+                        img.height,
+                        format_length(ex),
+                        format_length(ey),
+                        extent_unit.label()
+                    ));
+                    ui.separator();
+                    ui.label(format!("{:.0} %", doc.view.zoom * 100.0));
+                    ui.separator();
+                    ui.label(scale.describe())
+                        .on_hover_text("スケール設定コマンドで変更できます");
+                    ui.separator();
+                    // カーソル位置は画素と実寸法の両方を出す。
+                    let per_px = scale.per_px();
+                    match (self.last_hover.hover_px, self.last_hover.hover_value) {
+                        (Some((x, y)), Some(v)) => ui.monospace(format!(
+                            "({x}, {y}) px = ({}, {}) {}  I={v}",
+                            format_length(x as f64 * per_px),
+                            format_length(y as f64 * per_px),
+                            scale.unit.label()
+                        )),
+                        _ => ui.monospace("(-, -)"),
+                    };
+                }
+                None => {
+                    // スケール未設定の画像は、実寸法を出さず画素のまま扱う。
+                    ui.label(format!("{} × {} px", img.width, img.height));
+                    ui.separator();
+                    ui.label(format!("{:.0} %", doc.view.zoom * 100.0));
+                    ui.separator();
+                    ui.label("スケール未設定").on_hover_text(
+                        "メタデータから画素サイズを読み取れませんでした。スケール設定コマンドで設定すると実寸法を出せます。",
+                    );
+                    ui.separator();
+                    match (self.last_hover.hover_px, self.last_hover.hover_value) {
+                        (Some((x, y)), Some(v)) => ui.monospace(format!("({x}, {y}) px  I={v}")),
+                        _ => ui.monospace("(-, -)"),
+                    };
+                }
+            }
             ui.separator();
         }
         ui.checkbox(&mut self.auto_contrast, "自動コントラスト")
@@ -528,7 +545,7 @@ impl TemApp {
                 ui.label("・ディスク上の画像が更新されたときは、コマンド → 元ファイルを読み直して再計算 を使ってください。");
                 ui.separator();
                 ui.label("・TIFF の FEI / Thermo Fisher タグ、または ImageJ の単位情報から画素の実寸法が読めた場合、画像挿入の直後に「スケール設定」コマンドが自動で追加されます。");
-                ui.label("・読めなかった場合は 1 px = 1 nm として扱われます。コマンド → スケール設定 で、スケールバーから読み取った値を手で入れられます。");
+                ui.label("・読めなかった場合はスケール未設定となり、実寸法は出せません（画素単位のまま）。コマンド → スケール設定 で、スケールバーから読み取った値を手で入れられます。");
             });
         self.help_open = help_open;
 
@@ -711,7 +728,7 @@ impl TemApp {
         self.close_dialogs();
 
         // TIFF タグから画素の実寸法が読めたら、スケール設定コマンドとして残す。
-        // 読めなければ何も足さず、1 px = 1 nm のまま扱う。
+        // 読めなければ何も足さず、スケール未設定 (None) のまま扱う。
         let auto_scale = metadata::read_tiff_scale(&path);
 
         if !self.docs[self.active].is_empty() {
@@ -731,7 +748,7 @@ impl TemApp {
                 "画像を挿入しました（メタデータからスケールを取得: {}）。",
                 scale.describe()
             ),
-            None => "画像を挿入しました（スケール情報なし: 1 px = 1 nm）。".to_owned(),
+            None => "画像を挿入しました（スケール情報なし）。".to_owned(),
         };
     }
 

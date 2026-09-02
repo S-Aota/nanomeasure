@@ -59,9 +59,9 @@ impl Document {
         self.result().map(|f| &f.image)
     }
 
-    /// 現在有効なスケール。スケール設定コマンドが無ければ 1 px = 1 nm。
-    pub fn scale(&self) -> Scale {
-        self.result().map_or_else(Scale::default, |f| f.scale)
+    /// 現在有効なスケール。スケール設定コマンドが無ければ `None`。
+    pub fn scale(&self) -> Option<Scale> {
+        self.result().and_then(|f| f.scale)
     }
 
     /// コマンド `index` に入力される結果（= 直前まで適用したもの）。

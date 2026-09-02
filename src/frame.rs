@@ -2,7 +2,9 @@
 //!
 //! コマンドは「画像 + スケール」の組を受け取って同じ組を返す。スケールを
 //! 画像と一緒に持ち回すことで、スケール設定コマンドの位置に応じて
-//! 以降の処理・表示に効くようになる。
+//! 以降の処理・表示に効くようになる。スケール未設定（メタデータに
+//! 画素サイズが無い等）は `None` で表し、その画像は画素単位でしか
+//! 実寸法を出せない。
 
 use std::sync::Arc;
 
@@ -13,81 +15,63 @@ use crate::gray::Gray16;
 #[derive(Clone)]
 pub struct Frame {
     pub image: Arc<Gray16>,
-    pub scale: Scale,
+    /// このフレームに効いているスケール。未設定なら `None`。
+    pub scale: Option<Scale>,
 }
 
 impl Frame {
     pub fn new(image: Arc<Gray16>) -> Self {
-        Self {
-            image,
-            scale: Scale::default(),
-        }
+        Self { image, scale: None }
     }
 
     /// 画像はそのままに、スケールだけ差し替えた組を返す。
     pub fn with_scale(&self, scale: Scale) -> Self {
         Self {
             image: self.image.clone(),
-            scale,
+            scale: Some(scale),
         }
     }
 }
 
-/// 1 画素あたりの実寸法。x と y を別々に持つ（矩形画素の装置があるため）。
+/// 1 画素あたりの実寸法と、その表示・入力に使う単位。
+/// x と y は同一（正方画素）として 1 つで持つ。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Scale {
-    pub nm_per_px_x: f64,
-    pub nm_per_px_y: f64,
-}
-
-impl Default for Scale {
-    /// スケール未設定のときは 1 px = 1 nm とみなす。
-    fn default() -> Self {
-        Self {
-            nm_per_px_x: 1.0,
-            nm_per_px_y: 1.0,
-        }
-    }
+    /// 1 画素の実寸法（nm）。
+    pub nm_per_px: f64,
+    /// `nm_per_px` を読みやすい形に直したときの単位。ユーザーが
+    /// スケール設定ダイアログで選んだ単位がそのまま保持される。
+    pub unit: LengthUnit,
 }
 
 impl Scale {
-    pub fn new(nm_per_px_x: f64, nm_per_px_y: f64) -> Self {
+    /// nm/px から作る。単位は桁に合うものを自動で選ぶ。
+    pub fn new(nm_per_px: f64) -> Self {
         Self {
-            nm_per_px_x,
-            nm_per_px_y,
+            nm_per_px,
+            unit: LengthUnit::best_for(nm_per_px),
         }
     }
 
-    /// 1 画素の大きさを表示するための単位と、その単位での値。
-    pub fn pixel_size(&self) -> (LengthUnit, f64, f64) {
-        let unit = LengthUnit::best_for(self.nm_per_px_x.max(self.nm_per_px_y));
-        (
-            unit,
-            self.nm_per_px_x / unit.nm(),
-            self.nm_per_px_y / unit.nm(),
-        )
+    /// 1 画素の実寸法を、保持している単位で表した値。
+    pub fn per_px(&self) -> f64 {
+        self.nm_per_px / self.unit.nm()
     }
 
     /// 画像全体の実寸法。1 画素とは桁が違うので、単位は別に選ぶ。
     pub fn extent(&self, width: u32, height: u32) -> (LengthUnit, f64, f64) {
-        let w = width as f64 * self.nm_per_px_x;
-        let h = height as f64 * self.nm_per_px_y;
+        let w = width as f64 * self.nm_per_px;
+        let h = height as f64 * self.nm_per_px;
         let unit = LengthUnit::best_for(w.max(h));
         (unit, w / unit.nm(), h / unit.nm())
     }
 
     pub fn describe(&self) -> String {
-        let (unit, x, y) = self.pixel_size();
-        if (self.nm_per_px_x - self.nm_per_px_y).abs() < f64::EPSILON {
-            format!("1 px = {} {}", format_length(x), unit.label())
-        } else {
-            format!(
-                "1 px = {} × {} {}",
-                format_length(x),
-                format_length(y),
-                unit.label()
-            )
-        }
+        format!(
+            "1 px = {} {}",
+            format_length(self.per_px()),
+            self.unit.label()
+        )
     }
 }
 
@@ -180,20 +164,22 @@ mod tests {
     }
 
     #[test]
-    fn describe_collapses_equal_axes() {
-        assert_eq!(Scale::new(0.5, 0.5).describe(), "1 px = 0.5 nm");
-        assert_eq!(
-            Scale::new(0.093517, 0.093517).describe(),
-            "1 px = 0.09352 nm"
-        );
-        assert!(Scale::new(0.5, 0.48).describe().contains('×'));
+    fn describe_uses_held_unit() {
+        assert_eq!(Scale::new(0.5).describe(), "1 px = 0.5 nm");
+        assert_eq!(Scale::new(0.093517).describe(), "1 px = 0.09352 nm");
+        // 自動選択は nm だが、保持されている単位があればそれが使われる。
+        let scale = Scale {
+            nm_per_px: 500.0,
+            unit: LengthUnit::Micrometer,
+        };
+        assert_eq!(scale.describe(), "1 px = 0.5 µm");
+        assert_eq!(scale.per_px(), 0.5);
     }
 
     /// 1 画素と画像全体は桁が違うので、それぞれに合う単位が選ばれること。
     #[test]
     fn extent_picks_its_own_unit() {
-        let scale = Scale::new(0.093517, 0.093517);
-        assert_eq!(scale.pixel_size().0, LengthUnit::Nanometer);
+        let scale = Scale::new(0.093517);
         let (unit, w, _) = scale.extent(1024, 1024);
         assert_eq!(unit, LengthUnit::Nanometer);
         assert!((w - 95.761).abs() < 1e-2, "{w}");

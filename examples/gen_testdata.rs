@@ -29,7 +29,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write_tiff8(
         &dir.join("carbon_support_8bit.tif"),
         carbon_support(1024),
-        // x と y をわざと変えてある（矩形画素の扱いの確認用）。
+        // x と y をわざと 4% 変えてある。差が 1% を超えると読み取り失敗になる
+        // （異方性を 1 つのスケールへ潰さない）ことの確認用。
         Some((5.0e-10, 4.8e-10)),
     )?;
     // PNG にはスケール情報を持たせない（メタデータが無いときの挙動の確認用）。

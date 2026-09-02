@@ -28,23 +28,35 @@ fn set_command(doc: &mut Document, index: usize, cmd: Command) {
 #[derive(Default)]
 pub struct ScaleDialog {
     pub open: bool,
-    index: usize,
+    /// 編集対象のコマンド。`None` はまだ挿入していない新規設定（空欄スタート）。
+    index: Option<usize>,
     created: bool,
     original: Option<Command>,
-    x_pixels: String,
-    x_length: String,
-    y_pixels: String,
-    y_length: String,
+    pixels: String,
+    length: String,
     unit: LengthUnit,
-    /// X の入力を Y にもそのまま使う。
-    link_axes: bool,
 }
 
 impl ScaleDialog {
+    /// 新しいスケール設定を始める。有効なスケールがあれば、それを
+    /// 編集しやすい値に戻して入れる。無ければ空欄で始める
+    /// （メタデータが無い画像に、勝手な既定値を入れないため）。
     pub fn open_new(&mut self, doc: &mut Document) {
-        // 既定は現在有効なスケール。メタデータ由来の値があればそれが入る。
-        let index = doc.push_command(Command::scale_from(doc.scale()));
-        self.start(doc, index, true);
+        match doc.scale() {
+            Some(scale) => {
+                let index = doc.push_command(Command::scale_from(scale));
+                self.start(doc, index, true);
+            }
+            None => {
+                self.pixels.clear();
+                self.length.clear();
+                self.unit = LengthUnit::Nanometer;
+                self.index = None;
+                self.created = false;
+                self.original = None;
+                self.open = true;
+            }
+        }
     }
 
     pub fn open_edit(&mut self, doc: &mut Document, index: usize) {
@@ -54,21 +66,16 @@ impl ScaleDialog {
     fn start(&mut self, doc: &Document, index: usize, created: bool) {
         let original = doc.commands[index].command.clone();
         if let Command::SetScale {
-            x_pixels,
-            x_length,
-            y_pixels,
-            y_length,
+            pixels,
+            length,
             unit,
         } = original
         {
-            self.x_pixels = format_number(x_pixels);
-            self.x_length = format_number(x_length);
-            self.y_pixels = format_number(y_pixels);
-            self.y_length = format_number(y_length);
+            self.pixels = format_number(pixels);
+            self.length = format_number(length);
             self.unit = unit;
-            self.link_axes = self.x_pixels == self.y_pixels && self.x_length == self.y_length;
         }
-        self.index = index;
+        self.index = Some(index);
         self.created = created;
         self.original = Some(original);
         self.open = true;
@@ -78,7 +85,7 @@ impl ScaleDialog {
         if !self.open {
             return;
         }
-        if self.index >= doc.commands.len() {
+        if self.index.is_some_and(|i| i >= doc.commands.len()) {
             self.open = false;
             return;
         }
@@ -96,37 +103,19 @@ impl ScaleDialog {
                 ui.label("画素数と実寸法の対応を入力してください（スケールバーから読み取った値をそのまま入れられます）。");
                 ui.add_space(8.0);
 
-                egui::Grid::new("scale_grid")
-                    .num_columns(5)
-                    .spacing([6.0, 6.0])
-                    .show(ui, |ui| {
-                        ui.label("X 方向");
-                        ui.add(number_edit(&mut self.x_pixels));
-                        ui.label("px  =");
-                        ui.add(number_edit(&mut self.x_length));
-                        egui::ComboBox::from_id_salt("scale_unit")
-                            .selected_text(self.unit.label())
-                            .width(64.0)
-                            .show_ui(ui, |ui| {
-                                for unit in LengthUnit::ALL {
-                                    ui.selectable_value(&mut self.unit, unit, unit.label());
-                                }
-                            });
-                        ui.end_row();
-
-                        ui.label("Y 方向");
-                        ui.add_enabled(!self.link_axes, number_edit(&mut self.y_pixels));
-                        ui.label("px  =");
-                        ui.add_enabled(!self.link_axes, number_edit(&mut self.y_length));
-                        ui.label(self.unit.label());
-                        ui.end_row();
-                    });
-
-                ui.checkbox(&mut self.link_axes, "Y 方向も X と同じにする");
-                if self.link_axes {
-                    self.y_pixels = self.x_pixels.clone();
-                    self.y_length = self.x_length.clone();
-                }
+                ui.horizontal(|ui| {
+                    ui.add(number_edit(&mut self.pixels));
+                    ui.label("px  =");
+                    ui.add(number_edit(&mut self.length));
+                    egui::ComboBox::from_id_salt("scale_unit")
+                        .selected_text(self.unit.label())
+                        .width(64.0)
+                        .show_ui(ui, |ui| {
+                            for unit in LengthUnit::ALL {
+                                ui.selectable_value(&mut self.unit, unit, unit.label());
+                            }
+                        });
+                });
 
                 ui.add_space(6.0);
                 match self.pending() {
@@ -168,7 +157,15 @@ impl ScaleDialog {
         if let Some(cmd) = self.pending()
             && cmd.scale().is_some()
         {
-            set_command(doc, self.index, cmd);
+            match self.index {
+                Some(index) => set_command(doc, index, cmd),
+                None => {
+                    // 空欄スタートの新規設定は、初めて正しい値が揃った時点で挿入する。
+                    let index = doc.push_command(cmd);
+                    self.index = Some(index);
+                    self.created = true;
+                }
+            }
         }
 
         if cancelled || !window_open {
@@ -183,19 +180,20 @@ impl ScaleDialog {
     /// 現在の入力欄からコマンドを組み立てる。数値として読めなければ `None`。
     fn pending(&self) -> Option<Command> {
         Some(Command::SetScale {
-            x_pixels: self.x_pixels.trim().parse().ok()?,
-            x_length: self.x_length.trim().parse().ok()?,
-            y_pixels: self.y_pixels.trim().parse().ok()?,
-            y_length: self.y_length.trim().parse().ok()?,
+            pixels: self.pixels.trim().parse().ok()?,
+            length: self.length.trim().parse().ok()?,
             unit: self.unit,
         })
     }
 
     fn revert(&mut self, doc: &mut Document) {
+        let Some(index) = self.index else {
+            return;
+        };
         if self.created {
-            doc.remove_command(self.index);
+            doc.remove_command(index);
         } else if let Some(original) = self.original.take() {
-            set_command(doc, self.index, original);
+            set_command(doc, index, original);
         }
     }
 }
