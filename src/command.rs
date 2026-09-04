@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::frame::{Frame, LengthUnit, Scale};
 use crate::gray::Gray16;
+use crate::measure::MeasureData;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -24,6 +25,9 @@ pub enum Command {
     Rotate { angle_deg: f32 },
     /// in_min..in_max の輝度を 0..65535 へ線形に引き伸ばす。
     Levels { in_min: u16, in_max: u16 },
+    /// 測長。画像は変えず、ツール・グループ・フィッティング設定を保持する。
+    /// フィッティングと測定値は適用のたびに再計算される。
+    Measure { data: MeasureData },
 }
 
 impl Command {
@@ -51,6 +55,10 @@ impl Command {
             },
             Self::Rotate { angle_deg } => format!("回転: {angle_deg:.2}°"),
             Self::Levels { in_min, in_max } => format!("レベル補正: {in_min} → {in_max}"),
+            Self::Measure { data } => {
+                let measurements = data.tools.iter().filter(|t| t.is_measurement()).count();
+                format!("測長: グループ {} 件 / 測定 {} 件", data.groups.len(), measurements)
+            }
         }
     }
 
@@ -107,6 +115,9 @@ impl Command {
                     scale: frame.scale,
                 })
             }
+            // 測長は画像を変えない素通しコマンド。オーバーレイと測定値は
+            // アプリ側で MeasureData::compute により毎回再計算される。
+            Self::Measure { .. } => Ok(require_input(input)?.clone()),
         }
     }
 }
@@ -145,9 +156,9 @@ impl CommandItem {
     }
 }
 
-/// x/y 別々のスケールを廃止し、1 つのスケールと単位を持つようになった版が 3。
-/// （version 2 以前の履歴は構造が違うため読み込まない。）
-pub const HISTORY_FORMAT_VERSION: u32 = 3;
+/// 測長コマンドを追加した版が 4。version 3 の履歴はそのまま読める
+/// （追加バリアントは後方互換のため）。version 2 以前は読まない。
+pub const HISTORY_FORMAT_VERSION: u32 = 4;
 
 /// `.json` に書き出すコマンド履歴。
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -231,5 +242,46 @@ mod tests {
         let back = cmd.scale().expect("換算できること");
         assert!((back.nm_per_px - scale.nm_per_px).abs() < 1e-12);
         assert_eq!(cmd.label(), "スケール設定: 1 px = 0.09352 nm");
+    }
+
+    /// version 3 の履歴（測長コマンドなし）はそのまま読めること。
+    #[test]
+    fn version3_history_still_loads() {
+        let json = r#"{
+            "app": "tem_measure",
+            "version": 3,
+            "commands": [
+                {"enabled": true, "command": {"type": "InsertImage", "path": "a.tif"}},
+                {"enabled": true, "command": {"type": "SetScale", "pixels": 1.0, "length": 0.093517, "unit": "nm"}}
+            ]
+        }"#;
+        let file: HistoryFile = serde_json::from_str(json).expect("v3 は読める");
+        assert_eq!(file.commands.len(), 2);
+        assert!(file.processing_only().len() == 1, "画像挿入だけが除かれる");
+    }
+
+    /// 新しい形式は version 判定で拒否されること。
+    #[test]
+    fn newer_version_is_rejected_on_parse() {
+        let json = r#"{"app": "tem_measure", "version": 99, "commands": []}"#;
+        let file: HistoryFile = serde_json::from_str(json).unwrap();
+        assert!(file.version > HISTORY_FORMAT_VERSION);
+    }
+
+    /// 測長コマンドを含む履歴の JSON ラウンドトリップ。
+    #[test]
+    fn measure_command_round_trips() {
+        let mut data = MeasureData::default();
+        data.group_for_new_measurement();
+        let cmd = Command::Measure {
+            data: data.clone(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let back: Command = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, cmd);
+        let Command::Measure { data: d } = back else {
+            panic!("Measure に戻る");
+        };
+        assert_eq!(d, data);
     }
 }

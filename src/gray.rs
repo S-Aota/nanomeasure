@@ -145,6 +145,30 @@ impl Gray16 {
         (top * (1.0 - fy) + bot * fy).round().clamp(0.0, 65535.0) as u16
     }
 
+    /// 範囲外を最外周の画素値で padding する双一次補間サンプリング。
+    /// 測長のフィッティング領域は画像からはみ出すことがあるため、
+    /// 0 埋めの `sample_bilinear` とは別に用意した。
+    pub fn sample_bilinear_clamp(&self, x: f64, y: f64) -> f64 {
+        if self.width == 0 || self.height == 0 {
+            return 0.0;
+        }
+        let (w, h) = (self.width as f64, self.height as f64);
+        let cx = x.clamp(0.0, w - 1.0);
+        let cy = y.clamp(0.0, h - 1.0);
+        let x0 = cx.floor();
+        let y0 = cy.floor();
+        let x1 = (x0 + 1.0).min(w - 1.0);
+        let y1 = (y0 + 1.0).min(h - 1.0);
+        let fx = cx - x0;
+        let fy = cy - y0;
+        let get = |xi: f64, yi: f64| {
+            self.data[(yi as usize) * (self.width as usize) + xi as usize] as f64
+        };
+        let top = get(x0, y0) * (1.0 - fx) + get(x1, y0) * fx;
+        let bot = get(x0, y1) * (1.0 - fx) + get(x1, y1) * fx;
+        top * (1.0 - fy) + bot * fy
+    }
+
     /// `in_min`..`in_max` の輝度を 0..65535 へ線形に引き伸ばす。
     pub fn apply_levels(&self, in_min: u16, in_max: u16) -> Self {
         let lo = in_min.min(in_max);
@@ -291,5 +315,28 @@ mod tests {
         assert_eq!(hist.iter().sum::<u32>(), 4);
         assert_eq!(hist[0], 2);
         assert_eq!(hist[3], 1);
+    }
+
+    #[test]
+    fn clamp_sampling_pads_with_outermost_pixels() {
+        let img = Gray16 {
+            width: 4,
+            height: 4,
+            data: vec![100; 16],
+        };
+        assert_eq!(img.sample_bilinear_clamp(1.5, 1.5), 100.0);
+        // 画像の外側は最外周の画素値で埋まる（0 ではない）。
+        assert_eq!(img.sample_bilinear_clamp(-10.0, -10.0), 100.0);
+        assert_eq!(img.sample_bilinear_clamp(100.0, 100.0), 100.0);
+    }
+
+    #[test]
+    fn clamp_sampling_interpolates() {
+        let mut img = Gray16::black(4, 4);
+        for (i, v) in img.data.iter_mut().enumerate() {
+            *v = (i as u16) * 100;
+        }
+        // (0.5, 0) は値 0 と 100 の中間。
+        assert_eq!(img.sample_bilinear_clamp(0.5, 0.0), 50.0);
     }
 }

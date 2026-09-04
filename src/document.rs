@@ -242,6 +242,10 @@ impl Document {
         let Some(start) = self.dirty_from.take() else {
             return;
         };
+        // 測長のような素通しコマンドの編集では結果画像が変わらない。
+        // テクスチャの作り直し（フル画像の縮小）を毎フレーム発生させない
+        // ため、再計算前後の結果画像を比較して世代を進めるか決める。
+        let before = self.result_image_ptr();
         self.error = None;
         let mut current: Option<Frame> = if start == 0 {
             None
@@ -272,8 +276,16 @@ impl Document {
             }
         }
 
-        self.generation = self.generation.wrapping_add(1);
-        self.cached_min_max = None;
+        let after = self.result_image_ptr();
+        if before != after {
+            self.generation = self.generation.wrapping_add(1);
+            self.cached_min_max = None;
+        }
+    }
+
+    /// 最終結果の画像の同一性判定用ポインタ。
+    fn result_image_ptr(&self) -> Option<*const Gray16> {
+        self.result().map(|f| Arc::as_ptr(&f.image))
     }
 
     /// 表示に使う輝度レンジ。`auto` なら結果画像の実測 min/max に合わせる。

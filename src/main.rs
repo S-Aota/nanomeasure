@@ -8,6 +8,9 @@ mod document;
 mod fonts;
 mod frame;
 mod gray;
+mod measure;
+mod measure_fit;
+mod measure_mode;
 mod metadata;
 mod view;
 

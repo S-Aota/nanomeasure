@@ -54,11 +54,28 @@ impl Default for ImageView {
     }
 }
 
-/// 表示中にカーソル下から拾えた情報（ステータスバー用）。
-#[derive(Default)]
+/// 表示中にカーソル下から拾えた情報（ステータスバー・オーバーレイ用）。
 pub struct ViewInfo {
     pub hover_px: Option<(u32, u32)>,
     pub hover_value: Option<u16>,
+    /// 画像表示領域（vp 相対ではなく画面座標）。
+    pub vp: Rect,
+    /// 画像の画面座標矩形（画像が無ければ None）。画像 px → 画面 px は
+    /// `image_rect.min + pt * zoom` で変換できる。
+    pub image_rect: Option<Rect>,
+    pub zoom: f32,
+}
+
+impl Default for ViewInfo {
+    fn default() -> Self {
+        Self {
+            hover_px: None,
+            hover_value: None,
+            vp: Rect::NOTHING,
+            image_rect: None,
+            zoom: 1.0,
+        }
+    }
 }
 
 impl ImageView {
@@ -67,17 +84,39 @@ impl ImageView {
         self.needs_fit = true;
     }
 
+    /// 表示領域をドラッグした分だけパンする（測長モードが中ドラッグに使う）。
+    pub fn pan_by(&mut self, delta: Vec2) {
+        self.pan += delta;
+    }
+
+    /// `anchor`（表示領域相対の画面座標）を中心にズームする。
+    pub fn zoom_about(&mut self, anchor: Vec2, factor: f32) {
+        let new_zoom = (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+        let image_pt = (anchor - self.pan) / self.zoom;
+        self.pan = anchor - image_pt * new_zoom;
+        self.zoom = new_zoom;
+    }
+
+    /// `interactive` が false のときは画像表示だけを行い、入力処理は
+    /// 呼び出し側（測長モードなど）が引き受ける。
     pub fn show(
         &mut self,
         ui: &mut Ui,
         img: Option<&Arc<Gray16>>,
         generation: u64,
         range: (u16, u16),
+        interactive: bool,
     ) -> ViewInfo {
         let vp = ui.available_rect_before_wrap();
         let response = ui.allocate_rect(vp, Sense::click_and_drag());
         let painter = ui.painter_at(vp);
         painter.rect_filled(vp, 0.0, Color32::from_gray(24));
+
+        let mut info = ViewInfo {
+            vp,
+            zoom: self.zoom,
+            ..Default::default()
+        };
 
         let Some(img) = img else {
             painter.text(
@@ -87,21 +126,24 @@ impl ImageView {
                 egui::FontId::proportional(16.0),
                 Color32::from_gray(140),
             );
-            return ViewInfo::default();
+            return info;
         };
 
         if self.needs_fit {
             self.fit(vp.size(), img);
             self.needs_fit = false;
+            info.zoom = self.zoom;
         }
 
-        self.handle_input(&response, vp);
+        if interactive {
+            self.handle_input(&response, vp);
+        }
         self.update_texture(ui, img, generation, range);
 
-        let mut info = ViewInfo::default();
         if let Some(tex) = &self.tex {
             let size = Vec2::new(img.width as f32, img.height as f32) * self.zoom;
             let image_rect = Rect::from_min_size(vp.min + self.pan, size);
+            info.image_rect = Some(image_rect);
             painter.image(
                 tex.id(),
                 image_rect,
@@ -115,7 +157,9 @@ impl ImageView {
                 egui::StrokeKind::Outside,
             );
 
-            if let Some(pos) = response.hover_pos() {
+            if interactive
+                && let Some(pos) = response.hover_pos()
+            {
                 let rel = (pos - image_rect.min) / self.zoom;
                 if rel.x >= 0.0
                     && rel.y >= 0.0
@@ -147,8 +191,9 @@ impl ImageView {
     fn handle_input(&mut self, response: &egui::Response, vp: Rect) {
         if response.dragged_by(egui::PointerButton::Primary)
             || response.dragged_by(egui::PointerButton::Middle)
+            || response.dragged_by(egui::PointerButton::Secondary)
         {
-            self.pan += response.drag_delta();
+            self.pan_by(response.drag_delta());
         }
 
         if response.hovered() {
@@ -160,13 +205,10 @@ impl ImageView {
                 factor *= (scroll_y * 0.0022).exp();
             }
             if factor != 1.0 {
-                let new_zoom = (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
                 // カーソル位置の画素が動かないようにパンを補正する。
                 let anchor =
                     response.hover_pos().map_or(vp.center(), |p| p).to_vec2() - vp.min.to_vec2();
-                let image_pt = (anchor - self.pan) / self.zoom;
-                self.pan = anchor - image_pt * new_zoom;
-                self.zoom = new_zoom;
+                self.zoom_about(anchor, factor);
             }
         }
 

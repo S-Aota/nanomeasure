@@ -1,0 +1,1723 @@
+//! 測長モード。右の command_panel の位置に測長ツール UI を表示し、
+//! 画像上のクリックでツールを作成する。
+//!
+//! データは `Command::Measure` へ常にライブ反映される（既存ダイアログと
+//! 同じ方式）。決定で確定、キャンセルは確認を経て破棄。ツール操作は
+//! Ctrl+Z / Ctrl+Shift+Z で undo / redo できる。
+
+use egui::{Align2, Color32, Context, FontId, Painter, Pos2, Rect, Sense, Stroke, Ui, Vec2};
+
+use crate::command::Command;
+use crate::dialogs::set_command;
+use crate::document::Document;
+use crate::frame::{format_length, Scale};
+use crate::gray::Gray16;
+use crate::measure::{
+    AngleMode, ComputedMeasure, ComputedTool, FitMode, FitSettings, MeasureData, MeasureTool,
+    NewMeasureMode, Pt2, SnapLine, ToolKind, format_measurement, snap_angle_four, snap_distance,
+};
+use crate::view::ViewInfo;
+
+/// undo / redo スタックの深さ上限。
+const UNDO_LIMIT: usize = 100;
+
+/// スナップ判定のしきい値（画面 px）。ズームによらず操作感を一定にする。
+const SNAP_PX: f32 = 10.0;
+
+/// 配置済みツールの選択判定のしきい値（画面 px）。端点・線分の両方に使う。
+/// 画面 px 基準なので表示倍率を考慮した扱いになり、拡大しても画面上の
+/// 判定半径は変わらない。
+const PICK_PX: f32 = 20.0;
+
+/// 二点間測長（赤）。
+const COLOR_DISTANCE: Color32 = Color32::from_rgb(235, 70, 70);
+/// 境界線・オフセット線（紫）。
+const COLOR_GUIDE: Color32 = Color32::from_rgb(175, 90, 235);
+/// フィッティング領域の枠。フィッティング設定 1〜3 に合わせて色を変える。
+const COLOR_REGION_OFF: Color32 = Color32::from_rgb(240, 160, 60); // 1: オレンジ
+const COLOR_REGION_GAUSSIAN: Color32 = Color32::from_rgb(90, 180, 240); // 2: 水色
+const COLOR_REGION_DERIV: Color32 = Color32::from_rgb(150, 220, 90); // 3: 黄緑
+/// 作成中・選択中の一時表示（橙）。
+const COLOR_IN_PROGRESS: Color32 = Color32::from_rgb(255, 150, 60);
+
+fn region_color(mode: FitMode) -> Color32 {
+    match mode {
+        FitMode::Off => COLOR_REGION_OFF,
+        FitMode::Gaussian => COLOR_REGION_GAUSSIAN,
+        FitMode::DerivativeGaussian => COLOR_REGION_DERIV,
+    }
+}
+
+/// 作成中のツールの状態（未確定なので data.tools には入っていない）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum InProgress {
+    /// 端点 1 を置いた後の二点間測長。p1_line はスナップ中の直線。
+    Distance { p1: Pt2, p1_line: Option<SnapLine> },
+    /// 端点 1 を置いた後の境界線。
+    Boundary { p1: Pt2 },
+    /// オフセット線: 選択した境界線と現在の距離（符号付き px）。
+    OffsetPick { source: u64, distance: f64 },
+    /// 直線複製: 元ツール、ドラッグ開始位置・現在位置、複製数。
+    LinearDuplicate {
+        src: u64,
+        start: Pt2,
+        current: Pt2,
+        count: usize,
+    },
+}
+
+/// ツールボタンの選択。None は非選択状態（Esc で解除、パンが使える）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ToolButton {
+    #[default]
+    Distance,
+    Boundary,
+    Offset,
+    LinearDuplicate,
+}
+
+impl ToolButton {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Distance => "二点間測長",
+            Self::Boundary => "境界線",
+            Self::Offset => "オフセット線",
+            Self::LinearDuplicate => "直線複製",
+        }
+    }
+}
+
+/// 移動する端点の側。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EndpointWhich {
+    P1,
+    P2,
+}
+
+/// 非選択状態で選択したツールのドラッグ移動の状態。
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Drag {
+    /// 端点だけを動かす（もう片方の端点は固定）。
+    Endpoint { id: u64, which: EndpointWhich },
+    /// ツール全体を平行移動する。
+    Whole {
+        id: u64,
+        start: Pt2,
+        orig_p1: Pt2,
+        orig_p2: Pt2,
+    },
+}
+
+/// フィッティング設定ポップアップの編集対象（ツールごとの設定を持つ）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FitPopupTarget {
+    /// 二点間測長の端点 1 / 端点 2。
+    Dist1 { tool: u64 },
+    Dist2 { tool: u64 },
+    /// 境界線。
+    Boundary { tool: u64 },
+}
+
+/// 結果リストの UI から集めた操作（描画中は data を借りているため後処理する）。
+enum ResultAction {
+    SelectNewGroup,
+    SelectGroup(u64),
+    BeginRename(u64),
+    Rename(u64, String),
+    DeleteTool(u64),
+    /// 全グループの統計データをクリップボードへコピー。
+    CopyStats,
+    /// 1 グループの測長結果一覧をクリップボードへコピー。
+    CopyGroupData(u64),
+}
+
+#[derive(Default)]
+pub struct MeasureMode {
+    pub open: bool,
+    /// 編集対象のタブとコマンド行。
+    pub(crate) tab: usize,
+    index: usize,
+    created: bool,
+    original: Option<Command>,
+    /// 作業コピー。変更は常に doc 側のコマンドへライブ反映する。
+    data: MeasureData,
+    /// 選択中のツールボタン。None = 非選択（Esc で解除、左ドラッグでパン）。
+    tool: Option<ToolButton>,
+    /// 二点間測長のフィッティング設定 UI で端点 1/2 のどちらを表示するか。
+    ep_tab: bool,
+    /// 非選択状態で選択した配置済みツール。
+    selected: Option<u64>,
+    /// 選択ツールのドラッグ移動中。
+    drag: Option<Drag>,
+    /// フィッティング設定ポップアップの編集対象。
+    popup: Option<FitPopupTarget>,
+    undo: Vec<MeasureData>,
+    redo: Vec<MeasureData>,
+    /// キャンセルの確認モーダルを表示中か。
+    confirm_cancel: bool,
+    /// 名前編集中のグループ（id）。
+    rename: Option<u64>,
+    rename_text: String,
+    /// 作成中のツール（端点 1 だけ置かれたものや、選択中の元ツール）。
+    in_progress: Option<InProgress>,
+    /// 直線複製のホイール入力の累積（20.0 たまるごとに複製数を 1 増減）。
+    scroll_accum: f32,
+}
+
+impl MeasureMode {
+    /// ツール未選択で、作成・選択・ドラッグのいずれも無い状態か。
+    /// この状態では左ドラッグを通常のパンに使える（app 側で判定）。
+    pub fn is_idle(&self) -> bool {
+        self.tool.is_none()
+            && self.selected.is_none()
+            && self.drag.is_none()
+            && self.in_progress.is_none()
+    }
+}
+
+impl MeasureMode {
+    /// 新しい測長コマンドを追加してモードに入る。
+    pub fn open_new(&mut self, doc: &mut Document, tab: usize) {
+        let index = doc.push_command(Command::Measure {
+            data: MeasureData::default(),
+        });
+        self.start(doc, tab, index, true);
+    }
+
+    /// 既存の測長コマンドを編集する。
+    pub fn open_edit(&mut self, doc: &mut Document, tab: usize, index: usize) {
+        self.start(doc, tab, index, false);
+    }
+
+    fn start(&mut self, doc: &Document, tab: usize, index: usize, created: bool) {
+        let original = doc.commands[index].command.clone();
+        self.data = match &original {
+            Command::Measure { data } => data.clone(),
+            _ => MeasureData::default(),
+        };
+        self.tab = tab;
+        self.index = index;
+        self.created = created;
+        self.original = Some(original);
+        self.open = true;
+        self.tool = None;
+        self.ep_tab = false;
+        self.selected = None;
+        self.drag = None;
+        self.popup = None;
+        self.undo.clear();
+        self.redo.clear();
+        self.confirm_cancel = false;
+        self.rename = None;
+        self.rename_text.clear();
+        self.in_progress = None;
+        self.scroll_accum = 0.0;
+    }
+
+    /// 編集を破棄してモードを閉じる（新規分のコマンドは取り除く）。
+    pub fn revert(&mut self, doc: &mut Document) {
+        if !self.open {
+            return;
+        }
+        if self.index < doc.commands.len()
+            && matches!(doc.commands[self.index].command, Command::Measure { .. })
+        {
+            if self.created {
+                doc.remove_command(self.index);
+            } else if let Some(original) = self.original.take() {
+                set_command(doc, self.index, original);
+            }
+        }
+        self.open = false;
+        self.undo.clear();
+        self.redo.clear();
+    }
+
+    fn finish(&mut self) {
+        self.original = None;
+        self.open = false;
+        self.undo.clear();
+        self.redo.clear();
+    }
+
+    // -------------------------------------------------- undo / redo
+
+    /// 1 論理操作の記録を開始する（スライダーのドラッグ開始時などに呼ぶ）。
+    fn begin_change(&mut self) {
+        self.undo.push(self.data.clone());
+        if self.undo.len() > UNDO_LIMIT {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+    }
+
+    /// 記録済みの変更を doc 側へ反映する。
+    fn apply_change(&mut self, doc: &mut Document) {
+        set_command(
+            doc,
+            self.index,
+            Command::Measure {
+                data: self.data.clone(),
+            },
+        );
+    }
+
+    /// クリック 1 回で完結する変更（ラジオ選択など）。
+    fn change_once(&mut self, doc: &mut Document) {
+        self.begin_change();
+        self.apply_change(doc);
+    }
+
+    /// 現状を undo に積んでから変更を適用する（ツール追加・削除など）。
+    fn mutate(&mut self, doc: &mut Document, f: impl FnOnce(&mut MeasureData)) {
+        self.begin_change();
+        f(&mut self.data);
+        self.apply_change(doc);
+    }
+
+    pub fn handle_shortcuts(&mut self, ctx: &Context, doc: &mut Document) {
+        if ctx.egui_wants_keyboard_input() {
+            return;
+        }
+        let undo = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Z);
+        let redo = egui::KeyboardShortcut::new(
+            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+            egui::Key::Z,
+        );
+        if ctx.input_mut(|i| i.consume_shortcut(&undo)) {
+            self.undo(doc);
+        }
+        if ctx.input_mut(|i| i.consume_shortcut(&redo)) {
+            self.redo(doc);
+        }
+    }
+
+    fn undo(&mut self, doc: &mut Document) {
+        if let Some(prev) = self.undo.pop() {
+            self.redo.push(self.data.clone());
+            if self.redo.len() > UNDO_LIMIT {
+                self.redo.remove(0);
+            }
+            self.data = prev;
+            self.apply_change(doc);
+        }
+    }
+
+    fn redo(&mut self, doc: &mut Document) {
+        if let Some(next) = self.redo.pop() {
+            self.undo.push(self.data.clone());
+            if self.undo.len() > UNDO_LIMIT {
+                self.undo.remove(0);
+            }
+            self.data = next;
+            self.apply_change(doc);
+        }
+    }
+
+    // ------------------------------------------------------ パネル UI
+
+    /// 右パネル（command_panel と同じ場所）に測長 UI を表示する。
+    pub fn show_panel(&mut self, ui: &mut Ui, doc: &mut Document) {
+        if !self.open {
+            return;
+        }
+        // 編集中にコマンド行が消えたり差し替わったら閉じる。
+        if self.index >= doc.commands.len()
+            || !matches!(doc.commands[self.index].command, Command::Measure { .. })
+        {
+            self.open = false;
+            return;
+        }
+
+        let mut confirmed = false;
+        let mut cancel_requested = false;
+
+        egui::Panel::right("command_panel")
+            .resizable(true)
+            .default_size(300.0)
+            .min_size(220.0)
+            .show(ui, |ui| {
+                ui.add_space(4.0);
+                ui.strong("測長");
+                ui.separator();
+
+                self.settings_ui(ui, doc);
+                ui.separator();
+                self.tools_ui(ui, doc);
+                ui.separator();
+
+                // 決定・キャンセルは最下部に固定し、残りの高さを結果リストに使う。
+                egui::Panel::bottom("measure_confirm_buttons").show(ui, |ui| {
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("決定").clicked() {
+                            confirmed = true;
+                        }
+                        if ui.button("キャンセル").clicked() {
+                            cancel_requested = true;
+                        }
+                    });
+                    ui.add_space(2.0);
+                });
+                self.results_ui(ui, doc);
+            });
+
+        if confirmed {
+            self.finish();
+        } else if cancel_requested {
+            // 変更が無ければそのまま破棄してよい。
+            let unchanged = self
+                .original
+                .as_ref()
+                .is_some_and(|o| o == &Command::Measure { data: self.data.clone() });
+            if unchanged {
+                self.revert(doc);
+            } else {
+                self.confirm_cancel = true;
+            }
+        }
+    }
+
+    /// フィッティング領域をダブルクリック/右クリックしたときに開く
+    /// 設定ポップアップ。
+    pub fn show_fit_popup(&mut self, ctx: &Context, doc: &mut Document) {
+        let Some(target) = self.popup else {
+            return;
+        };
+        let mut open = true;
+        let mut outcome = FitUiOutcome::default();
+        let mut target_gone = false;
+        egui::Window::new("端点のフィッティング設定")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label("この端点のフィッティング方法と検出領域を変更できます。");
+                ui.add_space(4.0);
+                // ツールごとの設定を直接編集する（この測長だけに効く）。
+                let fit = match target {
+                    FitPopupTarget::Dist1 { tool } => self
+                        .data
+                        .tools
+                        .iter_mut()
+                        .find(|t| t.id() == tool)
+                        .and_then(|t| match t {
+                            MeasureTool::Distance { fit1, .. } => Some(fit1),
+                            _ => None,
+                        }),
+                    FitPopupTarget::Dist2 { tool } => self
+                        .data
+                        .tools
+                        .iter_mut()
+                        .find(|t| t.id() == tool)
+                        .and_then(|t| match t {
+                            MeasureTool::Distance { fit2, .. } => Some(fit2),
+                            _ => None,
+                        }),
+                    FitPopupTarget::Boundary { tool } => self
+                        .data
+                        .tools
+                        .iter_mut()
+                        .find(|t| t.id() == tool)
+                        .and_then(|t| match t {
+                            MeasureTool::Boundary { fit, .. } => Some(fit),
+                            _ => None,
+                        }),
+                };
+                match fit {
+                    Some(fit) => outcome = fit_settings_ui(ui, fit),
+                    // 対象のツールが消えていたら閉じる。
+                    None => target_gone = true,
+                }
+            });
+        if !open || target_gone {
+            self.popup = None;
+        }
+        self.handle_fit_outcome(doc, outcome);
+    }
+
+    /// キャンセルの確認モーダル。
+    pub fn show_confirm_modal(&mut self, ctx: &Context, doc: &mut Document) {
+        if !self.confirm_cancel || !self.open {
+            return;
+        }
+        let mut close = false;
+        let mut confirmed = false;
+        egui::Window::new("キャンセルの確認")
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label("編集内容を保存せずに測長モードを終了しますか？");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("はい").clicked() {
+                        confirmed = true;
+                        close = true;
+                    }
+                    if ui.button("いいえ").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if close {
+            self.confirm_cancel = false;
+        }
+        if confirmed {
+            self.revert(doc);
+        }
+    }
+
+    fn settings_ui(&mut self, ui: &mut Ui, doc: &mut Document) {
+        ui.strong("設定");
+        ui.horizontal(|ui| {
+            ui.label("角度:");
+            if ui
+                .radio_value(&mut self.data.prefs.angle, AngleMode::FourDir, "4方向")
+                .changed()
+                || ui
+                    .radio_value(&mut self.data.prefs.angle, AngleMode::Free, "自由")
+                    .changed()
+            {
+                self.change_once(doc);
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("スナップ:");
+            if ui
+                .radio_value(&mut self.data.prefs.snap, true, "on")
+                .changed()
+                || ui
+                    .radio_value(&mut self.data.prefs.snap, false, "off")
+                    .changed()
+            {
+                self.change_once(doc);
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("新規測長:");
+            if ui
+                .radio_value(
+                    &mut self.data.prefs.new_measure,
+                    NewMeasureMode::NewGroup,
+                    "グループを追加",
+                )
+                .changed()
+                || ui
+                    .radio_value(
+                        &mut self.data.prefs.new_measure,
+                        NewMeasureMode::Keep,
+                        "そのまま",
+                    )
+                    .changed()
+            {
+                self.change_once(doc);
+            }
+        });
+    }
+
+    fn tools_ui(&mut self, ui: &mut Ui, doc: &mut Document) {
+        ui.strong("ツール");
+        ui.add_space(2.0);
+        // 章ごとに分けて配置する。
+        ui.label(egui::RichText::new("測長").small().weak());
+        ui.horizontal(|ui| {
+            ui.add_space(12.0);
+            self.tool_button(ui, ToolButton::Distance);
+        });
+        ui.label(egui::RichText::new("補助線").small().weak());
+        ui.horizontal(|ui| {
+            ui.add_space(12.0);
+            self.tool_button(ui, ToolButton::Boundary);
+            self.tool_button(ui, ToolButton::Offset);
+        });
+        ui.label(egui::RichText::new("複製").small().weak());
+        ui.horizontal(|ui| {
+            ui.add_space(12.0);
+            self.tool_button(ui, ToolButton::LinearDuplicate);
+        });
+        ui.add_space(4.0);
+
+        // フィッティング設定（二点間測長と境界線のみ）。
+        match self.tool {
+            Some(ToolButton::Distance) => {
+                ui.weak("新しく作る測長の既定値。個別の変更は画像上の領域をダブルクリック");
+                ui.horizontal(|ui| {
+                    ui.label("端点:");
+                    if ui.selectable_label(!self.ep_tab, "1").clicked() {
+                        self.ep_tab = false;
+                    }
+                    if ui.selectable_label(self.ep_tab, "2").clicked() {
+                        self.ep_tab = true;
+                    }
+                });
+                let outcome = if self.ep_tab {
+                    fit_settings_ui(ui, &mut self.data.dist_fit2)
+                } else {
+                    fit_settings_ui(ui, &mut self.data.dist_fit1)
+                };
+                self.handle_fit_outcome(doc, outcome);
+            }
+            Some(ToolButton::Boundary) => {
+                ui.weak("新しく作る境界線の既定値。個別の変更は画像上の領域をダブルクリック");
+                let outcome = fit_settings_ui(ui, &mut self.data.boundary_fit);
+                self.handle_fit_outcome(doc, outcome);
+            }
+            Some(ToolButton::Offset) => {
+                ui.weak("画像上の境界線をクリック → クリックで距離を決定");
+                self.offset_fine_tune_ui(ui, doc);
+            }
+            Some(ToolButton::LinearDuplicate) => {
+                ui.weak("測長・境界線をクリック → マウス移動で方向と距離を指定 → クリックで確定。ホイールで複製数 (1-20)");
+            }
+            None => {
+                ui.weak("画像上の測長・境界線をクリックで選択（ドラッグで移動、Esc で解除）");
+            }
+        }
+    }
+
+    fn tool_button(&mut self, ui: &mut Ui, tool: ToolButton) {
+        let selected = self.tool == Some(tool);
+        if ui.selectable_label(selected, tool.label()).clicked() {
+            // もう一度押すと選択解除（Esc と同じ）。
+            self.tool = if selected { None } else { Some(tool) };
+            self.in_progress = None;
+            self.selected = None;
+            self.drag = None;
+        }
+    }
+
+    fn handle_fit_outcome(&mut self, doc: &mut Document, outcome: FitUiOutcome) {
+        if outcome.began_change || outcome.committed {
+            self.begin_change();
+        }
+        if outcome.changed || outcome.committed {
+            self.apply_change(doc);
+        }
+    }
+
+    /// 最後に作成したオフセット線の距離を数値で微調整する。
+    fn offset_fine_tune_ui(&mut self, ui: &mut Ui, doc: &mut Document) {
+        let last = self
+            .data
+            .tools
+            .iter()
+            .rev()
+            .find_map(|t| match t {
+                MeasureTool::Offset { id, distance, .. } => Some((*id, *distance)),
+                _ => None,
+            });
+        let Some((id, mut distance)) = last else {
+            return;
+        };
+        ui.horizontal(|ui| {
+            ui.label("オフセット:");
+            let resp = ui.add(egui::DragValue::new(&mut distance).speed(0.5));
+            if resp.drag_started() {
+                self.begin_change();
+            }
+            if resp.changed() {
+                if let Some(t) = self.data.tools.iter_mut().find(|t| t.id() == id)
+                    && let MeasureTool::Offset { distance: d, .. } = t
+                {
+                    *d = distance;
+                }
+                self.apply_change(doc);
+            }
+            ui.label("px");
+        });
+    }
+
+    fn results_ui(&mut self, ui: &mut Ui, doc: &mut Document) {
+        ui.strong("測定結果");
+        let (img, scale) = match doc.input_to(self.index) {
+            Some(frame) => (frame.image.clone(), frame.scale),
+            None => return,
+        };
+        let computed = self.data.compute(&img, scale);
+        let mut actions = Vec::new();
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                // 特殊行 "new group"。チェックされていたら新測定でグループ生成。
+                if ui
+                    .radio(self.data.active_group.is_none(), "new group")
+                    .clicked()
+                {
+                    actions.push(ResultAction::SelectNewGroup);
+                }
+
+                for g in &self.data.groups {
+                    let gid = g.id;
+                    let selected = self.data.active_group == Some(gid);
+                    ui.horizontal(|ui| {
+                        if ui.radio(selected, "").clicked() {
+                            actions.push(ResultAction::SelectGroup(gid));
+                        }
+                        if self.rename == Some(gid) {
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(&mut self.rename_text)
+                                    .desired_width(110.0),
+                            );
+                            if resp.lost_focus()
+                                && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                            {
+                                actions.push(ResultAction::Rename(
+                                    gid,
+                                    self.rename_text.trim().to_owned(),
+                                ));
+                            } else if resp.lost_focus() {
+                                // Enter 以外（Esc やクリック逸れ）は名前変更を取り消す。
+                                actions.push(ResultAction::Rename(gid, String::new()));
+                            }
+                        } else {
+                            let name = if g.name.is_empty() {
+                                "(名前なし)".to_owned()
+                            } else {
+                                g.name.clone()
+                            };
+                            let resp = ui
+                                .add(egui::Label::new(name).sense(egui::Sense::click()))
+                                .on_hover_text("ダブルクリックで名前を変更。右クリックでコピー");
+                            if resp.double_clicked() {
+                                actions.push(ResultAction::BeginRename(gid));
+                            }
+                            // 右クリックメニュー: クリップボードへのコピー。
+                            resp.context_menu(|ui| {
+                                if ui.button("統計データをコピー").clicked() {
+                                    ui.close();
+                                    actions.push(ResultAction::CopyStats);
+                                }
+                                let has_data = !self.data.group_tools(gid).is_empty();
+                                if ui
+                                    .add_enabled(
+                                        has_data,
+                                        egui::Button::new("データ一覧をコピー"),
+                                    )
+                                    .on_disabled_hover_text("このグループに測長結果はありません")
+                                    .clicked()
+                                {
+                                    ui.close();
+                                    actions.push(ResultAction::CopyGroupData(gid));
+                                }
+                            });
+                        }
+                        if let Some(stat) = group_stat(&computed, gid, scale) {
+                            ui.label(egui::RichText::new(stat).weak());
+                        }
+                    });
+
+                    // グループ内の測定結果（インデント + 自動採番）。
+                    for (n, tid) in self.data.group_tools(gid).iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.add_space(24.0);
+                            match computed.by_id(*tid) {
+                                Some(t) => {
+                                    let value = t
+                                        .length_px
+                                        .map(|l| format_measurement(l, scale))
+                                        .unwrap_or_default();
+                                    ui.label(format!("#{}  {}", n + 1, value));
+                                }
+                                None => {
+                                    ui.label(format!("#{}", n + 1));
+                                }
+                            }
+                            if ui
+                                .small_button("×")
+                                .on_hover_text("この測定を削除")
+                                .clicked()
+                            {
+                                actions.push(ResultAction::DeleteTool(*tid));
+                            }
+                        });
+                    }
+                }
+            });
+
+        for action in actions {
+            match action {
+                ResultAction::SelectNewGroup => {
+                    self.data.active_group = None;
+                    self.apply_change(doc);
+                }
+                ResultAction::SelectGroup(gid) => {
+                    self.data.active_group = Some(gid);
+                    self.apply_change(doc);
+                }
+                ResultAction::BeginRename(gid) => {
+                    self.rename = Some(gid);
+                    self.rename_text = self
+                        .data
+                        .groups
+                        .iter()
+                        .find(|g| g.id == gid)
+                        .map(|g| g.name.clone())
+                        .unwrap_or_default();
+                }
+                ResultAction::Rename(gid, name) => {
+                    self.rename = None;
+                    if !name.is_empty() {
+                        // 空文字列はキャンセル扱い（名前を空にはしない）。
+                        self.mutate(doc, |data| {
+                            if let Some(g) = data.groups.iter_mut().find(|g| g.id == gid) {
+                                g.name = name;
+                            }
+                        });
+                    }
+                }
+                ResultAction::DeleteTool(id) => {
+                    // オフセット線がこのツールを参照していたら一緒に消す。
+                    let ids: Vec<u64> = self
+                        .data
+                        .tools
+                        .iter()
+                        .filter(|t| {
+                            matches!(t, MeasureTool::Offset { source, .. } if *source == id)
+                        })
+                        .map(|t| t.id())
+                        .collect();
+                    self.mutate(doc, |data| {
+                        data.tools
+                            .retain(|t| t.id() != id && !ids.contains(&t.id()));
+                    });
+                }
+                ResultAction::CopyStats => {
+                    ui.ctx().copy_text(stats_csv(&self.data, &computed, scale));
+                }
+                ResultAction::CopyGroupData(gid) => {
+                    ui.ctx().copy_text(group_data_csv(gid, &self.data, &computed, scale));
+                }
+            }
+        }
+    }
+}
+
+/// フィッティング設定 UI の変更検出結果。
+#[derive(Default)]
+struct FitUiOutcome {
+    /// スライダーのドラッグが始まった（この 1 操作の記録を開始する）。
+    began_change: bool,
+    /// 値が変わった（doc へ反映する）。
+    changed: bool,
+    /// ラジオのクリック（1 クリック = 1 操作として即記録）。
+    committed: bool,
+}
+
+/// フィッティング設定の共通 UI。
+fn fit_settings_ui(ui: &mut Ui, settings: &mut FitSettings) -> FitUiOutcome {
+    let mut outcome = FitUiOutcome::default();
+    for (label, mode) in [
+        ("1. クリック位置そのまま", FitMode::Off),
+        ("2. ガウシアン（境界線検出）", FitMode::Gaussian),
+        ("3. 微分ガウシアン（ステップ）", FitMode::DerivativeGaussian),
+    ] {
+        if ui.radio_value(&mut settings.mode, mode, label).changed() {
+            outcome.committed = true;
+        }
+    }
+    let w = ui.add(egui::Slider::new(&mut settings.width_px, 1..=20).text("検出領域の横"));
+    if w.drag_started() {
+        outcome.began_change = true;
+    }
+    if w.changed() {
+        outcome.changed = true;
+    }
+    let l = ui.add(egui::Slider::new(&mut settings.length_px, 1..=50).text("検出領域の縦"));
+    if l.drag_started() {
+        outcome.began_change = true;
+    }
+    if l.changed() {
+        outcome.changed = true;
+    }
+    outcome
+}
+
+/// 単位なしの数値文字列（スケールがあれば実寸の値、なければ px）。
+fn value_number(px: f64, scale: Option<Scale>) -> String {
+    match scale {
+        Some(s) => format_length(px * s.per_px()),
+        None => format_length(px),
+    }
+}
+
+/// CSV の 1 フィールド（カンマ・引用符・改行を含む名前は引用符で囲む）。
+fn csv_field(s: &str) -> String {
+    if s.contains(',') || s.contains('"') || s.contains('\n') {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_owned()
+    }
+}
+
+/// 全グループの統計データを CSV にする。
+/// ヘッダー: グループ名, サンプル数, 平均, 標準偏差（単位なし・実寸の値）。
+fn stats_csv(data: &MeasureData, computed: &ComputedMeasure, scale: Option<Scale>) -> String {
+    let mut out = String::from("グループ名, サンプル数, 平均, 標準偏差\n");
+    for g in &data.groups {
+        let values: Vec<f64> = computed
+            .tools
+            .iter()
+            .filter(|t| t.group == Some(g.id) && t.kind == ToolKind::Distance)
+            .filter_map(|t| t.length_px)
+            .collect();
+        if values.is_empty() {
+            // 測長結果の無いグループは行を出さない。
+            continue;
+        }
+        let n = values.len();
+        let mean = values.iter().sum::<f64>() / n as f64;
+        let sd = if n < 2 {
+            String::new()
+        } else {
+            let var = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n - 1) as f64;
+            value_number(var.sqrt(), scale)
+        };
+        out += &format!(
+            "{}, {}, {}, {}\n",
+            csv_field(&g.name),
+            n,
+            value_number(mean, scale),
+            sd,
+        );
+    }
+    out
+}
+
+/// 1 グループの測長結果一覧を CSV にする。ヘッダー: 番号, 値。
+fn group_data_csv(
+    gid: u64,
+    data: &MeasureData,
+    computed: &ComputedMeasure,
+    scale: Option<Scale>,
+) -> String {
+    let mut out = String::from("番号, 値\n");
+    for (n, tid) in data.group_tools(gid).iter().enumerate() {
+        if let Some(t) = computed.by_id(*tid)
+            && let Some(len) = t.length_px
+        {
+            out += &format!("{}, {}\n", n + 1, value_number(len, scale));
+        }
+    }
+    out
+}
+
+/// グループの平均と標準偏差（標本 n−1）をまとめた表示文字列。
+fn group_stat(
+    computed: &crate::measure::ComputedMeasure,
+    gid: u64,
+    scale: Option<crate::frame::Scale>,
+) -> Option<String> {
+    let values: Vec<f64> = computed
+        .tools
+        .iter()
+        .filter(|t| t.group == Some(gid) && t.kind == ToolKind::Distance)
+        .filter_map(|t| t.length_px)
+        .collect();
+    if values.is_empty() {
+        return None;
+    }
+    let n = values.len();
+    let mean = values.iter().sum::<f64>() / n as f64;
+    let avg = format_measurement(mean, scale);
+    if n < 2 {
+        return Some(format!("{avg} (n=1)"));
+    }
+    let var = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n - 1) as f64;
+    let sigma = format_measurement(var.sqrt(), scale);
+    Some(format!("平均 {avg}  σ {sigma} (n={n})"))
+}
+
+// ------------------------------------------------------ オーバーレイ描画
+
+/// 画像 px → 画面座標。
+fn to_screen(info: &ViewInfo, p: Pt2) -> Pos2 {
+    let rect = info.image_rect.unwrap_or(Rect::NOTHING);
+    rect.min + Vec2::new(p.x as f32, p.y as f32) * info.zoom
+}
+
+/// 画面座標 → 画像 px（画像の外なら None）。
+fn to_image(info: &ViewInfo, pos: Pos2) -> Option<Pt2> {
+    let rect = info.image_rect?;
+    let p = (pos - rect.min) / info.zoom;
+    Some(Pt2::new(p.x as f64, p.y as f64))
+}
+
+/// 確定済みの測長コマンド（または測長モードの編集中データ）を画像に重ねて描く。
+pub fn draw_computed(
+    painter: &Painter,
+    info: &ViewInfo,
+    computed: &ComputedMeasure,
+    scale: Option<Scale>,
+) {
+    if info.image_rect.is_none() {
+        return;
+    }
+    for t in &computed.tools {
+        // フィッティング領域の枠（点線）。色はフィッティング設定で変える。
+        for region in &t.fit_regions {
+            let pts: Vec<Pos2> = region.corners().iter().map(|&c| to_screen(info, c)).collect();
+            painter.add(egui::Shape::dashed_line(
+                &[pts[0], pts[1], pts[2], pts[3], pts[0]],
+                Stroke::new(1.5, region_color(region.mode)),
+                6.0,
+                5.0,
+            ));
+        }
+        match t.kind {
+            ToolKind::Distance => {
+                let a = to_screen(info, t.p1);
+                let b = to_screen(info, t.p2);
+                draw_line_and_arrows(painter, a, b, COLOR_DISTANCE);
+                if let Some(len) = t.length_px {
+                    draw_value_label(painter, a, b, format_measurement(len, scale), COLOR_DISTANCE);
+                }
+            }
+            ToolKind::Boundary => {
+                // 長さは結果リストに出るので、画像中には描かない。
+                let a = to_screen(info, t.p1);
+                let b = to_screen(info, t.p2);
+                painter.line_segment([a, b], Stroke::new(2.0, COLOR_GUIDE));
+            }
+            ToolKind::Offset => {
+                // 元の境界線と同じ長さの線分。オフセット距離を画像中に表示する。
+                let a = to_screen(info, t.p1);
+                let b = to_screen(info, t.p2);
+                painter.line_segment([a, b], Stroke::new(1.5, COLOR_GUIDE));
+                if let Some(d) = t.distance_px {
+                    let sign = if d >= 0.0 { "+" } else { "-" };
+                    let text = format!("{sign}{}", format_measurement(d.abs(), scale));
+                    draw_value_label(painter, a, b, text, COLOR_GUIDE);
+                }
+            }
+        }
+    }
+}
+
+/// 線と両端の矢印頭。
+fn draw_line_and_arrows(painter: &Painter, a: Pos2, b: Pos2, color: Color32) {
+    painter.line_segment([a, b], Stroke::new(2.0, color));
+    draw_arrow_head(painter, a, a - b, color);
+    draw_arrow_head(painter, b, b - a, color);
+}
+
+/// 線の先端から ±25° に開いた 2 本の短線で矢印頭を描く。
+fn draw_arrow_head(painter: &Painter, tip: Pos2, dir: Vec2, color: Color32) {
+    let len = dir.length();
+    if len < 1.0 {
+        return;
+    }
+    let u = dir / len;
+    let rotate = |v: Vec2, angle: f32| {
+        let (sin, cos) = angle.sin_cos();
+        Vec2::new(v.x * cos - v.y * sin, v.x * sin + v.y * cos)
+    };
+    let stroke = Stroke::new(2.0, color);
+    painter.line_segment([tip, tip - rotate(u, 25f32.to_radians()) * 9.0], stroke);
+    painter.line_segment([tip, tip - rotate(u, -25f32.to_radians()) * 9.0], stroke);
+}
+
+/// 線の中点から少し浮かせて測定値を描く。
+fn draw_value_label(painter: &Painter, a: Pos2, b: Pos2, text: String, color: Color32) {
+    let mid = a.to_vec2() + (b - a) * 0.5;
+    let d = b - a;
+    let n = if d.length() > 1.0 { d.rot90() / d.length() } else { Vec2::Y };
+    painter.text(
+        egui::pos2(mid.x + n.x * 8.0, mid.y + n.y * 8.0),
+        Align2::CENTER_BOTTOM,
+        text,
+        FontId::proportional(12.0),
+        color,
+    );
+}
+
+/// 凸四角形（領域枠）の中に点があるか。
+fn point_in_quad(p: Pt2, q: [Pt2; 4]) -> bool {
+    let mut pos = 0;
+    let mut neg = 0;
+    for i in 0..4 {
+        let a = q[i];
+        let b = q[(i + 1) % 4];
+        let cross = (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
+        if cross > 0.0 {
+            pos += 1;
+        } else if cross < 0.0 {
+            neg += 1;
+        }
+    }
+    pos == 4 || neg == 4
+}
+
+/// 動かす端点の反対側の端点（4 方向固定の基準点）。
+fn other_endpoint(data: &MeasureData, id: u64, which: EndpointWhich) -> Option<Pt2> {
+    for t in &data.tools {
+        match (t, which) {
+            (MeasureTool::Distance { id: i, p1, p2, .. }, EndpointWhich::P1) if *i == id => {
+                return Some(*p2);
+            }
+            (MeasureTool::Distance { id: i, p1, p2, .. }, EndpointWhich::P2) if *i == id => {
+                return Some(*p1);
+            }
+            (MeasureTool::Boundary { id: i, p1, p2, .. }, EndpointWhich::P1) if *i == id => {
+                return Some(*p2);
+            }
+            (MeasureTool::Boundary { id: i, p1, p2, .. }, EndpointWhich::P2) if *i == id => {
+                return Some(*p1);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// ツールの端点を書き換える（ドラッグ移動用）。
+fn set_endpoint(data: &mut MeasureData, id: u64, which: EndpointWhich, p: Pt2) {
+    for t in &mut data.tools {
+        match (t, which) {
+            (MeasureTool::Distance { id: i, p1, .. }, EndpointWhich::P1) if *i == id => {
+                *p1 = p;
+            }
+            (MeasureTool::Distance { id: i, p2, .. }, EndpointWhich::P2) if *i == id => {
+                *p2 = p;
+            }
+            (MeasureTool::Boundary { id: i, p1, .. }, EndpointWhich::P1) if *i == id => {
+                *p1 = p;
+            }
+            (MeasureTool::Boundary { id: i, p2, .. }, EndpointWhich::P2) if *i == id => {
+                *p2 = p;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// 線分（a→b）までの距離。
+fn distance_to_segment(pos: Pt2, a: Pt2, b: Pt2) -> f64 {
+    let ab = b - a;
+    let len2 = ab.x * ab.x + ab.y * ab.y;
+    let t = if len2 > 0.0 {
+        (((pos - a).x * ab.x + (pos - a).y * ab.y) / len2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (pos - (a + ab * t)).length()
+}
+
+impl MeasureMode {
+    /// 測長モード中の編集セッションを描画する（確定済みツール + 作成中ツール）。
+    pub fn draw_session(&mut self, painter: &Painter, info: &ViewInfo, doc: &Document) {
+        let Some(frame) = doc.input_to(self.index) else {
+            return;
+        };
+        let (img, scale) = (frame.image.clone(), frame.scale);
+        // ドラッグ移動中はフィッティングの再計算を省く（パフォーマンス改善）。
+        let computed = if self.drag.is_some() {
+            self.data.compute_without_fit(&img, scale)
+        } else {
+            self.data.compute(&img, scale)
+        };
+        draw_computed(painter, info, &computed, scale);
+
+        // 選択中のツールを橙の太線でハイライトする。
+        if let Some(sel) = self.selected
+            && let Some(t) = computed.by_id(sel)
+        {
+            painter.line_segment(
+                [to_screen(info, t.p1), to_screen(info, t.p2)],
+                Stroke::new(3.0, COLOR_IN_PROGRESS),
+            );
+        }
+
+        let Some(prog) = &self.in_progress else {
+            return;
+        };
+        let cursor = painter
+            .ctx()
+            .input(|i| i.pointer.hover_pos())
+            .and_then(|p| to_image(info, p));
+        match *prog {
+            InProgress::Distance { p1, p1_line } => {
+                let Some(cursor) = cursor else { return };
+                let lines = self.data.snap_lines(&img, scale);
+                let (p1, p2, snapped) = self.resolve_distance(p1, p1_line, cursor, &lines, info.zoom);
+                let p2 = self.resolve_angle(p1, p2, snapped);
+                let a = to_screen(info, p1);
+                let b = to_screen(info, p2);
+                draw_line_and_arrows(painter, a, b, COLOR_IN_PROGRESS);
+            }
+            InProgress::Boundary { p1 } => {
+                let Some(cursor) = cursor else { return };
+                let p2 = self.resolve_angle(p1, cursor, false);
+                painter.line_segment(
+                    [to_screen(info, p1), to_screen(info, p2)],
+                    Stroke::new(2.0, COLOR_IN_PROGRESS),
+                );
+            }
+            InProgress::OffsetPick { source, distance } => {
+                if let Some(t) = computed.by_id(source) {
+                    let n = (t.p2 - t.p1).normalize().perp();
+                    painter.line_segment(
+                        [to_screen(info, t.p1 + n * distance), to_screen(info, t.p2 + n * distance)],
+                        Stroke::new(1.5, COLOR_IN_PROGRESS),
+                    );
+                }
+            }
+            InProgress::LinearDuplicate {
+                src,
+                start,
+                current,
+                count,
+            } => {
+                // ドラッグ距離を複製数で分割した位置にコピーをプレビュー表示する。
+                if let Some(t) = computed.by_id(src) {
+                    let delta = current - start;
+                    for k in 1..=count {
+                        let off = delta * (k as f64 / count as f64);
+                        let a = to_screen(info, t.p1 + off);
+                        let b = to_screen(info, t.p2 + off);
+                        let color = COLOR_IN_PROGRESS.gamma_multiply(0.6);
+                        match t.kind {
+                            ToolKind::Distance => {
+                                draw_line_and_arrows(painter, a, b, color);
+                            }
+                            _ => {
+                                painter.line_segment([a, b], Stroke::new(1.5, color));
+                            }
+                        }
+                    }
+                }
+                if let Some(c) = cursor {
+                    painter.text(
+                        to_screen(info, c) + Vec2::new(10.0, -8.0),
+                        Align2::LEFT_BOTTOM,
+                        format!("×{count}"),
+                        FontId::proportional(14.0),
+                        COLOR_IN_PROGRESS,
+                    );
+                }
+            }
+        }
+    }
+
+    /// 測長モード中の画像上の入力処理（パン・ズーム・ツール操作・選択移動）。
+    /// 戻り値はステータスバー用のホバー情報。
+    pub fn handle_overlay_input(
+        &mut self,
+        ui: &mut Ui,
+        info: &ViewInfo,
+        doc: &mut Document,
+    ) -> ViewInfo {
+        let mut hover = ViewInfo {
+            vp: info.vp,
+            image_rect: info.image_rect,
+            zoom: info.zoom,
+            ..Default::default()
+        };
+        // 非選択状態では左ドラッグを通常のパンに使うため（view 側が処理）、
+        // こちらはクリック検出だけにする。
+        let idle = self.is_idle();
+        let sense = if idle { Sense::click() } else { Sense::click_and_drag() };
+        let resp = ui.interact(info.vp, egui::Id::new("measure_overlay"), sense);
+
+        // パン（中ドラッグ・右ドラッグ）。idle 時は左ドラッグも view 側がパンする。
+        if resp.dragged_by(egui::PointerButton::Middle)
+            || resp.dragged_by(egui::PointerButton::Secondary)
+        {
+            doc.view.pan_by(resp.drag_delta());
+        }
+
+        // 直線複製中はホイールを複製数の調整だけに使い、ズームは止める。
+        // smooth_scroll_delta は 1 ノッチが複数フレームに分散するため、
+        // 累積して 20.0 たまるごとに 1 ずつ増減させる（速すぎないように）。
+        const SCROLL_STEP: f32 = 20.0;
+        let linear_duplicate_active =
+            matches!(self.in_progress, Some(InProgress::LinearDuplicate { .. }));
+        if linear_duplicate_active {
+            if let Some(InProgress::LinearDuplicate { count, .. }) = &mut self.in_progress {
+                let scroll = resp.ctx.input(|i| i.smooth_scroll_delta.y);
+                self.scroll_accum += scroll;
+                while self.scroll_accum >= SCROLL_STEP {
+                    *count = (*count + 1).min(20);
+                    self.scroll_accum -= SCROLL_STEP;
+                }
+                while self.scroll_accum <= -SCROLL_STEP {
+                    *count = (*count).saturating_sub(1).max(1);
+                    self.scroll_accum += SCROLL_STEP;
+                }
+            }
+        } else if !idle && resp.hovered() {
+            let (scroll_y, pinch) = resp
+                .ctx
+                .input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
+            let mut factor = pinch;
+            if scroll_y != 0.0 {
+                factor *= (scroll_y * 0.0022).exp();
+            }
+            if factor != 1.0 {
+                let anchor =
+                    resp.hover_pos().map_or(info.vp.center(), |p| p).to_vec2() - info.vp.min.to_vec2();
+                doc.view.zoom_about(anchor, factor);
+            }
+        }
+
+        // ステータスバー用のホバー画素値。
+        let img = doc.input_to(self.index).map(|f| f.image.clone());
+        if let (Some(img), Some(pos)) = (&img, resp.hover_pos())
+            && let Some(rel) = to_image(info, pos)
+            && rel.x >= 0.0
+            && rel.y >= 0.0
+            && (rel.x as u32) < img.width
+            && (rel.y as u32) < img.height
+        {
+            hover.hover_px = Some((rel.x as u32, rel.y as u32));
+            hover.hover_value = Some(img.at(rel.x as u32, rel.y as u32));
+        }
+
+        let cursor = resp.hover_pos().and_then(|p| to_image(info, p));
+
+        // 選択ツールのドラッグ移動（端点 or 全体）。
+        if let Some(drag) = self.drag
+            && let Some(cursor) = cursor
+        {
+            if resp.drag_started() {
+                self.begin_change();
+            }
+            if resp.dragged() || resp.drag_started() {
+                self.apply_drag(doc, &drag, cursor, &img, info.zoom);
+            }
+            if resp.drag_stopped() {
+                self.drag = None;
+            }
+        }
+
+        // 直線複製: カーソル追従（4 方向固定を適用）。確定はクリック側。
+        if let Some(InProgress::LinearDuplicate { start, current, .. }) = &mut self.in_progress
+            && let Some(cursor) = cursor
+        {
+            *current = if self.data.prefs.angle == AngleMode::FourDir {
+                snap_angle_four(*start, cursor)
+            } else {
+                cursor
+            };
+        }
+
+        // オフセット線選択中の距離追従。
+        if let Some(cursor) = cursor
+            && let Some(img) = &img
+            && let Some(InProgress::OffsetPick { source, distance }) = &mut self.in_progress
+        {
+            let scale = doc.input_to(self.index).and_then(|f| f.scale);
+            let computed = self.data.compute(img, scale);
+            if let Some(t) = computed.by_id(*source) {
+                let n = (t.p2 - t.p1).normalize().perp();
+                let v = cursor - t.p1;
+                *distance = n.x * v.x + n.y * v.y;
+            }
+        }
+
+        // Esc: 作成中ツール → 選択 → ツールボタンの順に解除する。
+        if resp.ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.cancel_escape();
+        }
+
+        let click_pos = resp.interact_pointer_pos().and_then(|p| to_image(info, p));
+        // 右クリックは作成中ツール・選択のキャンセルに使う。
+        if resp.secondary_clicked() {
+            self.cancel_escape();
+        }
+        // ダブルクリック: フィッティング領域の上なら設定ポップアップ。
+        if resp.double_clicked()
+            && let (Some(img), Some(pos)) = (&img, click_pos)
+        {
+            let scale = doc.input_to(self.index).and_then(|f| f.scale);
+            let computed = self.data.compute(img, scale);
+            if let Some(target) = self.fit_target_at(&computed, pos) {
+                self.popup = Some(target);
+            }
+        }
+
+        // 左クリックでツール操作（または選択モードでの選択）。
+        if resp.clicked()
+            && let (Some(img), Some(pos)) = (&img, click_pos)
+        {
+            self.on_click(doc, img, pos, info.zoom);
+        }
+
+        hover
+    }
+
+    /// Esc の解除順序: 作成中ツール → 選択 → ツールボタン。
+    fn cancel_escape(&mut self) {
+        if self.in_progress.is_some() {
+            self.in_progress = None;
+        } else if self.selected.is_some() || self.drag.is_some() {
+            self.selected = None;
+            self.drag = None;
+        } else {
+            self.tool = None;
+        }
+    }
+
+    /// ドラッグ移動をデータへ反映する（ライブ反映のみ、undo 記録は
+    /// `drag_started` のときに 1 回だけ行う）。
+    fn apply_drag(
+        &mut self,
+        doc: &mut Document,
+        drag: &Drag,
+        cursor: Pt2,
+        img: &Option<std::sync::Arc<Gray16>>,
+        zoom: f32,
+    ) {
+        let Some(img) = img else { return };
+        let scale = doc.input_to(self.index).and_then(|f| f.scale);
+        match *drag {
+            Drag::Endpoint { id, which } => {
+                // スナップが効かなければ 4 方向固定を適用する
+                // （もう一方の端点を基準に方向を丸める）。
+                let (mut p, snapped) = self.resolve_endpoint_move(id, cursor, img, scale, zoom);
+                if !snapped && self.data.prefs.angle == AngleMode::FourDir
+                    && let Some(other) = other_endpoint(&self.data, id, which)
+                {
+                    p = snap_angle_four(other, p);
+                }
+                set_endpoint(&mut self.data, id, which, p);
+                self.apply_change(doc);
+            }
+            Drag::Whole {
+                id,
+                start,
+                orig_p1,
+                orig_p2,
+            } => {
+                // 全体移動は 4 方向固定の対象外（平行移動のまま）。
+                let d = cursor - start;
+                set_endpoint(&mut self.data, id, EndpointWhich::P1, orig_p1 + d);
+                set_endpoint(&mut self.data, id, EndpointWhich::P2, orig_p2 + d);
+                self.apply_change(doc);
+            }
+        }
+    }
+
+    /// 端点移動時のスナップ（スナップ on の二点間測長のみ）。
+    /// 戻り値の bool はスナップが効いたかどうか。
+    fn resolve_endpoint_move(
+        &self,
+        id: u64,
+        cursor: Pt2,
+        img: &Gray16,
+        scale: Option<Scale>,
+        zoom: f32,
+    ) -> (Pt2, bool) {
+        if !self.data.prefs.snap
+            || !matches!(self.data.tool_by_id(id), Some(MeasureTool::Distance { .. }))
+        {
+            return (cursor, false);
+        }
+        let lines = self.data.snap_lines(img, scale);
+        let threshold = SNAP_PX as f64 / zoom as f64;
+        let nearest = lines
+            .iter()
+            .filter(|l| l.distance_to(cursor) <= threshold)
+            .min_by(|a, b| {
+                a.distance_to(cursor)
+                    .partial_cmp(&b.distance_to(cursor))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        match nearest {
+            Some(line) => (line.project(cursor), true),
+            None => (cursor, false),
+        }
+    }
+
+    /// クリック位置にあるフィッティング領域の設定対象を返す。
+    fn fit_target_at(&self, computed: &ComputedMeasure, pos: Pt2) -> Option<FitPopupTarget> {
+        for t in &computed.tools {
+            for region in &t.fit_regions {
+                if point_in_quad(pos, region.corners()) {
+                    return Some(match t.kind {
+                        ToolKind::Boundary => FitPopupTarget::Boundary { tool: t.id },
+                        ToolKind::Distance => {
+                            if (region.center - t.p1).length()
+                                < (region.center - t.p2).length()
+                            {
+                                FitPopupTarget::Dist1 { tool: t.id }
+                            } else {
+                                FitPopupTarget::Dist2 { tool: t.id }
+                            }
+                        }
+                        _ => continue,
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    fn on_click(&mut self, doc: &mut Document, img: &Gray16, pos: Pt2, zoom: f32) {
+        let scale = doc.input_to(self.index).and_then(|f| f.scale);
+        let computed = self.data.compute(img, scale);
+        let snap_lines = if self.data.prefs.snap {
+            self.data.snap_lines(img, scale)
+        } else {
+            Vec::new()
+        };
+        // スナップは狭く、ツール選択の判定は広めに取る。
+        let snap_threshold = SNAP_PX as f64 / zoom as f64;
+        let pick_threshold = PICK_PX as f64 / zoom as f64;
+
+        match self.tool {
+            Some(ToolButton::Distance) => match self.in_progress.take() {
+                None => {
+                    // 端点 1 を置く。近くの補助線があればスナップして記録する。
+                    let p1_line = snap_lines
+                        .iter()
+                        .filter(|l| l.distance_to(pos) <= snap_threshold)
+                        .min_by(|a, b| {
+                            a.distance_to(pos)
+                                .partial_cmp(&b.distance_to(pos))
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .copied();
+                    let p1 = p1_line.map_or(pos, |l| l.project(pos));
+                    self.in_progress = Some(InProgress::Distance { p1, p1_line });
+                }
+                Some(InProgress::Distance { p1, p1_line }) => {
+                    // 端点 2 を置いて確定。
+                    let (p1, p2, snapped) = self.resolve_distance(p1, p1_line, pos, &snap_lines, zoom);
+                    let p2 = self.resolve_angle(p1, p2, snapped);
+                    let (fit1, fit2) = (self.data.dist_fit1, self.data.dist_fit2);
+                    self.mutate(doc, |data| {
+                        let id = data.next_id();
+                        let group = data.group_for_new_measurement();
+                        data.tools.push(MeasureTool::Distance {
+                            id,
+                            p1,
+                            p2,
+                            group,
+                            fit1,
+                            fit2,
+                        });
+                        data.apply_new_measure_mode();
+                    });
+                }
+                _ => self.in_progress = None,
+            },
+            Some(ToolButton::Boundary) => match self.in_progress.take() {
+                None => self.in_progress = Some(InProgress::Boundary { p1: pos }),
+                Some(InProgress::Boundary { p1 }) => {
+                    let p2 = self.resolve_angle(p1, pos, false);
+                    let fit = self.data.boundary_fit;
+                    self.mutate(doc, |data| {
+                        let id = data.next_id();
+                        let group = data.group_for_new_measurement();
+                        data.tools.push(MeasureTool::Boundary {
+                            id,
+                            p1,
+                            p2,
+                            group,
+                            fit,
+                        });
+                        data.apply_new_measure_mode();
+                    });
+                }
+                _ => self.in_progress = None,
+            },
+            Some(ToolButton::Offset) => match self.in_progress.take() {
+                None => {
+                    // 境界線を選択。
+                    if let Some(t) = nearest_tool(&computed, pos, pick_threshold, |t| {
+                        t.kind == ToolKind::Boundary
+                    }) {
+                        let n = (t.p2 - t.p1).normalize().perp();
+                        let v = pos - t.p1;
+                        let distance = n.x * v.x + n.y * v.y;
+                        self.in_progress = Some(InProgress::OffsetPick {
+                            source: t.id,
+                            distance,
+                        });
+                    }
+                }
+                Some(InProgress::OffsetPick { source, distance }) => {
+                    // クリックで距離を確定。
+                    self.mutate(doc, |data| {
+                        let id = data.next_id();
+                        data.tools.push(MeasureTool::Offset {
+                            id,
+                            source,
+                            distance,
+                        });
+                    });
+                }
+                _ => self.in_progress = None,
+            },
+            Some(ToolButton::LinearDuplicate) => match self.in_progress.take() {
+                None => {
+                    // 複製元の測長・境界線を選ぶ。
+                    if let Some(t) = nearest_tool(&computed, pos, pick_threshold, |t| {
+                        matches!(t.kind, ToolKind::Distance | ToolKind::Boundary)
+                    }) {
+                        self.selected = Some(t.id);
+                        self.scroll_accum = 0.0;
+                        self.in_progress = Some(InProgress::LinearDuplicate {
+                            src: t.id,
+                            start: pos,
+                            current: pos,
+                            count: 1,
+                        });
+                    }
+                }
+                Some(InProgress::LinearDuplicate {
+                    src,
+                    start,
+                    count,
+                    ..
+                }) => {
+                    // クリックで確定。方向は 4 方向固定を適用した位置を使う。
+                    let current = if self.data.prefs.angle == AngleMode::FourDir {
+                        snap_angle_four(start, pos)
+                    } else {
+                        pos
+                    };
+                    let delta = current - start;
+                    if delta.length() >= 0.5 {
+                        // 複製元と同じグループに、距離を分割した位置へ配置する。
+                        // フィッティング設定も複製元から引き継ぐ（適用時に再計算）。
+                        let source = self.data.tool_by_id(src).cloned();
+                        let Some(source) = source else {
+                            self.selected = None;
+                            return;
+                        };
+                        let (base1, base2, group, fit1, fit2, is_boundary) = match source {
+                            MeasureTool::Distance { p1, p2, group, fit1, fit2, .. } => {
+                                (p1, p2, group, fit1, fit2, false)
+                            }
+                            MeasureTool::Boundary { p1, p2, group, fit, .. } => {
+                                (p1, p2, group, fit, fit, true)
+                            }
+                            _ => {
+                                self.selected = None;
+                                return;
+                            }
+                        };
+                        self.mutate(doc, |data| {
+                            for k in 1..=count {
+                                let off = delta * (k as f64 / count as f64);
+                                let id = data.next_id();
+                                let p1 = base1 + off;
+                                let p2 = base2 + off;
+                                data.tools.push(if is_boundary {
+                                    MeasureTool::Boundary {
+                                        id,
+                                        p1,
+                                        p2,
+                                        group,
+                                        fit: fit1,
+                                    }
+                                } else {
+                                    MeasureTool::Distance {
+                                        id,
+                                        p1,
+                                        p2,
+                                        group,
+                                        fit1,
+                                        fit2,
+                                    }
+                                });
+                            }
+                        });
+                    }
+                    self.selected = None;
+                }
+                // ツールボタン切替で in_progress はクリアされるので、
+                // 他の作成中状態が残ることはない（万一残っていても破棄）。
+                _ => {}
+            },
+            None => {
+                // 選択モード: 端点または全体を選んでドラッグ移動。
+                self.select_at(&computed, pos, pick_threshold);
+            }
+        }
+    }
+
+    /// クリック位置で選択方法を決める。端点に近ければ端点移動、
+    /// 線分上なら全体移動。どちらでもなければ選択解除。
+    fn select_at(&mut self, computed: &ComputedMeasure, pos: Pt2, threshold: f64) {
+        let mut best: Option<(u64, EndpointWhich, f64)> = None;
+        for t in computed
+            .tools
+            .iter()
+            .filter(|t| matches!(t.kind, ToolKind::Distance | ToolKind::Boundary))
+        {
+            for (which, p) in [(EndpointWhich::P1, t.p1), (EndpointWhich::P2, t.p2)] {
+                let d = (pos - p).length();
+                if d <= threshold && best.map_or(true, |(_, _, bd)| d < bd) {
+                    best = Some((t.id, which, d));
+                }
+            }
+        }
+        if let Some((id, which, _)) = best {
+            self.selected = Some(id);
+            self.drag = Some(Drag::Endpoint { id, which });
+            return;
+        }
+        if let Some(t) = nearest_tool(computed, pos, threshold, |t| {
+            matches!(t.kind, ToolKind::Distance | ToolKind::Boundary)
+        }) {
+            self.selected = Some(t.id);
+            self.drag = Some(Drag::Whole {
+                id: t.id,
+                start: pos,
+                orig_p1: t.p1,
+                orig_p2: t.p2,
+            });
+        } else {
+            self.selected = None;
+            self.drag = None;
+        }
+    }
+
+    /// スナップ適用後の端点位置。`snapped` はどちらかの端点が線に乗ったか。
+    fn resolve_distance(
+        &self,
+        p1: Pt2,
+        p1_line: Option<SnapLine>,
+        cursor: Pt2,
+        lines: &[SnapLine],
+        zoom: f32,
+    ) -> (Pt2, Pt2, bool) {
+        if self.data.prefs.snap {
+            let threshold = SNAP_PX as f64 / zoom as f64;
+            let (a, b) = snap_distance(p1, p1_line.as_ref(), cursor, lines, threshold);
+            let snapped = (a - p1).length() > 1e-9 || (b - cursor).length() > 1e-9;
+            return (a, b, snapped);
+        }
+        (p1, cursor, false)
+    }
+
+    /// 角度 4 方向スナップ（スナップが効いていないときだけ）。
+    fn resolve_angle(&self, p1: Pt2, p2: Pt2, snapped: bool) -> Pt2 {
+        if !snapped && self.data.prefs.angle == AngleMode::FourDir {
+            return snap_angle_four(p1, p2);
+        }
+        p2
+    }
+}
+
+/// `pos` に最も近い、条件を満たすツール（線分距離がしきい値以下）。
+fn nearest_tool(
+    computed: &ComputedMeasure,
+    pos: Pt2,
+    threshold: f64,
+    pred: impl Fn(&ComputedTool) -> bool,
+) -> Option<&ComputedTool> {
+    computed
+        .tools
+        .iter()
+        .filter(|t| pred(t))
+        .filter(|t| distance_to_segment(pos, t.p1, t.p2) <= threshold)
+        .min_by(|a, b| {
+            distance_to_segment(pos, a.p1, a.p2)
+                .partial_cmp(&distance_to_segment(pos, b.p1, b.p2))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+}

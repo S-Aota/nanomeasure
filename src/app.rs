@@ -8,6 +8,7 @@ use crate::command::{Command, CommandItem, HistoryFile, load_image};
 use crate::dialogs::{LevelsDialog, RotateDialog, ScaleDialog};
 use crate::document::{Document, SourceCache};
 use crate::frame::format_length;
+use crate::measure_mode::MeasureMode;
 use crate::metadata;
 use crate::view::ViewInfo;
 
@@ -21,6 +22,7 @@ enum Action {
     NewScale,
     NewRotate,
     NewLevels,
+    NewMeasure,
     EditCommand(usize),
     ToggleCommand(usize),
     DeleteCommand(usize),
@@ -58,6 +60,7 @@ pub struct TemApp {
     scale_dialog: ScaleDialog,
     rotate_dialog: RotateDialog,
     levels_dialog: LevelsDialog,
+    measure_mode: MeasureMode,
     /// データは変えずに、表示だけ min/max へ引き伸ばす。
     auto_contrast: bool,
     help_open: bool,
@@ -80,6 +83,7 @@ impl TemApp {
             scale_dialog: ScaleDialog::default(),
             rotate_dialog: RotateDialog::default(),
             levels_dialog: LevelsDialog::default(),
+            measure_mode: MeasureMode::default(),
             auto_contrast: true,
             help_open: false,
             about_open: false,
@@ -180,6 +184,13 @@ impl TemApp {
                         .clicked()
                     {
                         actions.push(Action::NewLevels);
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(self.has_image(), egui::Button::new("測長..."))
+                        .clicked()
+                    {
+                        actions.push(Action::NewMeasure);
                         ui.close();
                     }
                     ui.menu_button("フィルタ", |ui| {
@@ -364,6 +375,12 @@ impl TemApp {
     }
 
     fn ui_command_panel(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
+        // 測長モード中は右パネルを測長ツール UI に置き換える。
+        if self.measure_mode.open {
+            self.measure_mode
+                .show_panel(ui, &mut self.docs[self.active]);
+            return;
+        }
         let dirty = self.doc().is_dirty();
         let has_selection = self.doc().has_selection();
         let can_paste = !self.clipboard.is_empty();
@@ -546,6 +563,15 @@ impl TemApp {
                 ui.separator();
                 ui.label("・TIFF の FEI / Thermo Fisher タグ、または ImageJ の単位情報から画素の実寸法が読めた場合、画像挿入の直後に「スケール設定」コマンドが自動で追加されます。");
                 ui.label("・読めなかった場合はスケール未設定となり、実寸法は出せません（画素単位のまま）。コマンド → スケール設定 で、スケールバーから読み取った値を手で入れられます。");
+                ui.separator();
+                ui.label("・測長: コマンド → 測長... で右パネルが測長ツールに切り替わります。");
+                ui.label("・二点間測長・境界線は、画像上を 2 回クリックして作成します（Esc または右クリックで作成途中をキャンセル）。");
+                ui.label("・測長モード中は Ctrl+Z / Ctrl+Shift+Z でツール操作の取り消し・やり直しができます。");
+                ui.label("・スナップ on のとき、二点間測長の端点は既存の境界線・オフセット線に吸い付きます。");
+                ui.label("・Esc でツール選択を解除すると、左ドラッグでパンが使えます。非選択状態では測長・境界線をクリックして選択し、ドラッグで移動できます（端点付近のクリックは端点だけ、線の上は全体が動きます）。");
+                ui.label("・フィッティング領域をダブルクリックすると、その測長だけのフィッティング設定を再編集できます。");
+                ui.label("・直線複製: 測長・境界線をクリックで選択し、マウス移動で方向と距離を指定して、もう一度クリックで確定。ホイールで複製数 (1-20) を調整し、距離を等分した位置に複製します。");
+                ui.label("・中ドラッグまたは右ドラッグでパン、ホイールでズームできます（測長モード中も同じ）。");
             });
         self.help_open = help_open;
 
@@ -586,6 +612,11 @@ impl TemApp {
             Action::NewLevels => {
                 let index = self.active;
                 self.levels_dialog.open_new(&mut self.docs[index]);
+            }
+            Action::NewMeasure => {
+                let index = self.active;
+                self.close_dialogs();
+                self.measure_mode.open_new(&mut self.docs[index], index);
             }
             Action::EditCommand(i) => self.edit_command(i),
             Action::ToggleCommand(i) => self.doc_mut().invalidate_from(i),
@@ -641,11 +672,24 @@ impl TemApp {
         self.scale_dialog.open = false;
         self.rotate_dialog.open = false;
         self.levels_dialog.open = false;
+        // 測長モードも編集中のダイアログと同様に閉じる（コマンド構造の
+        // 変更操作と競合しないように、破棄して終了する）。
+        if self.measure_mode.open {
+            let tab = self.measure_mode.tab;
+            if tab < self.docs.len() {
+                self.measure_mode.revert(&mut self.docs[tab]);
+            } else {
+                self.measure_mode.open = false;
+            }
+        }
     }
 
     /// パラメータ調整中はプレビューのため、結果を先に進めておく必要がある。
     fn dialog_open(&self) -> bool {
-        self.scale_dialog.open || self.rotate_dialog.open || self.levels_dialog.open
+        self.scale_dialog.open
+            || self.rotate_dialog.open
+            || self.levels_dialog.open
+            || self.measure_mode.open
     }
 
     fn copy_commands(&mut self) {
@@ -688,6 +732,10 @@ impl TemApp {
             Command::SetScale { .. } => self.scale_dialog.open_edit(doc, index),
             Command::Rotate { .. } => self.rotate_dialog.open_edit(doc, index),
             Command::Levels { .. } => self.levels_dialog.open_edit(doc, index),
+            Command::Measure { .. } => {
+                let tab = self.active;
+                self.measure_mode.open_edit(doc, tab, index)
+            }
             Command::InsertImage { path } => {
                 // 画像挿入の「パラメータ」は読み込むファイルそのもの。
                 let mut dialog = rfd::FileDialog::new()
@@ -935,6 +983,12 @@ impl eframe::App for TemApp {
         let mut actions = Vec::new();
         self.handle_dropped_files(&ctx, &mut actions);
 
+        // 測長モード中にタブが切り替わったら、編集を破棄して終了する。
+        if self.measure_mode.open && self.measure_mode.tab != self.active {
+            self.close_dialogs();
+            self.status = "タブが切り替わったため、測長モードを終了しました。".to_owned();
+        }
+
         // 自動で計算するのは次の 2 つの場合だけ。それ以外の変更（並べ替え・
         // 有効無効の切り替え・削除・貼り付け）は「再計算」を押すまで待つ。
         //   - まだ一度も結果が出ていないタブ（開いた直後で何も表示できない）
@@ -946,6 +1000,11 @@ impl eframe::App for TemApp {
         }
 
         self.handle_shortcuts(&ctx, &mut actions);
+        // 測長モード中は Ctrl+Z / Shift+Ctrl+Z をツール操作の取り消しに使う。
+        if self.measure_mode.open && self.measure_mode.tab < self.docs.len() {
+            self.measure_mode
+                .handle_shortcuts(&ctx, &mut self.docs[self.measure_mode.tab]);
+        }
         self.ui_menu_bar(ui, &mut actions);
         self.ui_tab_bar(ui, &mut actions);
         self.ui_status_bar(ui);
@@ -957,11 +1016,44 @@ impl eframe::App for TemApp {
         let index = self.active;
         let range = self.docs[index].display_range(auto);
         let generation = self.docs[index].generation;
+        // 測長モード中でも、ツール未選択・選択なしの状態では左ドラッグを
+        // 通常どおりパンに使えるようにする。
+        let interactive = !self.measure_mode.open || self.measure_mode.is_idle();
         self.last_hover = egui::CentralPanel::no_frame()
             .show(ui, |ui| {
                 let doc = &mut self.docs[index];
                 let image = doc.image().cloned();
-                doc.view.show(ui, image.as_ref(), generation, range)
+                let mut info = doc.view.show(ui, image.as_ref(), generation, range, interactive);
+
+                // 測長オーバーレイ: 後段の回転等で画像が変わっていない
+                // 測長コマンドだけを、そのコマンドの画像座標系で描く。
+                if let Some(img) = &image {
+                    let painter = ui.painter_at(info.vp);
+                    for i in 0..doc.commands.len() {
+                        if let Command::Measure { data } = &doc.commands[i].command
+                            && let Some(frame) = doc.input_to(i)
+                            && std::sync::Arc::ptr_eq(&frame.image, img)
+                        {
+                            let computed = data.compute(&frame.image, frame.scale);
+                            crate::measure_mode::draw_computed(
+                                &painter,
+                                &info,
+                                &computed,
+                                frame.scale,
+                            );
+                        }
+                    }
+                }
+
+                // 測長モード中は編集セッションの描画とツール入力処理を重ねる。
+                if self.measure_mode.open {
+                    let painter = ui.painter_at(info.vp);
+                    self.measure_mode.draw_session(&painter, &info, doc);
+                    let hover = self.measure_mode.handle_overlay_input(ui, &info, doc);
+                    info.hover_px = hover.hover_px;
+                    info.hover_value = hover.hover_value;
+                }
+                info
             })
             .inner;
 
@@ -971,6 +1063,13 @@ impl eframe::App for TemApp {
         self.scale_dialog.show(&ctx, doc);
         self.rotate_dialog.show(&ctx, doc);
         self.levels_dialog.show(&ctx, doc);
+        if self.measure_mode.open {
+            let tab = self.measure_mode.tab;
+            if tab < self.docs.len() {
+                self.measure_mode.show_confirm_modal(&ctx, &mut self.docs[tab]);
+                self.measure_mode.show_fit_popup(&ctx, &mut self.docs[tab]);
+            }
+        }
 
         for action in actions {
             self.handle(&ctx, action);

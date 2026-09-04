@@ -14,7 +14,7 @@ use crate::frame::LengthUnit;
 use crate::gray::Gray16;
 
 /// 編集対象のコマンドを差し替え、必要な範囲だけ再計算対象にする。
-fn set_command(doc: &mut Document, index: usize, cmd: Command) {
+pub(crate) fn set_command(doc: &mut Document, index: usize, cmd: Command) {
     if doc.commands[index].command != cmd {
         doc.commands[index].command = cmd;
         doc.invalidate_from(index);
