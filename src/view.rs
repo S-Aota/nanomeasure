@@ -138,6 +138,15 @@ impl ImageView {
         if interactive {
             self.handle_input(&response, vp);
         }
+        // 倍率が変わらなくなってからの経過時間。測長モード中は入力処理を
+        // 呼び出し側が担う（interactive = false）ので、こちらで常に進める。
+        let dt = response.ctx.input(|i| i.stable_dt).min(0.1);
+        if (self.zoom - self.last_zoom).abs() > f32::EPSILON {
+            self.settle = 0.0;
+            self.last_zoom = self.zoom;
+        } else {
+            self.settle += dt;
+        }
         self.update_texture(ui, img, generation, range);
 
         if let Some(tex) = &self.tex {
@@ -210,14 +219,6 @@ impl ImageView {
                     response.hover_pos().map_or(vp.center(), |p| p).to_vec2() - vp.min.to_vec2();
                 self.zoom_about(anchor, factor);
             }
-        }
-
-        let dt = response.ctx.input(|i| i.stable_dt).min(0.1);
-        if (self.zoom - self.last_zoom).abs() > f32::EPSILON {
-            self.settle = 0.0;
-            self.last_zoom = self.zoom;
-        } else {
-            self.settle += dt;
         }
     }
 

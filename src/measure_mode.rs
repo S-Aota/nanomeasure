@@ -5,7 +5,9 @@
 //! 同じ方式）。決定で確定、キャンセルは確認を経て破棄。ツール操作は
 //! Ctrl+Z / Ctrl+Shift+Z で undo / redo できる。
 
-use egui::{Align2, Color32, Context, FontId, Painter, Pos2, Rect, Sense, Stroke, Ui, Vec2};
+use egui::{
+    Align2, Color32, Context, CursorIcon, FontId, Painter, Pos2, Rect, Sense, Stroke, Ui, Vec2,
+};
 
 use crate::command::Command;
 use crate::dialogs::set_command;
@@ -136,7 +138,7 @@ pub struct MeasureMode {
     pub open: bool,
     /// 編集対象のタブとコマンド行。
     pub(crate) tab: usize,
-    index: usize,
+    pub(crate) index: usize,
     created: bool,
     original: Option<Command>,
     /// 作業コピー。変更は常に doc 側のコマンドへライブ反映する。
@@ -149,6 +151,10 @@ pub struct MeasureMode {
     selected: Option<u64>,
     /// 選択ツールのドラッグ移動中。
     drag: Option<Drag>,
+    /// ドラッグ開始時のフィッティング済み計算結果。ドラッグ中は選択ツール
+    /// だけ生の位置で描き、他のツールはこのキャッシュで描く（毎フレームの
+    /// フィッティング再計算を避けつつ、二重線の重なりも出さない）。
+    drag_fitted: Option<ComputedMeasure>,
     /// フィッティング設定ポップアップの編集対象。
     popup: Option<FitPopupTarget>,
     undo: Vec<MeasureData>,
@@ -162,17 +168,6 @@ pub struct MeasureMode {
     in_progress: Option<InProgress>,
     /// 直線複製のホイール入力の累積（20.0 たまるごとに複製数を 1 増減）。
     scroll_accum: f32,
-}
-
-impl MeasureMode {
-    /// ツール未選択で、作成・選択・ドラッグのいずれも無い状態か。
-    /// この状態では左ドラッグを通常のパンに使える（app 側で判定）。
-    pub fn is_idle(&self) -> bool {
-        self.tool.is_none()
-            && self.selected.is_none()
-            && self.drag.is_none()
-            && self.in_progress.is_none()
-    }
 }
 
 impl MeasureMode {
@@ -204,6 +199,7 @@ impl MeasureMode {
         self.ep_tab = false;
         self.selected = None;
         self.drag = None;
+        self.drag_fitted = None;
         self.popup = None;
         self.undo.clear();
         self.redo.clear();
@@ -570,7 +566,7 @@ impl MeasureMode {
                 ui.weak("測長・境界線をクリック → マウス移動で方向と距離を指定 → クリックで確定。ホイールで複製数 (1-20)");
             }
             None => {
-                ui.weak("画像上の測長・境界線をクリックで選択（ドラッグで移動、Esc で解除）");
+                ui.weak("画像上の測長・境界線を直接ドラッグで移動（Esc で解除）");
             }
         }
     }
@@ -583,6 +579,7 @@ impl MeasureMode {
             self.in_progress = None;
             self.selected = None;
             self.drag = None;
+            self.drag_fitted = None;
         }
     }
 
@@ -980,10 +977,14 @@ pub fn draw_computed(
                 painter.line_segment([a, b], Stroke::new(2.0, COLOR_GUIDE));
             }
             ToolKind::Offset => {
-                // 元の境界線と同じ長さの線分。オフセット距離を画像中に表示する。
+                // 元の境界線と同じ長さの線分。元の境界線の中点から矢印で
+                // 関係を示し、オフセット距離を画像中に表示する。
+                if let Some(src) = t.source.and_then(|s| computed.by_id(s)) {
+                    draw_offset_link(painter, info, (src.p1, src.p2), (t.p1, t.p2));
+                }
                 let a = to_screen(info, t.p1);
                 let b = to_screen(info, t.p2);
-                painter.line_segment([a, b], Stroke::new(1.5, COLOR_GUIDE));
+                painter.line_segment([a, b], Stroke::new(2.0, COLOR_GUIDE));
                 if let Some(d) = t.distance_px {
                     let sign = if d >= 0.0 { "+" } else { "-" };
                     let text = format!("{sign}{}", format_measurement(d.abs(), scale));
@@ -1015,6 +1016,19 @@ fn draw_arrow_head(painter: &Painter, tip: Pos2, dir: Vec2, color: Color32) {
     let stroke = Stroke::new(2.0, color);
     painter.line_segment([tip, tip - rotate(u, 25f32.to_radians()) * 9.0], stroke);
     painter.line_segment([tip, tip - rotate(u, -25f32.to_radians()) * 9.0], stroke);
+}
+
+/// オフセット線と元の境界線の関係を示す矢印（元の中点 → オフセット線の中点）。
+fn draw_offset_link(painter: &Painter, info: &ViewInfo, src: (Pt2, Pt2), off: (Pt2, Pt2)) {
+    let sm = (src.0 + src.1) * 0.5;
+    let om = (off.0 + off.1) * 0.5;
+    let (a, b) = (to_screen(info, sm), to_screen(info, om));
+    // 距離 0 で線が重なっているときは描かない。
+    if (a - b).length() < 2.0 {
+        return;
+    }
+    painter.line_segment([a, b], Stroke::new(1.0, COLOR_GUIDE));
+    draw_arrow_head(painter, b, a - b, COLOR_GUIDE);
 }
 
 /// 線の中点から少し浮かせて測定値を描く。
@@ -1110,9 +1124,24 @@ impl MeasureMode {
             return;
         };
         let (img, scale) = (frame.image.clone(), frame.scale);
-        // ドラッグ移動中はフィッティングの再計算を省く（パフォーマンス改善）。
-        let computed = if self.drag.is_some() {
-            self.data.compute_without_fit(&img, scale)
+        // ドラッグ中: 選択ツールだけドラッグ位置（生の p1/p2）で描き、
+        // 他のツールはドラッグ開始時のフィッティング済み位置で描く。
+        // 全ツールを生の位置で描くと、通常のフィッティング後の線と
+        // 重なって二重に見えるため（選択ツールだけはそれが許容される）。
+        let computed = if let Some(fitted) = &self.drag_fitted {
+            let raw = self.data.compute_without_fit(&img, scale);
+            let mut tools = fitted.tools.clone();
+            // 選択ツールと、それを参照するオフセット線は生の位置（ドラッグ追従）。
+            if let Some(sel) = self.selected {
+                for r in &raw.tools {
+                    if (r.id == sel || r.source == Some(sel))
+                        && let Some(t) = tools.iter_mut().find(|t| t.id == r.id)
+                    {
+                        *t = r.clone();
+                    }
+                }
+            }
+            ComputedMeasure { tools }
         } else {
             self.data.compute(&img, scale)
         };
@@ -1127,6 +1156,9 @@ impl MeasureMode {
                 Stroke::new(3.0, COLOR_IN_PROGRESS),
             );
         }
+
+        // ホバー時の視覚フィードバック（スナップ・選択可能・ドラッグ中）。
+        self.hover_feedback(painter, info, &computed);
 
         let Some(prog) = &self.in_progress else {
             return;
@@ -1144,6 +1176,11 @@ impl MeasureMode {
                 let a = to_screen(info, p1);
                 let b = to_screen(info, p2);
                 draw_line_and_arrows(painter, a, b, COLOR_IN_PROGRESS);
+                // 端点 1 が補助線にスナップ中なら紫のドットで示す
+                // （端点 2 側のドットは hover_feedback が描く）。
+                if p1_line.is_some() {
+                    painter.circle_filled(a, 3.5, COLOR_GUIDE);
+                }
             }
             InProgress::Boundary { p1 } => {
                 let Some(cursor) = cursor else { return };
@@ -1156,9 +1193,12 @@ impl MeasureMode {
             InProgress::OffsetPick { source, distance } => {
                 if let Some(t) = computed.by_id(source) {
                     let n = (t.p2 - t.p1).normalize().perp();
+                    let (pa, pb) = (t.p1 + n * distance, t.p2 + n * distance);
+                    // プレビューにも元境界線との関係を示す矢印を出す。
+                    draw_offset_link(painter, info, (t.p1, t.p2), (pa, pb));
                     painter.line_segment(
-                        [to_screen(info, t.p1 + n * distance), to_screen(info, t.p2 + n * distance)],
-                        Stroke::new(1.5, COLOR_IN_PROGRESS),
+                        [to_screen(info, pa), to_screen(info, pb)],
+                        Stroke::new(2.0, COLOR_IN_PROGRESS),
                     );
                 }
             }
@@ -1199,6 +1239,147 @@ impl MeasureMode {
         }
     }
 
+    /// ホバー時の視覚フィードバック。スナップが効く位置ではカーソル位置に
+    /// 紫のリングとスナップ先のドットを描き、選択可能なツールでは
+    /// ハイライトとカーソルアイコンの変更を行う。
+    fn hover_feedback(&self, painter: &Painter, info: &ViewInfo, computed: &ComputedMeasure) {
+        let Some(pos) = painter
+            .ctx()
+            .input(|i| i.pointer.hover_pos())
+            .and_then(|p| to_image(info, p))
+        else {
+            return;
+        };
+        let zoom = info.zoom;
+        let set_cursor = |icon| painter.ctx().output_mut(|o| o.cursor_icon = icon);
+
+        // ---- スナップ（設定 on・二点間測長の作成中と二点間測長の端点
+        //      ドラッグ中のみ）----
+        let snapping = self.data.prefs.snap
+            && (self.tool == Some(ToolButton::Distance)
+                || matches!(
+                    self.drag,
+                    Some(Drag::Endpoint { id, .. })
+                        if matches!(self.data.tool_by_id(id), Some(MeasureTool::Distance { .. }))
+                ));
+        if snapping {
+            // スナップ対象は境界線・オフセット線（線分ハイライト用に端点も持つ）。
+            let lines: Vec<(SnapLine, Pt2, Pt2)> = computed
+                .tools
+                .iter()
+                .filter(|t| matches!(t.kind, ToolKind::Boundary | ToolKind::Offset))
+                .map(|t| (SnapLine::from_points(t.p1, t.p2), t.p1, t.p2))
+                .collect();
+            let threshold = SNAP_PX as f64 / zoom as f64;
+            let nearest = lines
+                .iter()
+                .filter(|(l, _, _)| l.distance_to(pos) <= threshold)
+                .min_by(|(a, _, _), (b, _, _)| {
+                    a.distance_to(pos)
+                        .partial_cmp(&b.distance_to(pos))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+            if let Some((line, a, b)) = nearest {
+                // カーソル位置の紫リング + 対象直線のハイライト。
+                painter.circle_stroke(to_screen(info, pos), 9.0, Stroke::new(2.0, COLOR_GUIDE));
+                painter.line_segment(
+                    [to_screen(info, *a), to_screen(info, *b)],
+                    Stroke::new(5.0, COLOR_GUIDE.gamma_multiply(0.3)),
+                );
+                // スナップ先のドットはクリック時と同じ計算で実際の着地点を示す。
+                match self.in_progress {
+                    // 端点 2 を置く前・端点ドラッグ中: カーソルの射影が着地点。
+                    None => {
+                        painter.circle_filled(to_screen(info, line.project(pos)), 3.5, COLOR_GUIDE);
+                    }
+                    // 端点 2 を置く: snap_distance と同じ計算（垂線の足のケースを含む）。
+                    Some(InProgress::Distance { p1, p1_line }) => {
+                        let raw: Vec<SnapLine> = lines.iter().map(|(l, _, _)| *l).collect();
+                        let (pa, pb) = snap_distance(p1, p1_line.as_ref(), pos, &raw, threshold);
+                        if p1_line.is_some() {
+                            painter.circle_filled(to_screen(info, pa), 3.5, COLOR_GUIDE);
+                        }
+                        painter.circle_filled(to_screen(info, pb), 3.5, COLOR_GUIDE);
+                    }
+                    _ => {
+                        painter.circle_filled(to_screen(info, line.project(pos)), 3.5, COLOR_GUIDE);
+                    }
+                }
+            }
+        }
+
+        // ---- ドラッグ中のカーソルと端点リング ----
+        match self.drag {
+            Some(Drag::Endpoint { id, which }) => {
+                if let Some(t) = computed.by_id(id) {
+                    let p = match which {
+                        EndpointWhich::P1 => t.p1,
+                        EndpointWhich::P2 => t.p2,
+                    };
+                    painter.circle_stroke(
+                        to_screen(info, p),
+                        7.0,
+                        Stroke::new(2.0, COLOR_IN_PROGRESS),
+                    );
+                }
+                set_cursor(CursorIcon::Grabbing);
+                return;
+            }
+            Some(Drag::Whole { id, .. }) => {
+                if let Some(t) = computed.by_id(id) {
+                    for p in [t.p1, t.p2] {
+                        painter.circle_stroke(
+                            to_screen(info, p),
+                            7.0,
+                            Stroke::new(2.0, COLOR_IN_PROGRESS),
+                        );
+                    }
+                }
+                set_cursor(CursorIcon::Move);
+                return;
+            }
+            None => {}
+        }
+
+        // ---- ホバーで選択可能な対象（選択モード・オフセット線の元選択・
+        //      直線複製の元選択）----
+        let picking = match self.tool {
+            None => true,
+            Some(ToolButton::Offset | ToolButton::LinearDuplicate) => self.in_progress.is_none(),
+            Some(ToolButton::Distance | ToolButton::Boundary) => false,
+        };
+        if !picking {
+            return;
+        }
+        let pred = |t: &ComputedTool| match self.tool {
+            Some(ToolButton::Offset) => t.kind == ToolKind::Boundary,
+            _ => matches!(t.kind, ToolKind::Distance | ToolKind::Boundary),
+        };
+        let threshold = PICK_PX as f64 / zoom as f64;
+        // 端点優先（クリック時の判定と同じ順序）。
+        let mut best: Option<Pt2> = None;
+        for t in computed.tools.iter().filter(|t| pred(t)) {
+            for p in [t.p1, t.p2] {
+                let d = (pos - p).length();
+                if d <= threshold && best.is_none_or(|bp| d < (pos - bp).length()) {
+                    best = Some(p);
+                }
+            }
+        }
+        if let Some(p) = best {
+            painter.circle_stroke(to_screen(info, p), 7.0, Stroke::new(2.0, COLOR_IN_PROGRESS));
+            set_cursor(CursorIcon::PointingHand);
+            return;
+        }
+        if let Some(t) = nearest_tool(computed, pos, threshold, pred) {
+            painter.line_segment(
+                [to_screen(info, t.p1), to_screen(info, t.p2)],
+                Stroke::new(4.0, COLOR_IN_PROGRESS.gamma_multiply(0.45)),
+            );
+            set_cursor(CursorIcon::Grab);
+        }
+    }
+
     /// 測長モード中の画像上の入力処理（パン・ズーム・ツール操作・選択移動）。
     /// 戻り値はステータスバー用のホバー情報。
     pub fn handle_overlay_input(
@@ -1213,13 +1394,17 @@ impl MeasureMode {
             zoom: info.zoom,
             ..Default::default()
         };
-        // 非選択状態では左ドラッグを通常のパンに使うため（view 側が処理）、
-        // こちらはクリック検出だけにする。
-        let idle = self.is_idle();
-        let sense = if idle { Sense::click() } else { Sense::click_and_drag() };
-        let resp = ui.interact(info.vp, egui::Id::new("measure_overlay"), sense);
+        // 左ドラッグは常にこちらで処理する（選択モードでは直接ドラッグで
+        // 移動、ツールの無い場所ではパン）。view 側の入力処理は測長モード中
+        // は無効にしている（app 側で interactive = false）。
+        let resp = ui.interact(
+            info.vp,
+            egui::Id::new("measure_overlay"),
+            Sense::click_and_drag(),
+        );
 
-        // パン（中ドラッグ・右ドラッグ）。idle 時は左ドラッグも view 側がパンする。
+        // パン（中ドラッグ・右ドラッグ）。左ドラッグのパンは下の選択モード
+        // ブロック（ツールの無い場所）が担う。
         if resp.dragged_by(egui::PointerButton::Middle)
             || resp.dragged_by(egui::PointerButton::Secondary)
         {
@@ -1245,7 +1430,7 @@ impl MeasureMode {
                     self.scroll_accum += SCROLL_STEP;
                 }
             }
-        } else if !idle && resp.hovered() {
+        } else if resp.hovered() {
             let (scroll_y, pinch) = resp
                 .ctx
                 .input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
@@ -1275,6 +1460,27 @@ impl MeasureMode {
 
         let cursor = resp.hover_pos().and_then(|p| to_image(info, p));
 
+        // 選択モード: 押したまま動かすだけでドラッグ移動を始める
+        // （事前のクリックで選択は不要）。
+        if self.tool.is_none()
+            && self.in_progress.is_none()
+            && resp.drag_started()
+            && let (Some(img), Some(cursor)) = (&img, cursor)
+        {
+            let scale = doc.input_to(self.index).and_then(|f| f.scale);
+            let computed = self.data.compute(img, scale);
+            let threshold = PICK_PX as f64 / info.zoom as f64;
+            self.select_at(&computed, cursor, threshold);
+        }
+        // ツールの無い場所の左ドラッグはパンに使う。
+        if self.tool.is_none()
+            && self.in_progress.is_none()
+            && self.drag.is_none()
+            && resp.dragged()
+        {
+            doc.view.pan_by(resp.drag_delta());
+        }
+
         // 選択ツールのドラッグ移動（端点 or 全体）。
         if let Some(drag) = self.drag
             && let Some(cursor) = cursor
@@ -1287,6 +1493,8 @@ impl MeasureMode {
             }
             if resp.drag_stopped() {
                 self.drag = None;
+                self.drag_fitted = None;
+                self.selected = None;
             }
         }
 
@@ -1353,6 +1561,7 @@ impl MeasureMode {
         } else if self.selected.is_some() || self.drag.is_some() {
             self.selected = None;
             self.drag = None;
+            self.drag_fitted = None;
         } else {
             self.tool = None;
         }
@@ -1485,7 +1694,18 @@ impl MeasureMode {
                     // 端点 2 を置いて確定。
                     let (p1, p2, snapped) = self.resolve_distance(p1, p1_line, pos, &snap_lines, zoom);
                     let p2 = self.resolve_angle(p1, p2, snapped);
-                    let (fit1, fit2) = (self.data.dist_fit1, self.data.dist_fit2);
+                    let (mut fit1, mut fit2) = (self.data.dist_fit1, self.data.dist_fit2);
+                    // 片側だけスナップした端点はフィッティングせずクリック位置
+                    // そのまま（補助線近傍の輝度でフィットが端点をずらすのを防ぐ）。
+                    let p1_snapped = p1_line.is_some();
+                    let p2_snapped = snap_lines
+                        .iter()
+                        .any(|l| l.distance_to(pos) <= snap_threshold);
+                    if p1_snapped && !p2_snapped {
+                        fit1.mode = FitMode::Off;
+                    } else if p2_snapped && !p1_snapped {
+                        fit2.mode = FitMode::Off;
+                    }
                     self.mutate(doc, |data| {
                         let id = data.next_id();
                         let group = data.group_for_new_measurement();
@@ -1509,15 +1729,15 @@ impl MeasureMode {
                     let fit = self.data.boundary_fit;
                     self.mutate(doc, |data| {
                         let id = data.next_id();
-                        let group = data.group_for_new_measurement();
+                        // 補助線は測定結果に出ないのでグループを作らず、既存の
+                        // アクティブグループも変えない（group は使われないので 0）。
                         data.tools.push(MeasureTool::Boundary {
                             id,
                             p1,
                             p2,
-                            group,
+                            group: 0,
                             fit,
                         });
-                        data.apply_new_measure_mode();
                     });
                 }
                 _ => self.in_progress = None,
@@ -1633,8 +1853,8 @@ impl MeasureMode {
                 _ => {}
             },
             None => {
-                // 選択モード: 端点または全体を選んでドラッグ移動。
-                self.select_at(&computed, pos, pick_threshold);
+                // 選択モードではクリック単独では何もしない（ドラッグ開始時に
+                // handle_overlay_input 側で直接選択して移動する）。
             }
         }
     }
@@ -1658,6 +1878,7 @@ impl MeasureMode {
         if let Some((id, which, _)) = best {
             self.selected = Some(id);
             self.drag = Some(Drag::Endpoint { id, which });
+            self.drag_fitted = Some(computed.clone());
             return;
         }
         if let Some(t) = nearest_tool(computed, pos, threshold, |t| {
@@ -1670,9 +1891,11 @@ impl MeasureMode {
                 orig_p1: t.p1,
                 orig_p2: t.p2,
             });
+            self.drag_fitted = Some(computed.clone());
         } else {
             self.selected = None;
             self.drag = None;
+            self.drag_fitted = None;
         }
     }
 

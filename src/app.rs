@@ -1016,9 +1016,9 @@ impl eframe::App for TemApp {
         let index = self.active;
         let range = self.docs[index].display_range(auto);
         let generation = self.docs[index].generation;
-        // 測長モード中でも、ツール未選択・選択なしの状態では左ドラッグを
-        // 通常どおりパンに使えるようにする。
-        let interactive = !self.measure_mode.open || self.measure_mode.is_idle();
+        // 測長モード中は画像上の入力（左ドラッグの移動・パン、ズーム）を
+        // すべて measure_mode 側で処理する。
+        let interactive = !self.measure_mode.open;
         self.last_hover = egui::CentralPanel::no_frame()
             .show(ui, |ui| {
                 let doc = &mut self.docs[index];
@@ -1027,9 +1027,17 @@ impl eframe::App for TemApp {
 
                 // 測長オーバーレイ: 後段の回転等で画像が変わっていない
                 // 測長コマンドだけを、そのコマンドの画像座標系で描く。
+                // 測長モードで編集中のコマンドは draw_session 側が描くので
+                // ここではスキップする（二重描画を防ぐ）。
                 if let Some(img) = &image {
                     let painter = ui.painter_at(info.vp);
                     for i in 0..doc.commands.len() {
+                        if self.measure_mode.open
+                            && self.measure_mode.tab == index
+                            && i == self.measure_mode.index
+                        {
+                            continue;
+                        }
                         if let Command::Measure { data } = &doc.commands[i].command
                             && let Some(frame) = doc.input_to(i)
                             && std::sync::Arc::ptr_eq(&frame.image, img)

@@ -370,6 +370,7 @@ impl MeasureData {
                     length_px: Some((p2_fit - p1_fit).length()),
                     group: Some(*group),
                     distance_px: None,
+                    source: None,
                     fit_regions: regions,
                 })
             }
@@ -381,10 +382,11 @@ impl MeasureData {
                 fit: boundary_fit,
             } => {
                 let dir = (*p2 - *p1).normalize();
-                // 領域枠は最初に与えた一点目を中心に固定（表示のみ。
+                let half = (*p2 - *p1).length() * 0.5;
+                // 領域枠はユーザー入力の線分の中点を中心に固定（表示のみ。
                 // モード 2/3 でも同じ位置）。フィッティングで動かない。
                 let region = FitRegion::new(
-                    *p1,
+                    (*p1 + *p2) * 0.5,
                     dir.perp(),
                     boundary_fit.length_px,
                     boundary_fit.width_px,
@@ -397,16 +399,16 @@ impl MeasureData {
                         kind: ToolKind::Boundary,
                         p1: *p1,
                         p2: *p2,
-                        length_px: Some((*p2 - *p1).length()),
+                        length_px: Some(half * 2.0),
                         group: Some(*group),
                         distance_px: None,
+                        source: None,
                         fit_regions: vec![region],
                     });
                 }
-                // モード 2/3: 一点目が線分の中点かつフィッティング領域の中心。
-                // 平均方向 = 二点目方向。フィッティングで一点目を垂直方向に調整する。
-                let center = fit_endpoint(*p1, dir, *boundary_fit, img, false);
-                let half = (*p2 - *p1).length();
+                // モード 2/3: 線分の中点でフィッティングし、検出位置へ
+                // 線全体を垂直方向に平行移動する（長さ・方向はユーザー入力のまま）。
+                let center = fit_endpoint((*p1 + *p2) * 0.5, dir, *boundary_fit, img, false);
                 Some(ComputedTool {
                     id: *id,
                     kind: ToolKind::Boundary,
@@ -415,6 +417,7 @@ impl MeasureData {
                     length_px: Some(half * 2.0),
                     group: Some(*group),
                     distance_px: None,
+                    source: None,
                     fit_regions: vec![region],
                 })
             }
@@ -434,6 +437,7 @@ impl MeasureData {
                     length_px: None,
                     group: None,
                     distance_px: Some(*distance),
+                    source: Some(*source),
                     fit_regions: Vec::new(),
                 })
             }
@@ -488,6 +492,8 @@ pub struct ComputedTool {
     pub group: Option<u64>,
     /// オフセット線の符号付きオフセット距離（px）。
     pub distance_px: Option<f64>,
+    /// Offset のみ。元の境界線の id（関係を示す矢印の描画に使う）。
+    pub source: Option<u64>,
     /// フィッティング領域の枠（オーバーレイ描画用）。Off なら空。
     pub fit_regions: Vec<FitRegion>,
 }
@@ -783,7 +789,7 @@ mod tests {
     }
 
     #[test]
-    fn boundary_fit_centers_on_edge_and_doubles_length() {
+    fn boundary_fit_centers_on_edge_at_midpoint() {
         // y = 30 で輝度が 0 → 3000 に変わる水平エッジ。
         let (w, h) = (200, 100);
         let mut img = Gray16::black(w, h);
@@ -794,7 +800,7 @@ mod tests {
         }
         let mut data = MeasureData::default();
         let g = data.group_for_new_measurement();
-        // 線方向は水平（二点目が右）。一点目はエッジから 1 px ずらして置く。
+        // 線方向は水平（二点目が右）。エッジから 1 px ずらして置く。
         let fit = FitSettings {
             mode: FitMode::DerivativeGaussian,
             width_px: 11,
@@ -809,11 +815,15 @@ mod tests {
         });
         let c = data.compute(&img, None);
         let t = c.by_id(1).unwrap();
-        // 中心がエッジ（y ≈ 29.5）へ吸着し、線分は p1 を中心に 2 倍の長さ。
+        // 中点（75, 31）でフィット → エッジ（y ≈ 29.5）へ線全体が垂直シフト。
+        // 長さ・方向はユーザー入力のまま（x は 50〜100、長さ 50）。
         assert!((t.p1.y - 29.5).abs() < 0.5, "{}", t.p1.y);
         assert!((t.p2.y - 29.5).abs() < 0.5, "{}", t.p2.y);
-        assert!((t.p1.x - 0.0).abs() < 1e-9, "{}", t.p1.x);
+        assert!((t.p1.x - 50.0).abs() < 1e-9, "{}", t.p1.x);
         assert!((t.p2.x - 100.0).abs() < 1e-9, "{}", t.p2.x);
-        assert!((t.length_px.unwrap() - 100.0).abs() < 1e-9);
+        assert!((t.length_px.unwrap() - 50.0).abs() < 1e-9);
+        // 領域枠は中点を中心に表示される（フィット位置には追従しない）。
+        assert!((t.fit_regions[0].center.x - 75.0).abs() < 1e-9, "{}", t.fit_regions[0].center.x);
+        assert!((t.fit_regions[0].center.y - 31.0).abs() < 1e-9, "{}", t.fit_regions[0].center.y);
     }
 }
