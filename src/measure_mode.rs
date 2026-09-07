@@ -5,6 +5,8 @@
 //! 同じ方式）。決定で確定、キャンセルは確認を経て破棄。ツール操作は
 //! Ctrl+Z / Ctrl+Shift+Z で undo / redo できる。
 
+use std::path::{Path, PathBuf};
+
 use egui::{
     Align2, Color32, Context, CursorIcon, FontId, Painter, Pos2, Rect, Sense, Stroke, Ui, Vec2,
 };
@@ -127,10 +129,23 @@ enum ResultAction {
     BeginRename(u64),
     Rename(u64, String),
     DeleteTool(u64),
+    /// グループと、そのグループに属するツールをまとめて削除。
+    DeleteGroup(u64),
+    /// グループ内で測定結果を上下に動かす（番号は表示時に振り直す）。
+    MoveTool { gid: u64, id: u64, delta: isize },
+    /// グループ内を代表座標（anchor_point）の x / y で昇順に並べ替える。
+    SortGroup { gid: u64, key: SortKey },
     /// 全グループの統計データをクリップボードへコピー。
     CopyStats,
     /// 1 グループの測長結果一覧をクリップボードへコピー。
     CopyGroupData(u64),
+}
+
+/// グループ内ソートのキー。代表座標のどちらの軸で比較するか。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SortKey {
+    X,
+    Y,
 }
 
 #[derive(Default)]
@@ -313,20 +328,22 @@ impl MeasureMode {
     // ------------------------------------------------------ パネル UI
 
     /// 右パネル（command_panel と同じ場所）に測長 UI を表示する。
-    pub fn show_panel(&mut self, ui: &mut Ui, doc: &mut Document) {
+    /// 戻り値は「保存」ボタンが押されたか（呼び出し側でファイルへ保存する）。
+    pub fn show_panel(&mut self, ui: &mut Ui, doc: &mut Document) -> bool {
         if !self.open {
-            return;
+            return false;
         }
         // 編集中にコマンド行が消えたり差し替わったら閉じる。
         if self.index >= doc.commands.len()
             || !matches!(doc.commands[self.index].command, Command::Measure { .. })
         {
             self.open = false;
-            return;
+            return false;
         }
 
         let mut confirmed = false;
         let mut cancel_requested = false;
+        let mut save_requested = false;
 
         egui::Panel::right("command_panel")
             .resizable(true)
@@ -337,7 +354,7 @@ impl MeasureMode {
                 ui.strong("測長");
                 ui.separator();
 
-                self.settings_ui(ui, doc);
+                save_requested |= self.settings_ui(ui, doc);
                 ui.separator();
                 self.tools_ui(ui, doc);
                 ui.separator();
@@ -372,6 +389,7 @@ impl MeasureMode {
                 self.confirm_cancel = true;
             }
         }
+        save_requested
     }
 
     /// フィッティング領域をダブルクリック/右クリックしたときに開く
@@ -463,7 +481,9 @@ impl MeasureMode {
         }
     }
 
-    fn settings_ui(&mut self, ui: &mut Ui, doc: &mut Document) {
+    /// 設定 UI。戻り値は「保存」ボタンが押されたか。
+    fn settings_ui(&mut self, ui: &mut Ui, doc: &mut Document) -> bool {
+        let mut save_requested = false;
         ui.strong("設定");
         ui.horizontal(|ui| {
             ui.label("角度:");
@@ -509,6 +529,40 @@ impl MeasureMode {
                 self.change_once(doc);
             }
         });
+
+        // 測定結果 JSON の出力先。{dir} / {filename} は保存時に画像パスから
+        // 解決するので、自由なパスを書いてもよい。
+        ui.horizontal(|ui| {
+            ui.label("出力:");
+            let resp = ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.data.output_path)
+                        .desired_width(180.0)
+                        .hint_text("{dir}/{filename}_result.json"),
+                )
+                .on_hover_text(
+                    "測定結果 JSON の出力先。{dir} は開いている画像のフォルダ、\n\
+                     {filename} は拡張子なしのファイル名に置き換わります。\n\
+                     空欄にすると保存しません。",
+                );
+            if resp.gained_focus() {
+                self.begin_change();
+            }
+            if resp.changed() {
+                self.apply_change(doc);
+            }
+        });
+        ui.horizontal(|ui| {
+            if ui
+                .button("保存")
+                .on_hover_text("測定結果を JSON で保存（再計算のときにも保存されます）")
+                .clicked()
+            {
+                save_requested = true;
+            }
+            ui.weak("再計算時に自動保存");
+        });
+        save_requested
     }
 
     fn tools_ui(&mut self, ui: &mut Ui, doc: &mut Document) {
@@ -697,15 +751,41 @@ impl MeasureMode {
                                     ui.close();
                                     actions.push(ResultAction::CopyGroupData(gid));
                                 }
+                                if ui
+                                    .add_enabled(has_data, egui::Button::new("x 座標でソート"))
+                                    .on_disabled_hover_text("このグループに測長結果はありません")
+                                    .clicked()
+                                {
+                                    ui.close();
+                                    actions.push(ResultAction::SortGroup { gid, key: SortKey::X });
+                                }
+                                if ui
+                                    .add_enabled(has_data, egui::Button::new("y 座標でソート"))
+                                    .on_disabled_hover_text("このグループに測長結果はありません")
+                                    .clicked()
+                                {
+                                    ui.close();
+                                    actions.push(ResultAction::SortGroup { gid, key: SortKey::Y });
+                                }
                             });
+                        }
+                        // グループごとの一括削除。
+                        if ui
+                            .small_button("×")
+                            .on_hover_text("グループとその測長結果をすべて削除")
+                            .clicked()
+                        {
+                            actions.push(ResultAction::DeleteGroup(gid));
                         }
                         if let Some(stat) = group_stat(&computed, gid, scale) {
                             ui.label(egui::RichText::new(stat).weak());
                         }
                     });
 
-                    // グループ内の測定結果（インデント + 自動採番）。
-                    for (n, tid) in self.data.group_tools(gid).iter().enumerate() {
+                    // グループ内の測定結果（インデント + 自動採番）。番号は
+                    // 並べ替えるたびに先頭から振り直す。
+                    let ids = self.data.group_tools(gid);
+                    for (n, tid) in ids.iter().enumerate() {
                         ui.horizontal(|ui| {
                             ui.add_space(24.0);
                             match computed.by_id(*tid) {
@@ -726,6 +806,28 @@ impl MeasureMode {
                                 .clicked()
                             {
                                 actions.push(ResultAction::DeleteTool(*tid));
+                            }
+                            if ui
+                                .add_enabled(n > 0, egui::Button::new("▲").small())
+                                .on_hover_text("グループ内で上へ")
+                                .clicked()
+                            {
+                                actions.push(ResultAction::MoveTool {
+                                    gid,
+                                    id: *tid,
+                                    delta: -1,
+                                });
+                            }
+                            if ui
+                                .add_enabled(n + 1 < ids.len(), egui::Button::new("▼").small())
+                                .on_hover_text("グループ内で下へ")
+                                .clicked()
+                            {
+                                actions.push(ResultAction::MoveTool {
+                                    gid,
+                                    id: *tid,
+                                    delta: 1,
+                                });
                             }
                         });
                     }
@@ -779,6 +881,42 @@ impl MeasureMode {
                             .retain(|t| t.id() != id && !ids.contains(&t.id()));
                     });
                 }
+                ResultAction::DeleteGroup(gid) => {
+                    if self.rename == Some(gid) {
+                        self.rename = None;
+                    }
+                    // グループ内のツールと、それらを参照するオフセット線を消す。
+                    let ids: Vec<u64> = self
+                        .data
+                        .tools
+                        .iter()
+                        .filter(|t| {
+                            matches!(
+                                t,
+                                MeasureTool::Distance { group, .. }
+                                    | MeasureTool::Boundary { group, .. }
+                                    if *group == gid
+                            )
+                        })
+                        .map(|t| t.id())
+                        .collect();
+                    self.mutate(doc, |data| {
+                        data.tools.retain(|t| {
+                            !matches!(t, MeasureTool::Offset { source, .. } if ids.contains(source))
+                                && !ids.contains(&t.id())
+                        });
+                        data.groups.retain(|g| g.id != gid);
+                        if data.active_group == Some(gid) {
+                            data.active_group = None;
+                        }
+                    });
+                }
+                ResultAction::MoveTool { gid, id, delta } => {
+                    self.mutate(doc, |data| move_tool_in_group(data, gid, id, delta));
+                }
+                ResultAction::SortGroup { gid, key } => {
+                    self.mutate(doc, |data| sort_group(data, &computed, gid, key));
+                }
                 ResultAction::CopyStats => {
                     ui.ctx().copy_text(stats_csv(&self.data, &computed, scale));
                 }
@@ -788,6 +926,129 @@ impl MeasureMode {
             }
         }
     }
+}
+
+/// グループ内の表示順でツールを上下に動かす。`data.tools` 内で隣接する
+/// 同じグループのツールと位置を入れ替える（番号は表示時に振り直される）。
+fn move_tool_in_group(data: &mut MeasureData, gid: u64, id: u64, delta: isize) {
+    let Some(i) = data.tools.iter().position(|t| t.id() == id) else {
+        return;
+    };
+    let step = delta.signum();
+    let mut j = i as isize + step;
+    while j >= 0 && (j as usize) < data.tools.len() {
+        if matches!(&data.tools[j as usize], MeasureTool::Distance { group, .. } if *group == gid)
+        {
+            data.tools.swap(i, j as usize);
+            return;
+        }
+        j += step;
+    }
+}
+
+/// グループ内の測定ツールを代表座標の x / y で昇順に並べ替える。
+/// move_tool_in_group と同様、ツール本体（ID はそのまま）を並べ替える。
+/// グループ所属ツールをソート済み順に取り出して元のスロットへ書き戻すので、
+/// グループ外のツールの並びは変わらない。
+fn sort_group(data: &mut MeasureData, computed: &ComputedMeasure, gid: u64, key: SortKey) {
+    let mut ids = data.group_tools(gid);
+    let pos = |id: u64| computed.by_id(id).and_then(|t| t.anchor_point());
+    ids.sort_by(|a, b| {
+        let (Some(pa), Some(pb)) = (pos(*a), pos(*b)) else {
+            return std::cmp::Ordering::Equal;
+        };
+        let (va, vb) = match key {
+            SortKey::X => (pa.x, pb.x),
+            SortKey::Y => (pa.y, pb.y),
+        };
+        va.partial_cmp(&vb).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let members: Vec<MeasureTool> = ids
+        .iter()
+        .filter_map(|&id| data.tools.iter().find(|t| t.id() == id).cloned())
+        .collect();
+    let mut it = members.into_iter();
+    for t in &mut data.tools {
+        if matches!(t, MeasureTool::Distance { group, .. } if *group == gid) {
+            if let Some(m) = it.next() {
+                *t = m;
+            }
+        }
+    }
+}
+
+/// 測長コマンド `index` の測定結果を JSON で保存する。
+/// 出力先は `data.output_path`（`{dir}` / `{filename}` は画像パスから解決）。
+/// 空文字列のときは保存しない（Ok(None)）。戻り値は実際に保存したパス。
+pub fn save_measure_json(doc: &Document, index: usize) -> Result<Option<PathBuf>, String> {
+    let Command::Measure { data } = &doc.commands[index].command else {
+        return Err("測長コマンドではありません".to_owned());
+    };
+    let template = data.output_path.trim();
+    if template.is_empty() {
+        return Ok(None);
+    }
+    let img_path = doc.commands[..=index]
+        .iter()
+        .rev()
+        .find_map(|c| match &c.command {
+            Command::InsertImage { path } => Some(path.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| "画像がありません（画像を挿入してから保存してください）".to_owned())?;
+    let Some(frame) = doc.input_to(index) else {
+        return Err("結果がまだ計算されていません".to_owned());
+    };
+    let path = resolve_output_path(template, &img_path);
+    // JSON の先頭にはファイル名を出す。
+    let filename = img_path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "image".to_owned());
+    let computed = data.compute(&frame.image, frame.scale);
+    let groups: Vec<serde_json::Value> = data
+        .groups
+        .iter()
+        .map(|g| {
+            let values: Vec<String> = data
+                .group_tools(g.id)
+                .iter()
+                .filter_map(|tid| {
+                    computed
+                        .by_id(*tid)
+                        .and_then(|t| t.length_px)
+                        .map(|l| format_measurement(l, frame.scale))
+                })
+                .collect();
+            serde_json::json!({ "name": g.name, "values": values })
+        })
+        .collect();
+    let json = serde_json::json!({ "filename": filename, "groups": groups });
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&json).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| format!("{} に保存できません: {e}", path.to_string_lossy()))?;
+    Ok(Some(path))
+}
+
+/// `{dir}` / `{filename}` を画像パスから解決する。
+fn resolve_output_path(template: &str, img_path: &Path) -> PathBuf {
+    let dir = img_path
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| ".".to_owned());
+    let stem = img_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| {
+            img_path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "image".to_owned())
+        });
+    PathBuf::from(template.replace("{dir}", &dir).replace("{filename}", &stem))
 }
 
 /// フィッティング設定 UI の変更検出結果。
@@ -1943,4 +2204,132 @@ fn nearest_tool(
                 .partial_cmp(&distance_to_segment(pos, b.p1, b.p2))
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::document::SourceCache;
+
+    fn pt(x: f64, y: f64) -> Pt2 {
+        Pt2::new(x, y)
+    }
+
+    /// id 1..=3 の測長を持つグループを作る。中点は (100,15) / (20,50) / (55,5)。
+    fn data_with_group() -> (MeasureData, u64) {
+        let mut data = MeasureData::default();
+        let g = data.group_for_new_measurement();
+        for (i, (p1, p2)) in [
+            ((100.0, 10.0), (100.0, 20.0)),
+            ((10.0, 50.0), (30.0, 50.0)),
+            ((50.0, 5.0), (60.0, 5.0)),
+        ]
+        .iter()
+        .enumerate()
+        {
+            data.tools.push(MeasureTool::Distance {
+                id: i as u64 + 1,
+                p1: pt(p1.0, p1.1),
+                p2: pt(p2.0, p2.1),
+                group: g,
+                fit1: crate::measure::FitSettings::default(),
+                fit2: crate::measure::FitSettings::default(),
+            });
+        }
+        (data, g)
+    }
+
+    fn computed_of(data: &MeasureData) -> ComputedMeasure {
+        data.compute(&crate::gray::Gray16::black(200, 200), None)
+    }
+
+    #[test]
+    fn sort_action_via_mutate_updates_mode_and_doc() {
+        let (data, g) = data_with_group();
+        let computed = computed_of(&data);
+        let mut doc = Document::new("t");
+        doc.push_command(Command::Measure { data: data.clone() });
+
+        let mut mode = MeasureMode::default();
+        mode.index = 0;
+        mode.data = data;
+        // results_ui のアクション処理と同じ経路（mutate → self.data 変更 → doc 反映）。
+        mode.mutate(&mut doc, |d| sort_group(d, &computed, g, SortKey::X));
+        assert_eq!(mode.data.group_tools(g), vec![2, 3, 1]);
+        let Command::Measure { data: d } = &doc.commands[0].command else {
+            panic!("Measure のはず");
+        };
+        assert_eq!(d.group_tools(g), vec![2, 3, 1], "doc 側のコマンドにも反映される");
+    }
+
+    #[test]
+    fn sort_group_by_x_and_y() {
+        let (mut data, g) = data_with_group();
+        let computed = computed_of(&data);
+        sort_group(&mut data, &computed, g, SortKey::X);
+        assert_eq!(data.group_tools(g), vec![2, 3, 1], "x: 20, 55, 100 の順");
+        // move_tool_in_group と同じく、ツール本体が動く（ID は変わらない）。
+        let ids: Vec<u64> = data.tools.iter().map(|t| t.id()).collect();
+        assert_eq!(ids, vec![2, 3, 1], "data.tools の並び自体が入れ替わる");
+        let MeasureTool::Distance { p1, .. } = data.tools[0] else {
+            panic!("先頭は二点間測長");
+        };
+        assert_eq!(p1, pt(10.0, 50.0), "先頭は元 id2 のツール本体");
+        sort_group(&mut data, &computed, g, SortKey::Y);
+        assert_eq!(data.group_tools(g), vec![3, 1, 2], "y: 5, 15, 50 の順");
+    }
+
+    #[test]
+    fn move_tool_in_group_swaps_order() {
+        let (mut data, g) = data_with_group();
+        move_tool_in_group(&mut data, g, 1, 1);
+        assert_eq!(data.group_tools(g), vec![2, 1, 3]);
+        move_tool_in_group(&mut data, g, 3, -1);
+        assert_eq!(data.group_tools(g), vec![2, 3, 1]);
+        // 端のツールは動かない。
+        move_tool_in_group(&mut data, g, 2, -1);
+        assert_eq!(data.group_tools(g), vec![2, 3, 1]);
+        move_tool_in_group(&mut data, g, 1, 1);
+        assert_eq!(data.group_tools(g), vec![2, 3, 1]);
+    }
+
+    #[test]
+    fn save_measure_json_writes_filename_first() {
+        let dir = std::env::temp_dir().join(format!("tem_measure_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let img_path = dir.join("sample.tif");
+        image::GrayImage::from_raw(4, 4, vec![0u8; 16])
+            .unwrap()
+            .save(&img_path)
+            .unwrap();
+
+        let mut doc = Document::new("sample.tif");
+        doc.push_command(Command::InsertImage {
+            path: img_path.clone(),
+        });
+        let (mut data, _g) = data_with_group();
+        data.output_path = "{dir}/{filename}_result.json".to_owned();
+        doc.push_command(Command::Measure { data });
+        doc.recompute(&mut SourceCache::new());
+
+        let path = save_measure_json(&doc, 1).unwrap().expect("保存される");
+        assert_eq!(path, dir.join("sample_result.json"));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.starts_with("{\n  \"filename\": \"sample.tif\""),
+            "先頭にファイル名: {text}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["groups"][0]["values"].as_array().unwrap().len(), 3);
+
+        // 出力先が空なら保存しない。
+        let mut empty = MeasureData::default();
+        empty.output_path = String::new();
+        doc.commands[1].command = Command::Measure { data: empty };
+        assert!(save_measure_json(&doc, 1).unwrap().is_none());
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(&img_path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+    }
 }

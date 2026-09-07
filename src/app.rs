@@ -32,6 +32,7 @@ enum Action {
     CopyCommands,
     PasteCommands,
     Recompute,
+    SaveMeasureResults,
     ReloadSources,
     SaveHistory,
     OpenHistory,
@@ -377,8 +378,12 @@ impl TemApp {
     fn ui_command_panel(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
         // 測長モード中は右パネルを測長ツール UI に置き換える。
         if self.measure_mode.open {
-            self.measure_mode
+            let save_requested = self
+                .measure_mode
                 .show_panel(ui, &mut self.docs[self.active]);
+            if save_requested {
+                actions.push(Action::SaveMeasureResults);
+            }
             return;
         }
         let dirty = self.doc().is_dirty();
@@ -648,8 +653,11 @@ impl TemApp {
                 } else {
                     "変更はありません。".to_owned()
                 };
+                // 測長結果の JSON 出力（測長コマンドが無ければ何もしない）。
+                self.save_measure_results();
                 ctx.request_repaint();
             }
+            Action::SaveMeasureResults => self.save_measure_results(),
             Action::ReloadSources => {
                 // 元ファイルを読み直したいときだけキャッシュを捨てる。
                 self.cache.clear();
@@ -810,6 +818,37 @@ impl TemApp {
             self.docs.push(Document::new("(空)"));
         }
         self.active = self.active.min(self.docs.len() - 1);
+    }
+
+    /// アクティブタブの測長コマンドの結果を、それぞれの出力先設定へ
+    /// JSON で保存する。保存が無ければステータスは変えない。
+    fn save_measure_results(&mut self) {
+        let doc = &self.docs[self.active];
+        let mut saved = Vec::new();
+        let mut error = None;
+        for i in 0..doc.commands.len() {
+            if !matches!(doc.commands[i].command, Command::Measure { .. }) {
+                continue;
+            }
+            match crate::measure_mode::save_measure_json(doc, i) {
+                Ok(Some(path)) => saved.push(path),
+                Ok(None) => {}
+                Err(e) => {
+                    error = Some(e);
+                    break;
+                }
+            }
+        }
+        if let Some(e) = error {
+            self.error = Some(e);
+            return;
+        }
+        if saved.is_empty() {
+            return;
+        }
+        self.error = None;
+        let names: Vec<String> = saved.iter().map(|p| file_label(p)).collect();
+        self.status = format!("測定結果を保存しました: {}", names.join(", "));
     }
 
     fn save_history(&mut self) {

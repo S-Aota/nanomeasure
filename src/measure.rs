@@ -217,6 +217,16 @@ pub struct MeasureData {
     /// 境界線のフィッティング設定（端点 1 のみ使用）。
     pub boundary_fit: FitSettings,
     pub tools: Vec<MeasureTool>,
+    /// 測定結果 JSON の出力先テンプレート。`{dir}` = 開いている画像の
+    /// フォルダ、`{filename}` = 拡張子なしのファイル名に保存時に置き換わる。
+    /// 空文字列は保存しない。
+    #[serde(default = "default_output_path")]
+    pub output_path: String,
+}
+
+/// 出力先テンプレートの既定値。
+pub fn default_output_path() -> String {
+    "{dir}/{filename}_result.json".to_owned()
 }
 
 impl Default for MeasureData {
@@ -229,6 +239,7 @@ impl Default for MeasureData {
             dist_fit2: FitSettings::default(),
             boundary_fit: FitSettings::default(),
             tools: Vec::new(),
+            output_path: default_output_path(),
         }
     }
 }
@@ -509,6 +520,17 @@ impl ComputedMeasure {
     }
 }
 
+impl ComputedTool {
+    /// 一覧の並べ替えなどの基準になる代表座標。二点間測長では
+    /// p1/p2 の中点。測長の種類が増えたらここに対応を足す。
+    pub fn anchor_point(&self) -> Option<Pt2> {
+        match self.kind {
+            ToolKind::Distance | ToolKind::Boundary => Some((self.p1 + self.p2) * 0.5),
+            ToolKind::Offset => None,
+        }
+    }
+}
+
 /// スナップに使う無限直線（単位方向つき）。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SnapLine {
@@ -720,6 +742,22 @@ mod tests {
         data.prefs.new_measure = NewMeasureMode::Keep;
         data.apply_new_measure_mode();
         assert_eq!(data.active_group, Some(g2));
+    }
+
+    /// 旧形式のデータ（output_path なし）は既定のテンプレートで読めること。
+    #[test]
+    fn output_path_defaults_when_missing() {
+        let json = r#"{
+            "prefs": {"angle": "four_dir", "snap": false, "new_measure": "new_group"},
+            "groups": [],
+            "active_group": null,
+            "dist_fit1": {"mode": "off", "width_px": 11, "length_px": 31},
+            "dist_fit2": {"mode": "off", "width_px": 11, "length_px": 31},
+            "boundary_fit": {"mode": "off", "width_px": 11, "length_px": 31},
+            "tools": []
+        }"#;
+        let data: MeasureData = serde_json::from_str(json).expect("output_path なしでも読める");
+        assert_eq!(data.output_path, "{dir}/{filename}_result.json");
     }
 
     #[test]
