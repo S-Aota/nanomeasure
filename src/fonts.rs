@@ -51,3 +51,11 @@ pub fn install_japanese_font(ctx: &Context) {
     }
     eprintln!("日本語フォントが見つかりませんでした。日本語が表示されない場合があります。");
 }
+
+/// 書き出し画像のラベル描画用に、最初に見つかったフォントのバイト列と
+/// face 番号。egui 用の `install_japanese_font` と同じ候補を試す。
+pub fn first_available_font() -> Option<(Vec<u8>, u32)> {
+    CANDIDATES
+        .iter()
+        .find_map(|(path, index)| std::fs::read(path).ok().map(|bytes| (bytes, *index)))
+}

@@ -28,6 +28,23 @@ pub enum Command {
     /// 測長。画像は変えず、ツール・グループ・フィッティング設定を保持する。
     /// フィッティングと測定値は適用のたびに再計算される。
     Measure { data: MeasureData },
+    /// アノテーション付き画像の書き出し。画像は変えず、出力先テンプレートと
+    /// アノテーション倍率を保持する。ファイル保存は適用のたびにアプリ側で行う。
+    ExportImage {
+        /// 出力先テンプレート。`{dir}` / `{filename}` は保存時に画像パスから解決。
+        output: String,
+        /// アノテーションの倍率（解像度による自動調整に掛ける係数）。
+        #[serde(default = "default_annotation_scale")]
+        annotation_scale: f32,
+        /// カラー（RGB 8bit）で保存するか。既定は 16bit グレースケール
+        /// （アノテーションの色は輝度へ落ちる）。
+        #[serde(default)]
+        color: bool,
+    },
+}
+
+fn default_annotation_scale() -> f32 {
+    1.0
 }
 
 impl Command {
@@ -58,6 +75,10 @@ impl Command {
             Self::Measure { data } => {
                 let measurements = data.tools.iter().filter(|t| t.is_measurement()).count();
                 format!("測長: グループ {} 件 / 測定 {} 件", data.groups.len(), measurements)
+            }
+            Self::ExportImage { output, color, .. } => {
+                let mode = if *color { "（カラー）" } else { "" };
+                format!("画像出力: {output}{mode}")
             }
         }
     }
@@ -115,9 +136,9 @@ impl Command {
                     scale: frame.scale,
                 })
             }
-            // 測長は画像を変えない素通しコマンド。オーバーレイと測定値は
-            // アプリ側で MeasureData::compute により毎回再計算される。
-            Self::Measure { .. } => Ok(require_input(input)?.clone()),
+            // 測長と画像出力は画像を変えない素通しコマンド。オーバーレイと
+            // 測定値はアプリ側で MeasureData::compute により毎回再計算される。
+            Self::Measure { .. } | Self::ExportImage { .. } => Ok(require_input(input)?.clone()),
         }
     }
 }
@@ -156,15 +177,10 @@ impl CommandItem {
     }
 }
 
-/// 測長コマンドを追加した版が 4。version 3 の履歴はそのまま読める
-/// （追加バリアントは後方互換のため）。version 2 以前は読まない。
-pub const HISTORY_FORMAT_VERSION: u32 = 4;
-
 /// `.json` に書き出すコマンド履歴。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HistoryFile {
     pub app: String,
-    pub version: u32,
     pub commands: Vec<CommandItem>,
 }
 
@@ -172,7 +188,6 @@ impl HistoryFile {
     pub fn new(commands: Vec<CommandItem>) -> Self {
         Self {
             app: "tem_measure".to_owned(),
-            version: HISTORY_FORMAT_VERSION,
             commands,
         }
     }
@@ -188,12 +203,6 @@ impl HistoryFile {
             .map_err(|e| format!("{} を読み込めません: {e}", path.to_string_lossy()))?;
         let file: Self = serde_json::from_str(&text)
             .map_err(|e| format!("{} の解析に失敗しました: {e}", path.to_string_lossy()))?;
-        if file.version > HISTORY_FORMAT_VERSION {
-            return Err(format!(
-                "この履歴はより新しい形式です (version {})",
-                file.version
-            ));
-        }
         Ok(file)
     }
 
@@ -244,9 +253,10 @@ mod tests {
         assert_eq!(cmd.label(), "スケール設定: 1 px = 0.09352 nm");
     }
 
-    /// version 3 の履歴（測長コマンドなし）はそのまま読めること。
+    /// 測長コマンドの無い古い履歴はそのまま読めること。version キーは
+    /// リリース前に廃止したので、あっても未知のキーとして無視される。
     #[test]
-    fn version3_history_still_loads() {
+    fn history_without_measure_commands_still_loads() {
         let json = r#"{
             "app": "tem_measure",
             "version": 3,
@@ -255,17 +265,9 @@ mod tests {
                 {"enabled": true, "command": {"type": "SetScale", "pixels": 1.0, "length": 0.093517, "unit": "nm"}}
             ]
         }"#;
-        let file: HistoryFile = serde_json::from_str(json).expect("v3 は読める");
+        let file: HistoryFile = serde_json::from_str(json).expect("version キー付きでも読める");
         assert_eq!(file.commands.len(), 2);
         assert!(file.processing_only().len() == 1, "画像挿入だけが除かれる");
-    }
-
-    /// 新しい形式は version 判定で拒否されること。
-    #[test]
-    fn newer_version_is_rejected_on_parse() {
-        let json = r#"{"app": "tem_measure", "version": 99, "commands": []}"#;
-        let file: HistoryFile = serde_json::from_str(json).unwrap();
-        assert!(file.version > HISTORY_FORMAT_VERSION);
     }
 
     /// 測長コマンドを含む履歴の JSON ラウンドトリップ。
@@ -283,5 +285,29 @@ mod tests {
             panic!("Measure に戻る");
         };
         assert_eq!(d, data);
+    }
+
+    /// 画像出力コマンドの JSON ラウンドトリップ。annotation_scale / color が
+    /// 無い JSON は既定値（1.0 / グレー）で読めること。
+    #[test]
+    fn export_command_round_trips() {
+        let cmd = Command::ExportImage {
+            output: "{dir}/{filename}_result.jpg".to_owned(),
+            annotation_scale: 2.0,
+            color: true,
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let back: Command = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, cmd);
+        let missing: Command =
+            serde_json::from_str(r#"{"type":"ExportImage","output":"a.png"}"#).unwrap();
+        assert_eq!(
+            missing,
+            Command::ExportImage {
+                output: "a.png".to_owned(),
+                annotation_scale: 1.0,
+                color: false,
+            }
+        );
     }
 }

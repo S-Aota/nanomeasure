@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use egui::Ui;
 
 use crate::command::{Command, CommandItem, HistoryFile, load_image};
-use crate::dialogs::{LevelsDialog, RotateDialog, ScaleDialog};
+use crate::dialogs::{ExportDialog, LevelsDialog, RotateDialog, ScaleDialog};
 use crate::document::{Document, SourceCache};
 use crate::frame::format_length;
 use crate::measure_mode::MeasureMode;
@@ -23,6 +23,8 @@ enum Action {
     NewRotate,
     NewLevels,
     NewMeasure,
+    NewExport,
+    SaveImageExports,
     EditCommand(usize),
     ToggleCommand(usize),
     DeleteCommand(usize),
@@ -61,6 +63,7 @@ pub struct TemApp {
     scale_dialog: ScaleDialog,
     rotate_dialog: RotateDialog,
     levels_dialog: LevelsDialog,
+    export_dialog: ExportDialog,
     measure_mode: MeasureMode,
     /// データは変えずに、表示だけ min/max へ引き伸ばす。
     auto_contrast: bool,
@@ -84,6 +87,7 @@ impl TemApp {
             scale_dialog: ScaleDialog::default(),
             rotate_dialog: RotateDialog::default(),
             levels_dialog: LevelsDialog::default(),
+            export_dialog: ExportDialog::default(),
             measure_mode: MeasureMode::default(),
             auto_contrast: true,
             help_open: false,
@@ -192,6 +196,13 @@ impl TemApp {
                         .clicked()
                     {
                         actions.push(Action::NewMeasure);
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(self.has_image(), egui::Button::new("画像出力..."))
+                        .clicked()
+                    {
+                        actions.push(Action::NewExport);
                         ui.close();
                     }
                     ui.menu_button("フィルタ", |ui| {
@@ -576,6 +587,7 @@ impl TemApp {
                 ui.label("・Esc でツール選択を解除すると、左ドラッグでパンが使えます。非選択状態では測長・境界線をクリックして選択し、ドラッグで移動できます（端点付近のクリックは端点だけ、線の上は全体が動きます）。");
                 ui.label("・フィッティング領域をダブルクリックすると、その測長だけのフィッティング設定を再編集できます。");
                 ui.label("・直線複製: 測長・境界線をクリックで選択し、マウス移動で方向と距離を指定して、もう一度クリックで確定。ホイールで複製数 (1-20) を調整し、距離を等分した位置に複製します。");
+                ui.label("・画像出力: コマンド → 画像出力... でアノテーション付き画像の保存先を設定します（tif / png / jpg）。決定または「再計算」(F5) で保存されます。");
                 ui.label("・中ドラッグまたは右ドラッグでパン、ホイールでズームできます（測長モード中も同じ）。");
             });
         self.help_open = help_open;
@@ -623,6 +635,12 @@ impl TemApp {
                 self.close_dialogs();
                 self.measure_mode.open_new(&mut self.docs[index], index);
             }
+            Action::NewExport => {
+                let index = self.active;
+                self.close_dialogs();
+                self.export_dialog.open_new(&mut self.docs[index]);
+            }
+            Action::SaveImageExports => self.save_image_exports(),
             Action::EditCommand(i) => self.edit_command(i),
             Action::ToggleCommand(i) => self.doc_mut().invalidate_from(i),
             Action::DeleteCommand(i) => {
@@ -655,6 +673,8 @@ impl TemApp {
                 };
                 // 測長結果の JSON 出力（測長コマンドが無ければ何もしない）。
                 self.save_measure_results();
+                // アノテーション付き画像の書き出し（画像出力コマンドがあれば）。
+                self.save_image_exports();
                 ctx.request_repaint();
             }
             Action::SaveMeasureResults => self.save_measure_results(),
@@ -680,6 +700,7 @@ impl TemApp {
         self.scale_dialog.open = false;
         self.rotate_dialog.open = false;
         self.levels_dialog.open = false;
+        self.export_dialog.open = false;
         // 測長モードも編集中のダイアログと同様に閉じる（コマンド構造の
         // 変更操作と競合しないように、破棄して終了する）。
         if self.measure_mode.open {
@@ -697,6 +718,7 @@ impl TemApp {
         self.scale_dialog.open
             || self.rotate_dialog.open
             || self.levels_dialog.open
+            || self.export_dialog.open
             || self.measure_mode.open
     }
 
@@ -744,6 +766,7 @@ impl TemApp {
                 let tab = self.active;
                 self.measure_mode.open_edit(doc, tab, index)
             }
+            Command::ExportImage { .. } => self.export_dialog.open_edit(doc, index),
             Command::InsertImage { path } => {
                 // 画像挿入の「パラメータ」は読み込むファイルそのもの。
                 let mut dialog = rfd::FileDialog::new()
@@ -849,6 +872,89 @@ impl TemApp {
         self.error = None;
         let names: Vec<String> = saved.iter().map(|p| file_label(p)).collect();
         self.status = format!("測定結果を保存しました: {}", names.join(", "));
+    }
+
+    /// アクティブタブの画像出力コマンドを実行する。出力先は各コマンドの
+    /// テンプレート（`{dir}` / `{filename}` は画像パスから解決）。
+    /// アノテーションは、画面上に重ねて表示しているのと同じ測長オーバーレイ。
+    fn save_image_exports(&mut self) {
+        let doc = &self.docs[self.active];
+        let mut saved = Vec::new();
+        let mut error = None;
+        for i in 0..doc.commands.len() {
+            let Command::ExportImage {
+                output,
+                annotation_scale,
+                color,
+            } = &doc.commands[i].command
+            else {
+                continue;
+            };
+            let template = output.trim();
+            if template.is_empty() {
+                continue;
+            }
+            let Some(img_path) = doc.commands[..=i].iter().rev().find_map(|c| match &c.command {
+                Command::InsertImage { path } => Some(path.clone()),
+                _ => None,
+            }) else {
+                error = Some("画像がありません（画像を挿入してから保存してください）".to_owned());
+                break;
+            };
+            let Some(frame) = doc.input_to(i) else {
+                error = Some("結果がまだ計算されていません".to_owned());
+                break;
+            };
+            let path = crate::measure_mode::resolve_output_path(template, &img_path);
+            if !crate::export::validate_extension(&path) {
+                error = Some(format!(
+                    "{} は対応していない拡張子です（tif / png / jpg）",
+                    path.to_string_lossy()
+                ));
+                break;
+            }
+            // 書き出し画像と同じフレームに効いている測長オーバーレイを集める
+            // （表示のオーバーレイ描画と同じ判定。編集中の測長コマンドは除く）。
+            let mut overlays = Vec::new();
+            for j in 0..doc.commands.len() {
+                if self.measure_mode.open
+                    && self.measure_mode.tab == self.active
+                    && j == self.measure_mode.index
+                {
+                    continue;
+                }
+                if let Command::Measure { data } = &doc.commands[j].command
+                    && let Some(fj) = doc.input_to(j)
+                    && std::sync::Arc::ptr_eq(&fj.image, &frame.image)
+                {
+                    overlays.push((data.compute(&fj.image, fj.scale), fj.scale));
+                }
+            }
+            let result = if *color {
+                let buf = crate::export::render_rgb(&frame.image, &overlays, *annotation_scale);
+                crate::export::save_rgb(&buf, &path)
+            } else {
+                let buf = crate::export::render(&frame.image, &overlays, *annotation_scale);
+                crate::export::save(&buf, &path)
+            };
+            match result {
+                Ok(()) => saved.push(path),
+                Err(e) => {
+                    error = Some(e);
+                    break;
+                }
+            }
+        }
+        if let Some(e) = error {
+            self.error = Some(e);
+            return;
+        }
+        if saved.is_empty() {
+            return;
+        }
+        self.error = None;
+        let names: Vec<String> = saved.iter().map(|p| file_label(p)).collect();
+        self.status = format!("画像を保存しました: {}", names.join(", "));
     }
 
     fn save_history(&mut self) {
@@ -1110,6 +1216,9 @@ impl eframe::App for TemApp {
         self.scale_dialog.show(&ctx, doc);
         self.rotate_dialog.show(&ctx, doc);
         self.levels_dialog.show(&ctx, doc);
+        if self.export_dialog.show(&ctx, doc) {
+            actions.push(Action::SaveImageExports);
+        }
         if self.measure_mode.open {
             let tab = self.measure_mode.tab;
             if tab < self.docs.len() {

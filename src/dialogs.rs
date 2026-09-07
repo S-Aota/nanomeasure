@@ -541,3 +541,166 @@ impl LevelsDialog {
         }
     }
 }
+
+// -------------------------------------------------------------- 画像出力
+
+/// アノテーション付き画像の出力先テンプレートと形式を入力する。
+/// 形式は拡張子で指定する（tif / png / jpg）。
+#[derive(Default)]
+pub struct ExportDialog {
+    pub open: bool,
+    index: Option<usize>,
+    created: bool,
+    original: Option<Command>,
+    output: String,
+    annotation_scale: f32,
+    color: bool,
+}
+
+impl ExportDialog {
+    pub fn open_new(&mut self, doc: &mut Document) {
+        let index = doc.push_command(Command::ExportImage {
+            output: crate::export::DEFAULT_EXPORT_PATH.to_owned(),
+            annotation_scale: 1.0,
+            color: false,
+        });
+        self.start(doc, index, true);
+    }
+
+    pub fn open_edit(&mut self, doc: &mut Document, index: usize) {
+        self.start(doc, index, false);
+    }
+
+    fn start(&mut self, doc: &Document, index: usize, created: bool) {
+        let original = doc.commands[index].command.clone();
+        match &original {
+            Command::ExportImage {
+                output,
+                annotation_scale,
+                color,
+            } => {
+                self.output = output.clone();
+                self.annotation_scale = *annotation_scale;
+                self.color = *color;
+            }
+            _ => {
+                self.output = crate::export::DEFAULT_EXPORT_PATH.to_owned();
+                self.annotation_scale = 1.0;
+                self.color = false;
+            }
+        }
+        self.index = Some(index);
+        self.created = created;
+        self.original = Some(original);
+        self.open = true;
+    }
+
+    /// ウィンドウを表示する。戻り値は「決定」で保存が要求されたか。
+    pub fn show(&mut self, ctx: &Context, doc: &mut Document) -> bool {
+        if !self.open {
+            return false;
+        }
+        if self.index.is_some_and(|i| i >= doc.commands.len()) {
+            self.open = false;
+            return false;
+        }
+        let index = self.index.expect("open なら index あり");
+
+        let mut window_open = true;
+        let mut confirmed = false;
+        let mut cancelled = false;
+
+        egui::Window::new("画像出力")
+            .open(&mut window_open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(480.0)
+            .show(ctx, |ui| {
+                ui.label("アノテーション（寸法・矢印など）付きの画像を保存します。");
+                ui.label("拡張子で形式を指定します（tif / png / jpg）。");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label("出力先:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.output)
+                            .desired_width(330.0)
+                            .hint_text(crate::export::DEFAULT_EXPORT_PATH),
+                    );
+                });
+                ui.label(
+                    "{dir} は開いている画像のフォルダ、{filename} は拡張子なしのファイル名に置き換わります。",
+                );
+                let path = std::path::Path::new(self.output.trim());
+                if self.output.trim().is_empty() {
+                    ui.colored_label(
+                        Color32::from_rgb(255, 140, 140),
+                        "出力先を入力してください。",
+                    );
+                } else if !crate::export::validate_extension(path) {
+                    ui.colored_label(
+                        Color32::from_rgb(255, 140, 140),
+                        "対応していない拡張子です（tif / png / jpg）。",
+                    );
+                }
+                ui.add_space(8.0);
+                ui.checkbox(&mut self.color, "カラー（RGB）で保存")
+                    .on_hover_text(
+                        "アノテーションの色を残します。画像の階調は 8bit になります。\n\
+                         オフのときは 16bit グレースケールのまま、色は輝度へ落ちます。",
+                    );
+                ui.add_space(8.0);
+                ui.add(
+                    egui::Slider::new(&mut self.annotation_scale, 0.5..=4.0)
+                        .text("アノテーション倍率"),
+                );
+                ui.label(
+                    "線の太さや文字の大きさは画像の解像度に合わせて自動調整されます。この値はそれに掛ける係数です。",
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let valid = !self.output.trim().is_empty()
+                        && crate::export::validate_extension(path);
+                    if ui.add_enabled(valid, egui::Button::new("決定")).clicked() {
+                        confirmed = true;
+                    }
+                    if ui.button("キャンセル").clicked() {
+                        cancelled = true;
+                    }
+                });
+            });
+
+        // ライブ反映（他ダイアログと同じ方式。このコマンド自体にプレビューは無い）。
+        set_command(
+            doc,
+            index,
+            Command::ExportImage {
+                output: self.output.clone(),
+                annotation_scale: self.annotation_scale,
+                color: self.color,
+            },
+        );
+
+        if cancelled || !window_open {
+            self.revert(doc);
+            self.open = false;
+            return false;
+        }
+        if confirmed {
+            self.original = None;
+            self.open = false;
+            return true;
+        }
+        false
+    }
+
+    fn revert(&mut self, doc: &mut Document) {
+        let Some(index) = self.index else {
+            return;
+        };
+        if self.created {
+            doc.remove_command(index);
+        } else if let Some(original) = self.original.take() {
+            set_command(doc, index, original);
+        }
+    }
+}

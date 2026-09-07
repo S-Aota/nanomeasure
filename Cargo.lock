@@ -3848,6 +3848,7 @@ dependencies = [
 name = "tem_measure"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph",
  "eframe",
  "egui",
  "egui_extras",

@@ -34,17 +34,17 @@ const SNAP_PX: f32 = 10.0;
 const PICK_PX: f32 = 20.0;
 
 /// 二点間測長（赤）。
-const COLOR_DISTANCE: Color32 = Color32::from_rgb(235, 70, 70);
+pub(crate) const COLOR_DISTANCE: Color32 = Color32::from_rgb(235, 70, 70);
 /// 境界線・オフセット線（紫）。
-const COLOR_GUIDE: Color32 = Color32::from_rgb(175, 90, 235);
+pub(crate) const COLOR_GUIDE: Color32 = Color32::from_rgb(175, 90, 235);
 /// フィッティング領域の枠。フィッティング設定 1〜3 に合わせて色を変える。
-const COLOR_REGION_OFF: Color32 = Color32::from_rgb(240, 160, 60); // 1: オレンジ
-const COLOR_REGION_GAUSSIAN: Color32 = Color32::from_rgb(90, 180, 240); // 2: 水色
-const COLOR_REGION_DERIV: Color32 = Color32::from_rgb(150, 220, 90); // 3: 黄緑
+pub(crate) const COLOR_REGION_OFF: Color32 = Color32::from_rgb(240, 160, 60); // 1: オレンジ
+pub(crate) const COLOR_REGION_GAUSSIAN: Color32 = Color32::from_rgb(90, 180, 240); // 2: 水色
+pub(crate) const COLOR_REGION_DERIV: Color32 = Color32::from_rgb(150, 220, 90); // 3: 黄緑
 /// 作成中・選択中の一時表示（橙）。
 const COLOR_IN_PROGRESS: Color32 = Color32::from_rgb(255, 150, 60);
 
-fn region_color(mode: FitMode) -> Color32 {
+pub(crate) fn region_color(mode: FitMode) -> Color32 {
     match mode {
         FitMode::Off => COLOR_REGION_OFF,
         FitMode::Gaussian => COLOR_REGION_GAUSSIAN,
@@ -1032,8 +1032,8 @@ pub fn save_measure_json(doc: &Document, index: usize) -> Result<Option<PathBuf>
     Ok(Some(path))
 }
 
-/// `{dir}` / `{filename}` を画像パスから解決する。
-fn resolve_output_path(template: &str, img_path: &Path) -> PathBuf {
+/// `{dir}` / `{filename}` を画像パスから解決する（画像出力コマンドでも共用）。
+pub(crate) fn resolve_output_path(template: &str, img_path: &Path) -> PathBuf {
     let dir = img_path
         .parent()
         .map(|p| p.to_string_lossy().into_owned())

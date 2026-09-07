@@ -5,6 +5,7 @@ mod app;
 mod command;
 mod dialogs;
 mod document;
+mod export;
 mod fonts;
 mod frame;
 mod gray;
