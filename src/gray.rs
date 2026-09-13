@@ -169,6 +169,97 @@ impl Gray16 {
         top * (1.0 - fy) + bot * fy
     }
 
+    /// ガウシアンぼかし（分離型 2 パス）。`sigma` は画素単位の標準偏差。
+    /// カーネル半径は 3σ とし、画像の端は最外周の画素値で埋める。
+    pub fn gaussian_blur(&self, sigma: f32) -> Self {
+        let (w, h) = (self.width as usize, self.height as usize);
+        if w == 0 || h == 0 {
+            return self.clone();
+        }
+        let sigma = sigma.max(0.1);
+        let radius = ((sigma * 3.0).ceil() as usize).max(1);
+        let kernel: Vec<f32> = (0..=2 * radius)
+            .map(|i| {
+                let d = i as f32 - radius as f32;
+                (-(d * d) / (2.0 * sigma * sigma)).exp()
+            })
+            .collect();
+        let sum: f32 = kernel.iter().sum();
+        let kernel: Vec<f32> = kernel.iter().map(|k| k / sum).collect();
+
+        // 横 → 縦の順に畳み込む。端はクランプ（0 埋めだと縁が暗くなるため）。
+        let mut tmp = vec![0f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let mut acc = 0.0;
+                for (i, &k) in kernel.iter().enumerate() {
+                    let sx = (x + i).saturating_sub(radius).min(w - 1);
+                    acc += self.data[y * w + sx] as f32 * k;
+                }
+                tmp[y * w + x] = acc;
+            }
+        }
+        let mut out = Self::black(self.width, self.height);
+        for y in 0..h {
+            for x in 0..w {
+                let mut acc = 0.0;
+                for (i, &k) in kernel.iter().enumerate() {
+                    let sy = (y + i).saturating_sub(radius).min(h - 1);
+                    acc += tmp[sy * w + x] * k;
+                }
+                out.data[y * w + x] = acc.round().clamp(0.0, 65535.0) as u16;
+            }
+        }
+        out
+    }
+
+    /// メディアンフィルタ。一辺 2r+1 の正方形窓の中央値を取る。
+    /// 画像の端は最外周の画素値で埋める。窓が大きいと重いので、
+    /// 呼び出し側で `radius` を小さく制限すること。
+    pub fn median_filter(&self, radius: u32) -> Self {
+        let (w, h) = (self.width as usize, self.height as usize);
+        if w == 0 || h == 0 || radius == 0 {
+            return self.clone();
+        }
+        let r = radius as usize;
+        let mut out = Self::black(self.width, self.height);
+        let mut window = Vec::with_capacity((2 * r + 1) * (2 * r + 1));
+        for y in 0..h {
+            let y0 = y.saturating_sub(r);
+            let y1 = (y + r).min(h - 1);
+            for x in 0..w {
+                let x0 = x.saturating_sub(r);
+                let x1 = (x + r).min(w - 1);
+                window.clear();
+                for j in y0..=y1 {
+                    for i in x0..=x1 {
+                        window.push(self.data[j * w + i]);
+                    }
+                }
+                let mid = window.len() / 2;
+                window.select_nth_unstable(mid);
+                out.data[y * w + x] = window[mid];
+            }
+        }
+        out
+    }
+
+    /// アンシャープマスク。`sigma` でぼかしたものとの差に `amount` を掛けて
+    /// 元画像へ足し戻す（amount = 0 なら元のまま、1 が標準的な強さ）。
+    pub fn unsharp_mask(&self, sigma: f32, amount: f32) -> Self {
+        let blurred = self.gaussian_blur(sigma);
+        let mut out = Self::black(self.width, self.height);
+        for (o, (&v, &b)) in out
+            .data
+            .iter_mut()
+            .zip(self.data.iter().zip(blurred.data.iter()))
+        {
+            let s = v as f32 + amount * (v as f32 - b as f32);
+            *o = s.round().clamp(0.0, 65535.0) as u16;
+        }
+        out
+    }
+
     /// `in_min`..`in_max` の輝度を 0..65535 へ線形に引き伸ばす。
     pub fn apply_levels(&self, in_min: u16, in_max: u16) -> Self {
         let lo = in_min.min(in_max);
@@ -338,5 +429,60 @@ mod tests {
         }
         // (0.5, 0) は値 0 と 100 の中間。
         assert_eq!(img.sample_bilinear_clamp(0.5, 0.0), 50.0);
+    }
+
+    /// 一様画像はぼかしても変わらない（端のクランプと重みの正規化の確認）。
+    #[test]
+    fn gaussian_blur_keeps_uniform_image() {
+        let img = Gray16 {
+            width: 8,
+            height: 8,
+            data: vec![1000; 64],
+        };
+        let out = img.gaussian_blur(2.0);
+        assert_eq!(out.data, vec![1000; 64]);
+    }
+
+    /// インパルスは周囲へ対称に広がる。
+    #[test]
+    fn gaussian_blur_spreads_impulse() {
+        let img = with_dot(9, 9, 4, 4);
+        let out = img.gaussian_blur(1.0);
+        assert!(out.at(4, 4) > out.at(5, 4), "中心が最も明るい");
+        assert!(out.at(5, 4) > 0, "隣へ漏れる");
+        assert!(out.at(4, 4) < u16::MAX, "総和は保たれる");
+        // 対称性: 左右の隣は同じ値。
+        assert_eq!(out.at(3, 4), out.at(5, 4));
+    }
+
+    /// 平坦な画像のスパイク（ごま塩ノイズ相当）は中央値で消える。
+    #[test]
+    fn median_filter_removes_spikes() {
+        let mut img = Gray16::black(7, 7);
+        for v in img.data.iter_mut() {
+            *v = 1000;
+        }
+        img.data[3 * 7 + 3] = u16::MAX; // 中心だけスパイク
+        img.data[0] = 0; // 隅のスパイク（端のクランプ確認）
+        let out = img.median_filter(1);
+        assert_eq!(out.at(3, 3), 1000, "スパイクが除去される");
+        assert_eq!(out.at(0, 0), 1000);
+        assert_eq!(out.data, vec![1000; 49], "全域が平坦へ戻る");
+    }
+
+    /// アンシャープマスクは段差のコントラストを強調する。
+    #[test]
+    fn unsharp_mask_boosts_edges() {
+        let mut img = Gray16::black(9, 1);
+        for (i, v) in img.data.iter_mut().enumerate() {
+            *v = if i < 4 { 1000 } else { 5000 };
+        }
+        let out = img.unsharp_mask(1.0, 2.0);
+        assert!(out.at(2, 0) < 1000, "暗い側の縁はより暗く");
+        assert!(out.at(5, 0) > 5000, "明るい側の縁はより明るく");
+        assert_eq!(out.at(0, 0), 1000, "遠方は変わらない");
+        // amount = 0 なら元画像のまま。
+        let same = img.unsharp_mask(1.0, 0.0);
+        assert_eq!(same.data, img.data);
     }
 }

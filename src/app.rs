@@ -4,8 +4,8 @@ use std::path::PathBuf;
 
 use egui::Ui;
 
-use crate::command::{Command, CommandItem, HistoryFile, load_image};
-use crate::dialogs::{ExportDialog, LevelsDialog, RotateDialog, ScaleDialog};
+use crate::command::{Command, CommandCategory, CommandItem, Filter, HistoryFile, load_image};
+use crate::dialogs::{ExportDialog, FilterDialog, LevelsDialog, RotateDialog, ScaleDialog};
 use crate::document::{Document, SourceCache};
 use crate::frame::format_length;
 use crate::measure_mode::MeasureMode;
@@ -22,6 +22,7 @@ enum Action {
     NewScale,
     NewRotate,
     NewLevels,
+    NewFilter(Filter),
     NewMeasure,
     NewExport,
     SaveImageExports,
@@ -63,6 +64,7 @@ pub struct TemApp {
     scale_dialog: ScaleDialog,
     rotate_dialog: RotateDialog,
     levels_dialog: LevelsDialog,
+    filter_dialog: FilterDialog,
     export_dialog: ExportDialog,
     measure_mode: MeasureMode,
     /// データは変えずに、表示だけ min/max へ引き伸ばす。
@@ -87,6 +89,7 @@ impl TemApp {
             scale_dialog: ScaleDialog::default(),
             rotate_dialog: RotateDialog::default(),
             levels_dialog: LevelsDialog::default(),
+            filter_dialog: FilterDialog::default(),
             export_dialog: ExportDialog::default(),
             measure_mode: MeasureMode::default(),
             auto_contrast: true,
@@ -165,54 +168,72 @@ impl TemApp {
                 });
 
                 ui.menu_button("コマンド", |ui| {
-                    if ui.button("画像を挿入...").clicked() {
-                        actions.push(Action::PickImage);
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui
-                        .add_enabled(self.has_image(), egui::Button::new("スケール設定..."))
-                        .clicked()
-                    {
-                        actions.push(Action::NewScale);
-                        ui.close();
-                    }
-                    if ui
-                        .add_enabled(self.has_image(), egui::Button::new("画像の回転..."))
-                        .clicked()
-                    {
-                        actions.push(Action::NewRotate);
-                        ui.close();
-                    }
-                    if ui
-                        .add_enabled(self.has_image(), egui::Button::new("レベル補正..."))
-                        .clicked()
-                    {
-                        actions.push(Action::NewLevels);
-                        ui.close();
-                    }
-                    if ui
-                        .add_enabled(self.has_image(), egui::Button::new("測長..."))
-                        .clicked()
-                    {
-                        actions.push(Action::NewMeasure);
-                        ui.close();
-                    }
-                    if ui
-                        .add_enabled(self.has_image(), egui::Button::new("画像出力..."))
-                        .clicked()
-                    {
-                        actions.push(Action::NewExport);
-                        ui.close();
-                    }
-                    ui.menu_button("フィルタ", |ui| {
-                        for name in [
-                            "ガウシアンぼかし...",
-                            "メディアン...",
-                            "アンシャープマスク...",
-                        ] {
-                            ui.add_enabled(false, egui::Button::new(name))
-                                .on_disabled_hover_text("未実装");
+                    ui.menu_button("入力", |ui| {
+                        if ui.button("画像を挿入...").clicked() {
+                            actions.push(Action::PickImage);
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(self.has_image(), egui::Button::new("スケール設定..."))
+                            .clicked()
+                        {
+                            actions.push(Action::NewScale);
+                            ui.close();
+                        }
+                    });
+                    ui.menu_button("前処理", |ui| {
+                        if ui
+                            .add_enabled(self.has_image(), egui::Button::new("画像の回転..."))
+                            .clicked()
+                        {
+                            actions.push(Action::NewRotate);
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(self.has_image(), egui::Button::new("レベル補正..."))
+                            .clicked()
+                        {
+                            actions.push(Action::NewLevels);
+                            ui.close();
+                        }
+                        ui.menu_button("フィルタ", |ui| {
+                            for (name, filter) in [
+                                ("ガウシアンぼかし...", Filter::GaussianBlur { sigma: 1.0 }),
+                                ("メディアン...", Filter::Median { radius: 1 }),
+                                (
+                                    "アンシャープマスク...",
+                                    Filter::UnsharpMask {
+                                        sigma: 2.0,
+                                        amount: 1.5,
+                                    },
+                                ),
+                            ] {
+                                if ui
+                                    .add_enabled(self.has_image(), egui::Button::new(name))
+                                    .clicked()
+                                {
+                                    actions.push(Action::NewFilter(filter));
+                                    ui.close();
+                                }
+                            }
+                        });
+                    });
+                    ui.menu_button("解析", |ui| {
+                        if ui
+                            .add_enabled(self.has_image(), egui::Button::new("測長..."))
+                            .clicked()
+                        {
+                            actions.push(Action::NewMeasure);
+                            ui.close();
+                        }
+                    });
+                    ui.menu_button("出力", |ui| {
+                        if ui
+                            .add_enabled(self.has_image(), egui::Button::new("画像出力..."))
+                            .clicked()
+                        {
+                            actions.push(Action::NewExport);
+                            ui.close();
                         }
                     });
 
@@ -232,7 +253,7 @@ impl TemApp {
                             !self.clipboard.is_empty(),
                             egui::Button::new("貼り付け").shortcut_text("Ctrl+V"),
                         )
-                        .on_hover_text("選択行の手前に挿入します。未選択なら末尾へ追加します")
+                        .on_hover_text("各カテゴリのリスト末尾に追加します")
                         .clicked()
                     {
                         actions.push(Action::PasteCommands);
@@ -442,9 +463,7 @@ impl TemApp {
                     }
                     if ui
                         .add_enabled(can_paste, egui::Button::new("貼り付け").small())
-                        .on_hover_text(
-                            "選択行の手前に挿入します。未選択なら末尾へ追加します (Ctrl+V)",
-                        )
+                        .on_hover_text("各カテゴリのリスト末尾に追加します (Ctrl+V)")
                         .clicked()
                     {
                         actions.push(Action::PasteCommands);
@@ -467,84 +486,103 @@ impl TemApp {
 
                 let selection_fill = ui.visuals().selection.bg_fill;
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    for i in 0..doc.commands.len() {
-                        let selected = doc.is_selected(i);
-                        // 行の背景は中身の高さが決まってから塗るので、場所だけ先に確保する。
-                        let backdrop = ui.painter().add(egui::Shape::Noop);
+                    let mut global = 0;
+                    for cat in CommandCategory::ALL {
+                        let count = doc.commands.list(cat).len();
+                        ui.add_space(4.0);
+                        // カテゴリの見出し。処理はこの並び（入力 → 前処理 →
+                        // 解析 → 出力）で実行される。
+                        let header = if count > 0 {
+                            egui::RichText::new(cat.label()).strong()
+                        } else {
+                            egui::RichText::new(cat.label()).weak()
+                        };
+                        ui.label(header);
 
-                        let row = ui.scope(|ui| {
-                            // 右の操作ボタンを先に確保し、余った幅にラベルを詰める。
-                            egui::Sides::new().shrink_left().show(
-                                ui,
-                                |ui| {
-                                    let toggled = ui
-                                        .checkbox(&mut doc.commands[i].enabled, "")
-                                        .on_hover_text("外すとこの処理を一時的に無効化します")
-                                        .changed();
+                        for local in 0..count {
+                            let i = global + local;
+                            let selected = doc.is_selected(i);
+                            // 行の背景は中身の高さが決まってから塗るので、場所だけ先に確保する。
+                            let backdrop = ui.painter().add(egui::Shape::Noop);
 
-                                    let label = doc.commands[i].command.label();
-                                    let text = if doc.commands[i].enabled {
-                                        egui::RichText::new(label)
-                                    } else {
-                                        egui::RichText::new(label).weak().strikethrough()
-                                    };
-                                    let resp = ui
-                                        .add(
-                                            egui::Label::new(text)
-                                                .truncate()
-                                                .sense(egui::Sense::click()),
-                                        )
-                                        .on_hover_text(
-                                            "クリックで選択（Ctrl / Shift で複数選択）\n\
-                                             ダブルクリックでパラメータを再編集",
-                                        );
-                                    (toggled, resp)
-                                },
-                                |ui| {
-                                    let mut moved = None;
-                                    if ui.small_button("×").on_hover_text("削除").clicked() {
-                                        moved = Some(Action::DeleteCommand(i));
-                                    }
-                                    if ui.small_button("▼").on_hover_text("下へ").clicked() {
-                                        moved = Some(Action::MoveCommand(i, 1));
-                                    }
-                                    if ui.small_button("▲").on_hover_text("上へ").clicked() {
-                                        moved = Some(Action::MoveCommand(i, -1));
-                                    }
-                                    moved
-                                },
-                            )
-                        });
-                        let ((toggled, resp), moved) = row.inner;
+                            let row = ui.scope(|ui| {
+                                // 右の操作ボタンを先に確保し、余った幅にラベルを詰める。
+                                egui::Sides::new().shrink_left().show(
+                                    ui,
+                                    |ui| {
+                                        let item = doc.commands.get_mut(i).expect("行は範囲内");
+                                        let toggled = ui
+                                            .checkbox(&mut item.enabled, "")
+                                            .on_hover_text(
+                                                "外すとこの処理を一時的に無効化します",
+                                            )
+                                            .changed();
 
-                        if selected {
-                            ui.painter().set(
-                                backdrop,
-                                egui::Shape::rect_filled(
-                                    row.response.rect.expand2(egui::vec2(2.0, 1.0)),
-                                    3.0,
-                                    selection_fill,
-                                ),
-                            );
+                                        let label = item.command.label();
+                                        let text = if item.enabled {
+                                            egui::RichText::new(label)
+                                        } else {
+                                            egui::RichText::new(label).weak().strikethrough()
+                                        };
+                                        let resp = ui
+                                            .add(
+                                                egui::Label::new(text)
+                                                    .truncate()
+                                                    .sense(egui::Sense::click()),
+                                            )
+                                            .on_hover_text(
+                                                "クリックで選択（Ctrl / Shift で複数選択）\n\
+                                                 ダブルクリックでパラメータを再編集",
+                                            );
+                                        (toggled, resp)
+                                    },
+                                    |ui| {
+                                        let mut moved = None;
+                                        if ui.small_button("×").on_hover_text("削除").clicked() {
+                                            moved = Some(Action::DeleteCommand(i));
+                                        }
+                                        if ui.small_button("▼").on_hover_text("下へ").clicked() {
+                                            moved = Some(Action::MoveCommand(i, 1));
+                                        }
+                                        if ui.small_button("▲").on_hover_text("上へ").clicked() {
+                                            moved = Some(Action::MoveCommand(i, -1));
+                                        }
+                                        moved
+                                    },
+                                )
+                            });
+                            let ((toggled, resp), moved) = row.inner;
+
+                            if selected {
+                                ui.painter().set(
+                                    backdrop,
+                                    egui::Shape::rect_filled(
+                                        row.response.rect.expand2(egui::vec2(2.0, 1.0)),
+                                        3.0,
+                                        selection_fill,
+                                    ),
+                                );
+                            }
+
+                            if resp.double_clicked() {
+                                actions.push(Action::EditCommand(i));
+                            } else if resp.clicked() {
+                                let mods = resp.ctx.input(|input| input.modifiers);
+                                let mode = if mods.shift {
+                                    SelectMode::Range
+                                } else if mods.command || mods.ctrl {
+                                    SelectMode::Toggle
+                                } else {
+                                    SelectMode::Only
+                                };
+                                actions.push(Action::SelectCommand(i, mode));
+                            }
+                            if toggled {
+                                actions.push(Action::ToggleCommand(i));
+                            }
+                            actions.extend(moved);
                         }
-
-                        if resp.double_clicked() {
-                            actions.push(Action::EditCommand(i));
-                        } else if resp.clicked() {
-                            let mods = resp.ctx.input(|input| input.modifiers);
-                            let mode = if mods.shift {
-                                SelectMode::Range
-                            } else if mods.command || mods.ctrl {
-                                SelectMode::Toggle
-                            } else {
-                                SelectMode::Only
-                            };
-                            actions.push(Action::SelectCommand(i, mode));
-                        }
-                        if toggled {
-                            actions.push(Action::ToggleCommand(i));
-                        }
-                        actions.extend(moved);
+                        global += count;
                     }
 
                     // リストの下の余白をクリックしたら選択を外す。
@@ -564,31 +602,34 @@ impl TemApp {
             .show(ctx, |ui| {
                 ui.label("・画像表示領域にファイルをドラッグ&ドロップすると画像を挿入します。");
                 ui.label("・マウスホイールで拡大縮小（カーソル位置を中心）。");
-                ui.label("・左ドラッグ（または中ドラッグ）でパン。");
+                ui.label("・右ドラッグでパン。");
                 ui.label(
                     "・右のリストの行をダブルクリックすると、その処理のパラメータを再編集できます。",
                 );
                 ui.label("・チェックを外すと、その処理だけを一時的に無効化できます。");
                 ui.label("・行をクリックすると選択されます。Ctrl クリックで追加・解除、Shift クリックで範囲選択。");
                 ui.label("・選択した処理は Ctrl+C でコピー、Ctrl+V で貼り付けできます。別のタブへも貼り付けられます。");
-                ui.label("・貼り付けは選択行の手前に挿入され、未選択なら末尾に追加されます。");
+                ui.label("・貼り付けは各カテゴリのリスト末尾に追加されます。");
+                ui.label("・処理は 入力 → 前処理 → 解析 → 出力 のカテゴリ順に実行されます。追加した処理はそのカテゴリの末尾に入り、▲▼ でカテゴリ内の順序だけを入れ替えられます。");
                 ui.separator();
                 ui.label("・並べ替え・有効無効の切り替え・削除・貼り付けは、すぐには計算されません。「再計算」(F5) を押すまで表示は変わらず、その間ボタンが橙色になります。");
                 ui.label("・パラメータ調整ダイアログを開いている間だけは、結果をその場で見られるように自動で計算します。");
                 ui.label("・ディスク上の画像が更新されたときは、コマンド → 元ファイルを読み直して再計算 を使ってください。");
                 ui.separator();
                 ui.label("・TIFF の FEI / Thermo Fisher タグ、または ImageJ の単位情報から画素の実寸法が読めた場合、画像挿入の直後に「スケール設定」コマンドが自動で追加されます。");
-                ui.label("・読めなかった場合はスケール未設定となり、実寸法は出せません（画素単位のまま）。コマンド → スケール設定 で、スケールバーから読み取った値を手で入れられます。");
+                ui.label("・読めなかった場合はスケール未設定となり、実寸法は出せません（画素単位のまま）。コマンド → 入力 → スケール設定 で、スケールバーから読み取った値を手で入れられます。");
                 ui.separator();
-                ui.label("・測長: コマンド → 測長... で右パネルが測長ツールに切り替わります。");
+                ui.label("・フィルタ（ガウシアンぼかし・メディアン・アンシャープマスク）: コマンド → 前処理 → フィルタ から追加できます。");
+                ui.separator();
+                ui.label("・測長: コマンド → 解析 → 測長... で右パネルが測長ツールに切り替わります。");
                 ui.label("・二点間測長・境界線は、画像上を 2 回クリックして作成します（Esc または右クリックで作成途中をキャンセル）。");
                 ui.label("・測長モード中は Ctrl+Z / Ctrl+Shift+Z でツール操作の取り消し・やり直しができます。");
                 ui.label("・スナップ on のとき、二点間測長の端点は既存の境界線・オフセット線に吸い付きます。");
-                ui.label("・Esc でツール選択を解除すると、左ドラッグでパンが使えます。非選択状態では測長・境界線をクリックして選択し、ドラッグで移動できます（端点付近のクリックは端点だけ、線の上は全体が動きます）。");
+                ui.label("・非選択状態では測長・境界線をクリックして選択し、ドラッグで移動できます（端点付近のクリックは端点だけ、線の上は全体が動きます）。");
                 ui.label("・フィッティング領域をダブルクリックすると、その測長だけのフィッティング設定を再編集できます。");
                 ui.label("・直線複製: 測長・境界線をクリックで選択し、マウス移動で方向と距離を指定して、もう一度クリックで確定。ホイールで複製数 (1-20) を調整し、距離を等分した位置に複製します。");
-                ui.label("・画像出力: コマンド → 画像出力... でアノテーション付き画像の保存先を設定します（tif / png / jpg）。決定または「再計算」(F5) で保存されます。");
-                ui.label("・中ドラッグまたは右ドラッグでパン、ホイールでズームできます（測長モード中も同じ）。");
+                ui.label("・画像出力: コマンド → 出力 → 画像出力... でアノテーション付き画像の保存先を設定します（tif / png / jpg）。決定または「再計算」(F5) で保存されます。");
+                ui.label("・右ドラッグでパン、ホイールでズームできます（測長モード中も同じ）。");
             });
         self.help_open = help_open;
 
@@ -629,6 +670,10 @@ impl TemApp {
             Action::NewLevels => {
                 let index = self.active;
                 self.levels_dialog.open_new(&mut self.docs[index]);
+            }
+            Action::NewFilter(filter) => {
+                let index = self.active;
+                self.filter_dialog.open_new(&mut self.docs[index], filter);
             }
             Action::NewMeasure => {
                 let index = self.active;
@@ -700,6 +745,7 @@ impl TemApp {
         self.scale_dialog.open = false;
         self.rotate_dialog.open = false;
         self.levels_dialog.open = false;
+        self.filter_dialog.open = false;
         self.export_dialog.open = false;
         // 測長モードも編集中のダイアログと同様に閉じる（コマンド構造の
         // 変更操作と競合しないように、破棄して終了する）。
@@ -718,6 +764,7 @@ impl TemApp {
         self.scale_dialog.open
             || self.rotate_dialog.open
             || self.levels_dialog.open
+            || self.filter_dialog.open
             || self.export_dialog.open
             || self.measure_mode.open
     }
@@ -745,23 +792,26 @@ impl TemApp {
         let items = self.clipboard.clone();
         let count = items.len();
         let doc = self.doc_mut();
-        let at = doc.paste_position();
-        let range = doc.insert_commands(at, items);
+        // 貼り付けは各カテゴリのリスト末尾への追加（処理順はカテゴリで固定のため）。
+        let indices = doc.extend_commands(items);
         // 貼り付けた行を選択し直しておくと、続けて貼っても位置が分かりやすい。
-        doc.select_indices(range);
+        doc.select_indices(indices);
         self.status = format!(
-            "{count} 件の処理を {} 行目に貼り付けました（「再計算」で反映されます）。",
-            at + 1
+            "{count} 件の処理を各カテゴリの末尾に貼り付けました（「再計算」で反映されます）。"
         );
     }
 
     fn edit_command(&mut self, index: usize) {
         self.close_dialogs();
         let doc = &mut self.docs[self.active];
-        match doc.commands[index].command.clone() {
+        let Some(command) = doc.commands.get(index).map(|c| c.command.clone()) else {
+            return;
+        };
+        match command {
             Command::SetScale { .. } => self.scale_dialog.open_edit(doc, index),
             Command::Rotate { .. } => self.rotate_dialog.open_edit(doc, index),
             Command::Levels { .. } => self.levels_dialog.open_edit(doc, index),
+            Command::Filter { .. } => self.filter_dialog.open_edit(doc, index),
             Command::Measure { .. } => {
                 let tab = self.active;
                 self.measure_mode.open_edit(doc, tab, index)
@@ -777,7 +827,9 @@ impl TemApp {
                 }
                 if let Some(new_path) = dialog.pick_file() {
                     doc.title = file_label(&new_path);
-                    doc.commands[index].command = Command::InsertImage { path: new_path };
+                    if let Some(item) = doc.commands.get_mut(index) {
+                        item.command = Command::InsertImage { path: new_path };
+                    }
                     doc.invalidate_from(index);
                     doc.view.request_fit();
                 }
@@ -850,7 +902,10 @@ impl TemApp {
         let mut saved = Vec::new();
         let mut error = None;
         for i in 0..doc.commands.len() {
-            if !matches!(doc.commands[i].command, Command::Measure { .. }) {
+            let Some(item) = doc.commands.get(i) else {
+                continue;
+            };
+            if !matches!(&item.command, Command::Measure { .. }) {
                 continue;
             }
             match crate::measure_mode::save_measure_json(doc, i) {
@@ -882,11 +937,14 @@ impl TemApp {
         let mut saved = Vec::new();
         let mut error = None;
         for i in 0..doc.commands.len() {
+            let Some(item) = doc.commands.get(i) else {
+                continue;
+            };
             let Command::ExportImage {
                 output,
                 annotation_scale,
                 color,
-            } = &doc.commands[i].command
+            } = &item.command
             else {
                 continue;
             };
@@ -894,10 +952,7 @@ impl TemApp {
             if template.is_empty() {
                 continue;
             }
-            let Some(img_path) = doc.commands[..=i].iter().rev().find_map(|c| match &c.command {
-                Command::InsertImage { path } => Some(path.clone()),
-                _ => None,
-            }) else {
+            let Some(img_path) = doc.image_path_at(i) else {
                 error = Some("画像がありません（画像を挿入してから保存してください）".to_owned());
                 break;
             };
@@ -905,7 +960,7 @@ impl TemApp {
                 error = Some("結果がまだ計算されていません".to_owned());
                 break;
             };
-            let path = crate::measure_mode::resolve_output_path(template, &img_path);
+            let path = crate::measure_mode::resolve_output_path(template, img_path);
             if !crate::export::validate_extension(&path) {
                 error = Some(format!(
                     "{} は対応していない拡張子です（tif / png / jpg）",
@@ -923,7 +978,8 @@ impl TemApp {
                 {
                     continue;
                 }
-                if let Command::Measure { data } = &doc.commands[j].command
+                if let Some(item) = doc.commands.get(j)
+                    && let Command::Measure { data } = &item.command
                     && let Some(fj) = doc.input_to(j)
                     && std::sync::Arc::ptr_eq(&fj.image, &frame.image)
                 {
@@ -966,7 +1022,7 @@ impl TemApp {
         else {
             return;
         };
-        let file = HistoryFile::new(self.doc().commands.clone());
+        let file = HistoryFile::new(self.doc().commands.iter().cloned().collect());
         match file.save(&path) {
             Ok(()) => {
                 self.error = None;
@@ -1161,8 +1217,8 @@ impl eframe::App for TemApp {
         let index = self.active;
         let range = self.docs[index].display_range(auto);
         let generation = self.docs[index].generation;
-        // 測長モード中は画像上の入力（左ドラッグの移動・パン、ズーム）を
-        // すべて measure_mode 側で処理する。
+        // 測長モード中は画像上の入力（左ドラッグの移動、右ドラッグのパン、
+        // ズーム）をすべて measure_mode 側で処理する。
         let interactive = !self.measure_mode.open;
         self.last_hover = egui::CentralPanel::no_frame()
             .show(ui, |ui| {
@@ -1183,7 +1239,8 @@ impl eframe::App for TemApp {
                         {
                             continue;
                         }
-                        if let Command::Measure { data } = &doc.commands[i].command
+                        if let Some(item) = doc.commands.get(i)
+                            && let Command::Measure { data } = &item.command
                             && let Some(frame) = doc.input_to(i)
                             && std::sync::Arc::ptr_eq(&frame.image, img)
                         {
@@ -1216,6 +1273,7 @@ impl eframe::App for TemApp {
         self.scale_dialog.show(&ctx, doc);
         self.rotate_dialog.show(&ctx, doc);
         self.levels_dialog.show(&ctx, doc);
+        self.filter_dialog.show(&ctx, doc);
         if self.export_dialog.show(&ctx, doc) {
             actions.push(Action::SaveImageExports);
         }

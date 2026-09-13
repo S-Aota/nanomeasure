@@ -84,7 +84,7 @@ impl ImageView {
         self.needs_fit = true;
     }
 
-    /// 表示領域をドラッグした分だけパンする（測長モードが中ドラッグに使う）。
+    /// 表示領域をドラッグした分だけパンする（右ドラッグ用。測長モードも同じ）。
     pub fn pan_by(&mut self, delta: Vec2) {
         self.pan += delta;
     }
@@ -198,10 +198,8 @@ impl ImageView {
     }
 
     fn handle_input(&mut self, response: &egui::Response, vp: Rect) {
-        if response.dragged_by(egui::PointerButton::Primary)
-            || response.dragged_by(egui::PointerButton::Middle)
-            || response.dragged_by(egui::PointerButton::Secondary)
-        {
+        // パンは右ドラッグのみ（左ドラッグは測長モードなどのツール操作に使う）。
+        if response.dragged_by(egui::PointerButton::Secondary) {
             self.pan_by(response.drag_delta());
         }
 

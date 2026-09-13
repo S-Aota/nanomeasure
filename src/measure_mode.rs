@@ -158,7 +158,7 @@ pub struct MeasureMode {
     original: Option<Command>,
     /// 作業コピー。変更は常に doc 側のコマンドへライブ反映する。
     data: MeasureData,
-    /// 選択中のツールボタン。None = 非選択（Esc で解除、左ドラッグでパン）。
+    /// 選択中のツールボタン。None = 非選択（Esc で解除。パンは右ドラッグ）。
     tool: Option<ToolButton>,
     /// 二点間測長のフィッティング設定 UI で端点 1/2 のどちらを表示するか。
     ep_tab: bool,
@@ -200,15 +200,15 @@ impl MeasureMode {
     }
 
     fn start(&mut self, doc: &Document, tab: usize, index: usize, created: bool) {
-        let original = doc.commands[index].command.clone();
+        let original = doc.commands.get(index).map(|c| c.command.clone());
         self.data = match &original {
-            Command::Measure { data } => data.clone(),
+            Some(Command::Measure { data }) => data.clone(),
             _ => MeasureData::default(),
         };
         self.tab = tab;
         self.index = index;
         self.created = created;
-        self.original = Some(original);
+        self.original = original;
         self.open = true;
         self.tool = None;
         self.ep_tab = false;
@@ -230,9 +230,10 @@ impl MeasureMode {
         if !self.open {
             return;
         }
-        if self.index < doc.commands.len()
-            && matches!(doc.commands[self.index].command, Command::Measure { .. })
-        {
+        if matches!(
+            doc.commands.get(self.index).map(|c| &c.command),
+            Some(Command::Measure { .. })
+        ) {
             if self.created {
                 doc.remove_command(self.index);
             } else if let Some(original) = self.original.take() {
@@ -334,9 +335,10 @@ impl MeasureMode {
             return false;
         }
         // 編集中にコマンド行が消えたり差し替わったら閉じる。
-        if self.index >= doc.commands.len()
-            || !matches!(doc.commands[self.index].command, Command::Measure { .. })
-        {
+        if !matches!(
+            doc.commands.get(self.index).map(|c| &c.command),
+            Some(Command::Measure { .. })
+        ) {
             self.open = false;
             return false;
         }
@@ -981,21 +983,20 @@ fn sort_group(data: &mut MeasureData, computed: &ComputedMeasure, gid: u64, key:
 /// 出力先は `data.output_path`（`{dir}` / `{filename}` は画像パスから解決）。
 /// 空文字列のときは保存しない（Ok(None)）。戻り値は実際に保存したパス。
 pub fn save_measure_json(doc: &Document, index: usize) -> Result<Option<PathBuf>, String> {
-    let Command::Measure { data } = &doc.commands[index].command else {
+    let Some(item) = doc.commands.get(index) else {
+        return Err("測長コマンドではありません".to_owned());
+    };
+    let Command::Measure { data } = &item.command else {
         return Err("測長コマンドではありません".to_owned());
     };
     let template = data.output_path.trim();
     if template.is_empty() {
         return Ok(None);
     }
-    let img_path = doc.commands[..=index]
-        .iter()
-        .rev()
-        .find_map(|c| match &c.command {
-            Command::InsertImage { path } => Some(path.clone()),
-            _ => None,
-        })
-        .ok_or_else(|| "画像がありません（画像を挿入してから保存してください）".to_owned())?;
+    let img_path = doc
+        .image_path_at(index)
+        .ok_or_else(|| "画像がありません（画像を挿入してから保存してください）".to_owned())?
+        .to_path_buf();
     let Some(frame) = doc.input_to(index) else {
         return Err("結果がまだ計算されていません".to_owned());
     };
@@ -1656,19 +1657,16 @@ impl MeasureMode {
             ..Default::default()
         };
         // 左ドラッグは常にこちらで処理する（選択モードでは直接ドラッグで
-        // 移動、ツールの無い場所ではパン）。view 側の入力処理は測長モード中
-        // は無効にしている（app 側で interactive = false）。
+        // 移動）。パンは右ドラッグ。view 側の入力処理は測長モード中は
+        // 無効にしている（app 側で interactive = false）。
         let resp = ui.interact(
             info.vp,
             egui::Id::new("measure_overlay"),
             Sense::click_and_drag(),
         );
 
-        // パン（中ドラッグ・右ドラッグ）。左ドラッグのパンは下の選択モード
-        // ブロック（ツールの無い場所）が担う。
-        if resp.dragged_by(egui::PointerButton::Middle)
-            || resp.dragged_by(egui::PointerButton::Secondary)
-        {
+        // パン（右ドラッグのみ。左ドラッグはツール操作に使う）。
+        if resp.dragged_by(egui::PointerButton::Secondary) {
             doc.view.pan_by(resp.drag_delta());
         }
 
@@ -1733,15 +1731,6 @@ impl MeasureMode {
             let threshold = PICK_PX as f64 / info.zoom as f64;
             self.select_at(&computed, cursor, threshold);
         }
-        // ツールの無い場所の左ドラッグはパンに使う。
-        if self.tool.is_none()
-            && self.in_progress.is_none()
-            && self.drag.is_none()
-            && resp.dragged()
-        {
-            doc.view.pan_by(resp.drag_delta());
-        }
-
         // 選択ツールのドラッグ移動（端点 or 全体）。
         if let Some(drag) = self.drag
             && let Some(cursor) = cursor
@@ -2256,7 +2245,8 @@ mod tests {
         // results_ui のアクション処理と同じ経路（mutate → self.data 変更 → doc 反映）。
         mode.mutate(&mut doc, |d| sort_group(d, &computed, g, SortKey::X));
         assert_eq!(mode.data.group_tools(g), vec![2, 3, 1]);
-        let Command::Measure { data: d } = &doc.commands[0].command else {
+        let Command::Measure { data: d } = &doc.commands.get(0).expect("Measure のみ").command
+        else {
             panic!("Measure のはず");
         };
         assert_eq!(d.group_tools(g), vec![2, 3, 1], "doc 側のコマンドにも反映される");
@@ -2325,7 +2315,10 @@ mod tests {
         // 出力先が空なら保存しない。
         let mut empty = MeasureData::default();
         empty.output_path = String::new();
-        doc.commands[1].command = Command::Measure { data: empty };
+        doc.commands
+            .get_mut(1)
+            .expect("Measure コマンド")
+            .command = Command::Measure { data: empty };
         assert!(save_measure_json(&doc, 1).unwrap().is_none());
 
         std::fs::remove_file(&path).unwrap();

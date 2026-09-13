@@ -1,20 +1,114 @@
 //! タブ 1 枚分の状態。コマンド履歴・中間結果・表示状態を画像単位で持つ。
 
 use std::collections::{BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::command::{Command, CommandItem};
+use crate::command::{Command, CommandCategory, CommandItem};
 use crate::frame::{Frame, Scale};
 use crate::gray::Gray16;
 use crate::view::ImageView;
 
 pub type SourceCache = HashMap<PathBuf, Arc<Gray16>>;
 
+/// カテゴリごとのコマンド列。処理はカテゴリ順（入力 → 前処理 → 解析 → 出力）
+/// に実行され、追加したコマンドはそれぞれのカテゴリの末尾に入る。
+/// グローバル添字はカテゴリ順に通しで振った番号で、stages や選択と対応する。
+#[derive(Clone, Debug, Default)]
+pub struct CommandLists {
+    input: Vec<CommandItem>,
+    preprocess: Vec<CommandItem>,
+    analysis: Vec<CommandItem>,
+    output: Vec<CommandItem>,
+}
+
+impl CommandLists {
+    /// カテゴリのコマンド列。
+    pub fn list(&self, cat: CommandCategory) -> &[CommandItem] {
+        match cat {
+            CommandCategory::Input => &self.input,
+            CommandCategory::Preprocess => &self.preprocess,
+            CommandCategory::Analysis => &self.analysis,
+            CommandCategory::Output => &self.output,
+        }
+    }
+
+    pub fn list_mut(&mut self, cat: CommandCategory) -> &mut Vec<CommandItem> {
+        match cat {
+            CommandCategory::Input => &mut self.input,
+            CommandCategory::Preprocess => &mut self.preprocess,
+            CommandCategory::Analysis => &mut self.analysis,
+            CommandCategory::Output => &mut self.output,
+        }
+    }
+
+    /// 全カテゴリのコマンド数。
+    pub fn len(&self) -> usize {
+        CommandCategory::ALL.iter().map(|&c| self.list(c).len()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// カテゴリ順（= 処理順）に並べた全コマンド。
+    pub fn iter(&self) -> impl Iterator<Item = &CommandItem> {
+        CommandCategory::ALL
+            .into_iter()
+            .flat_map(|c| self.list(c).iter())
+    }
+
+    /// カテゴリの先頭コマンドのグローバル添字（= それ以前のカテゴリの合計数）。
+    fn category_start(&self, cat: CommandCategory) -> usize {
+        CommandCategory::ALL
+            .iter()
+            .take_while(|&&c| c != cat)
+            .map(|&c| self.list(c).len())
+            .sum()
+    }
+
+    /// グローバル添字をカテゴリとカテゴリ内添字へ直す。
+    pub fn locate(&self, mut index: usize) -> Option<(CommandCategory, usize)> {
+        for cat in CommandCategory::ALL {
+            let len = self.list(cat).len();
+            if index < len {
+                return Some((cat, index));
+            }
+            index -= len;
+        }
+        None
+    }
+
+    /// グローバル添字のコマンド。
+    pub fn get(&self, index: usize) -> Option<&CommandItem> {
+        let (cat, local) = self.locate(index)?;
+        Some(&self.list(cat)[local])
+    }
+
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut CommandItem> {
+        let (cat, local) = self.locate(index)?;
+        Some(&mut self.list_mut(cat)[local])
+    }
+
+    /// カテゴリの末尾へ追加し、グローバル添字を返す。
+    fn push(&mut self, cat: CommandCategory, item: CommandItem) -> usize {
+        let index = self.category_start(cat) + self.list(cat).len();
+        self.list_mut(cat).push(item);
+        index
+    }
+
+    /// グローバル添字のコマンドを除く。
+    fn remove(&mut self, index: usize) -> Option<CommandItem> {
+        let (cat, local) = self.locate(index)?;
+        Some(self.list_mut(cat).remove(local))
+    }
+}
+
 pub struct Document {
     pub title: String,
-    pub commands: Vec<CommandItem>,
-    /// `stages[i]` = コマンド i を適用し終えた結果。無効な行は直前の結果をそのまま持つ。
+    pub commands: CommandLists,
+    /// `stages[i]` = グローバル添字 i のコマンドを適用し終えた結果。
+    /// 無効な行は直前の結果をそのまま持つ。
     stages: Vec<Option<Frame>>,
     /// 再計算が必要な最小のコマンド添字。
     dirty_from: Option<usize>,
@@ -34,7 +128,7 @@ impl Document {
     pub fn new(title: impl Into<String>) -> Self {
         Self {
             title: title.into(),
-            commands: Vec::new(),
+            commands: CommandLists::default(),
             stages: Vec::new(),
             dirty_from: None,
             error: None,
@@ -64,7 +158,7 @@ impl Document {
         self.result().and_then(|f| f.scale)
     }
 
-    /// コマンド `index` に入力される結果（= 直前まで適用したもの）。
+    /// グローバル添字 `index` のコマンドに入力される結果（= 直前まで適用したもの）。
     pub fn input_to(&self, index: usize) -> Option<&Frame> {
         self.stages[..index.min(self.stages.len())]
             .iter()
@@ -72,55 +166,43 @@ impl Document {
             .find_map(|s| s.as_ref())
     }
 
-    pub fn push_command(&mut self, command: Command) -> usize {
-        let index = self.commands.len();
-        self.commands.push(CommandItem::new(command));
-        self.stages.push(None);
+    /// コマンドをそのカテゴリの末尾へ追加する。グローバル添字を返す。
+    fn append_item(&mut self, item: CommandItem) -> usize {
+        let index = self.commands.push(item.command.category(), item);
+        self.stages.insert(index, None);
+        self.shift_selection(index, 1);
         self.invalidate_from(index);
         index
     }
 
-    pub fn extend_commands(&mut self, items: impl IntoIterator<Item = CommandItem>) {
-        let start = self.commands.len();
-        for item in items {
-            self.commands.push(item);
-            self.stages.push(None);
-        }
-        if self.commands.len() > start {
-            self.invalidate_from(start);
-        }
+    pub fn push_command(&mut self, command: Command) -> usize {
+        self.append_item(CommandItem::new(command))
     }
 
-    /// `at` の位置に割り込ませる形で挿入する。挿入した範囲を返す。
-    pub fn insert_commands(
+    /// 各コマンドをそれぞれのカテゴリの末尾へ追加する。グローバル添字の列を返す。
+    pub fn extend_commands(
         &mut self,
-        at: usize,
-        items: Vec<CommandItem>,
-    ) -> std::ops::Range<usize> {
-        let at = at.min(self.commands.len());
-        let count = items.len();
-        if count == 0 {
-            return at..at;
-        }
-        self.commands.splice(at..at, items);
-        self.stages.splice(at..at, std::iter::repeat_n(None, count));
-        self.shift_selection(at, count as isize);
-        self.invalidate_from(at);
-        at..at + count
+        items: impl IntoIterator<Item = CommandItem>,
+    ) -> Vec<usize> {
+        items.into_iter().map(|item| self.append_item(item)).collect()
     }
 
+    /// 全コマンドを入れ替える。処理順（カテゴリ順）になるよう分類し直す。
     pub fn replace_commands(&mut self, items: Vec<CommandItem>) {
-        self.stages = vec![None; items.len()];
-        self.commands = items;
+        let mut lists = CommandLists::default();
+        for item in items {
+            lists.push(item.command.category(), item);
+        }
+        self.commands = lists;
+        self.stages = vec![None; self.commands.len()];
         self.clear_selection();
         self.invalidate_from(0);
     }
 
     pub fn remove_command(&mut self, index: usize) {
-        if index >= self.commands.len() {
+        if self.commands.remove(index).is_none() {
             return;
         }
-        self.commands.remove(index);
         self.stages.remove(index);
         self.selection.remove(&index);
         self.shift_selection(index, -1);
@@ -128,13 +210,24 @@ impl Document {
         self.invalidate_from(index);
     }
 
+    /// 同じカテゴリ内で前後に入れ替える。カテゴリの境界はまたがない
+    /// （処理順がカテゴリで固定されているため）。
     pub fn move_command(&mut self, index: usize, delta: isize) {
+        let Some((cat, local)) = self.commands.locate(index) else {
+            return;
+        };
         let target = index as isize + delta;
-        if target < 0 || target as usize >= self.commands.len() {
+        if target < 0 {
             return;
         }
         let target = target as usize;
-        self.commands.swap(index, target);
+        let Some((target_cat, target_local)) = self.commands.locate(target) else {
+            return;
+        };
+        if target_cat != cat {
+            return;
+        }
+        self.commands.list_mut(cat).swap(local, target_local);
         self.stages.swap(index, target);
         // 選択は行そのものに付いているので、入れ替えに追従させる。
         let (had_index, had_target) = (
@@ -145,6 +238,14 @@ impl Document {
         set_membership(&mut self.selection, target, had_index);
         self.anchor = None;
         self.invalidate_from(index.min(target));
+    }
+
+    /// `index` のコマンドまでで直近の画像挿入コマンドのパス。
+    pub fn image_path_at(&self, index: usize) -> Option<&Path> {
+        (0..=index).rev().find_map(|j| match &self.commands.get(j).map(|c| &c.command) {
+            Some(Command::InsertImage { path }) => Some(path.as_path()),
+            _ => None,
+        })
     }
 
     // ------------------------------------------------------------ 選択
@@ -160,15 +261,6 @@ impl Document {
     /// 選択されている行を、リストの並び順で返す。
     pub fn selected_indices(&self) -> Vec<usize> {
         self.selection.iter().copied().collect()
-    }
-
-    /// 貼り付け先。選択があればその先頭、無ければ末尾。
-    pub fn paste_position(&self) -> usize {
-        self.selection
-            .iter()
-            .next()
-            .copied()
-            .unwrap_or(self.commands.len())
     }
 
     pub fn clear_selection(&mut self) {
@@ -254,7 +346,7 @@ impl Document {
         };
 
         for i in start..self.commands.len() {
-            let item = &self.commands[i];
+            let item = self.commands.get(i).expect("コマンド数はループ開始時に確定");
             if !item.enabled {
                 // 無効な行は素通し。直前の結果をそのまま次段へ渡す。
                 self.stages[i] = current.clone();
@@ -313,6 +405,7 @@ fn set_membership(set: &mut BTreeSet<usize>, index: usize, member: bool) {
 mod tests {
     use super::*;
     use crate::command::Command;
+    use crate::measure::MeasureData;
 
     fn doc_with(n: usize) -> Document {
         let mut doc = Document::new("t");
@@ -334,27 +427,94 @@ mod tests {
             .collect()
     }
 
+    fn kinds(doc: &Document) -> Vec<CommandCategory> {
+        doc.commands.iter().map(|c| c.command.category()).collect()
+    }
+
+    /// 回転コマンドの角度だけを処理順に取り出す（NaN は assert できないため）。
+    fn rotations(doc: &Document) -> Vec<f32> {
+        doc.commands
+            .iter()
+            .filter_map(|c| match c.command {
+                Command::Rotate { angle_deg } => Some(angle_deg),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn insert_cmd() -> Command {
+        Command::InsertImage {
+            path: PathBuf::from("a.tif"),
+        }
+    }
+
+    /// 追加したコマンドはそのカテゴリの末尾（= カテゴリ順の位置）に入ること。
     #[test]
-    fn paste_position_is_selection_start_or_end() {
-        let mut doc = doc_with(3);
-        assert_eq!(doc.paste_position(), 3, "未選択なら末尾");
-        doc.select_only(1);
-        assert_eq!(doc.paste_position(), 1);
+    fn push_appends_to_category_end() {
+        let mut doc = Document::new("t");
+        doc.push_command(Command::Rotate { angle_deg: 1.0 }); // 前処理
+        doc.push_command(Command::Measure {
+            data: MeasureData::default(),
+        }); // 解析
+        let index = doc.push_command(insert_cmd()); // 入力
+        assert_eq!(index, 0, "入力カテゴリの末尾 = 全体の先頭");
+        doc.push_command(Command::Rotate { angle_deg: 2.0 });
+        assert_eq!(
+            kinds(&doc),
+            vec![
+                CommandCategory::Input,
+                CommandCategory::Preprocess,
+                CommandCategory::Preprocess,
+                CommandCategory::Analysis,
+            ]
+        );
+        assert_eq!(rotations(&doc), vec![1.0, 2.0]);
     }
 
     #[test]
-    fn insert_shifts_selection_and_keeps_order() {
-        let mut doc = doc_with(3);
-        doc.select_only(1);
-        let range = doc.insert_commands(
-            1,
-            vec![CommandItem::new(Command::Rotate { angle_deg: 9.0 })],
+    fn move_never_crosses_category_boundary() {
+        let mut doc = Document::new("t");
+        doc.push_command(insert_cmd());
+        doc.push_command(Command::Rotate { angle_deg: 1.0 });
+        doc.move_command(1, -1); // 前処理の行を入力カテゴリへ動かそうとする
+        assert_eq!(
+            kinds(&doc),
+            vec![CommandCategory::Input, CommandCategory::Preprocess]
         );
-        assert_eq!(range, 1..2);
-        assert_eq!(angles(&doc), vec![0.0, 9.0, 1.0, 2.0]);
-        // もとの 1 行目は 2 行目へずれる。
-        assert!(doc.is_selected(2));
-        assert!(!doc.is_selected(1));
+        // 同じカテゴリ内なら動く。
+        doc.push_command(Command::Rotate { angle_deg: 2.0 });
+        doc.move_command(1, 1);
+        assert_eq!(rotations(&doc), vec![2.0, 1.0]);
+    }
+
+    /// 途中への追加で、後続の行の選択がずれて付いていくこと。
+    #[test]
+    fn push_into_middle_shifts_selection() {
+        let mut doc = doc_with(2);
+        doc.select_only(0);
+        doc.push_command(insert_cmd());
+        assert!(doc.is_selected(1), "挿入分だけ後ろへずれる");
+        assert!(!doc.is_selected(0));
+    }
+
+    /// 履歴の読み込みでは、カテゴリ順になるよう分類し直されること。
+    #[test]
+    fn replace_commands_regroups_by_category() {
+        let mut doc = Document::new("t");
+        doc.replace_commands(vec![
+            CommandItem::new(Command::Rotate { angle_deg: 1.0 }),
+            CommandItem::new(insert_cmd()),
+            CommandItem::new(Command::Rotate { angle_deg: 2.0 }),
+        ]);
+        assert_eq!(
+            kinds(&doc),
+            vec![
+                CommandCategory::Input,
+                CommandCategory::Preprocess,
+                CommandCategory::Preprocess,
+            ]
+        );
+        assert_eq!(rotations(&doc), vec![1.0, 2.0]);
     }
 
     #[test]

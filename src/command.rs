@@ -10,6 +10,102 @@ use crate::frame::{Frame, LengthUnit, Scale};
 use crate::gray::Gray16;
 use crate::measure::MeasureData;
 
+/// コマンドのカテゴリ。処理は `ALL` の並び（入力 → 前処理 → 解析 → 出力）
+/// の順に実行される。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CommandCategory {
+    /// 画像を用意する（画像の挿入とスケール設定）。
+    Input,
+    /// 画像を整える（回転・レベル補正・フィルタなど）。
+    Preprocess,
+    /// 解析（測長など）。画像は変えない。
+    Analysis,
+    /// 出力（画像出力など）。画像は変えない。
+    Output,
+}
+
+impl CommandCategory {
+    /// 処理順のカテゴリ列。
+    pub const ALL: [Self; 4] = [Self::Input, Self::Preprocess, Self::Analysis, Self::Output];
+
+    /// コマンドリストの見出し。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Input => "入力",
+            Self::Preprocess => "前処理",
+            Self::Analysis => "解析",
+            Self::Output => "出力",
+        }
+    }
+}
+
+/// 前処理フィルタの種類とパラメータ。UI の切り替えボタンは [`FilterKind`]
+/// を選び、切り替えた種類の既定値で作り直す。
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Filter {
+    /// ガウシアンぼかし。`sigma` は画素単位の標準偏差。
+    GaussianBlur { sigma: f32 },
+    /// メディアンフィルタ。一辺 2r+1 の正方形窓の中央値を取る。
+    Median { radius: u32 },
+    /// アンシャープマスク。`sigma` のぼかしとの差に `amount` を掛けて足し戻す。
+    UnsharpMask { sigma: f32, amount: f32 },
+}
+
+/// パラメータを除いたフィルタの種類（UI の切り替え用）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FilterKind {
+    GaussianBlur,
+    Median,
+    UnsharpMask,
+}
+
+impl Default for Filter {
+    fn default() -> Self {
+        Self::GaussianBlur { sigma: 1.0 }
+    }
+}
+
+impl Filter {
+    pub fn kind(&self) -> FilterKind {
+        match self {
+            Self::GaussianBlur { .. } => FilterKind::GaussianBlur,
+            Self::Median { .. } => FilterKind::Median,
+            Self::UnsharpMask { .. } => FilterKind::UnsharpMask,
+        }
+    }
+
+    /// 種類を切り替えたときの既定値。
+    pub fn default_of(kind: FilterKind) -> Self {
+        match kind {
+            FilterKind::GaussianBlur => Self::GaussianBlur { sigma: 1.0 },
+            FilterKind::Median => Self::Median { radius: 1 },
+            FilterKind::UnsharpMask => Self::UnsharpMask {
+                sigma: 2.0,
+                amount: 1.5,
+            },
+        }
+    }
+
+    pub fn label(&self) -> String {
+        match self {
+            Self::GaussianBlur { sigma } => format!("ガウシアンぼかし: σ = {sigma:.2}"),
+            Self::Median { radius } => format!("メディアン: 半径 {radius}"),
+            Self::UnsharpMask { sigma, amount } => {
+                format!("アンシャープマスク: σ = {sigma:.2}, 強さ = {amount:.2}")
+            }
+        }
+    }
+
+    pub fn apply(&self, img: &Gray16) -> Gray16 {
+        match self {
+            Self::GaussianBlur { sigma } => img.gaussian_blur(*sigma),
+            Self::Median { radius } => img.median_filter(*radius),
+            Self::UnsharpMask { sigma, amount } => img.unsharp_mask(*sigma, *amount),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Command {
@@ -25,6 +121,8 @@ pub enum Command {
     Rotate { angle_deg: f32 },
     /// in_min..in_max の輝度を 0..65535 へ線形に引き伸ばす。
     Levels { in_min: u16, in_max: u16 },
+    /// 前処理フィルタ（ぼかし・メディアン・アンシャープマスク）。
+    Filter { filter: Filter },
     /// 測長。画像は変えず、ツール・グループ・フィッティング設定を保持する。
     /// フィッティングと測定値は適用のたびに再計算される。
     Measure { data: MeasureData },
@@ -72,6 +170,7 @@ impl Command {
             },
             Self::Rotate { angle_deg } => format!("回転: {angle_deg:.2}°"),
             Self::Levels { in_min, in_max } => format!("レベル補正: {in_min} → {in_max}"),
+            Self::Filter { filter } => format!("フィルタ: {}", filter.label()),
             Self::Measure { data } => {
                 let measurements = data.tools.iter().filter(|t| t.is_measurement()).count();
                 format!("測長: グループ {} 件 / 測定 {} 件", data.groups.len(), measurements)
@@ -100,6 +199,18 @@ impl Command {
             nm_per_px: nm,
             unit: *unit,
         })
+    }
+
+    /// このコマンドが属するカテゴリ（処理順を決める）。
+    pub fn category(&self) -> CommandCategory {
+        match self {
+            Self::InsertImage { .. } | Self::SetScale { .. } => CommandCategory::Input,
+            Self::Rotate { .. } | Self::Levels { .. } | Self::Filter { .. } => {
+                CommandCategory::Preprocess
+            }
+            Self::Measure { .. } => CommandCategory::Analysis,
+            Self::ExportImage { .. } => CommandCategory::Output,
+        }
     }
 
     /// 入力画像を必要とするか（`InsertImage` だけが入力なしで動く）。
@@ -133,6 +244,13 @@ impl Command {
                 let frame = require_input(input)?;
                 Ok(Frame {
                     image: Arc::new(frame.image.apply_levels(*in_min, *in_max)),
+                    scale: frame.scale,
+                })
+            }
+            Self::Filter { filter } => {
+                let frame = require_input(input)?;
+                Ok(Frame {
+                    image: Arc::new(filter.apply(&frame.image)),
                     scale: frame.scale,
                 })
             }
@@ -241,6 +359,59 @@ mod tests {
             unit: LengthUnit::Nanometer,
         };
         assert!(cmd.scale().is_none());
+    }
+
+    #[test]
+    fn commands_map_to_categories() {
+        let insert = Command::InsertImage {
+            path: "a.tif".into(),
+        };
+        assert_eq!(insert.category(), CommandCategory::Input);
+        let scale = Command::SetScale {
+            pixels: 1.0,
+            length: 2.0,
+            unit: LengthUnit::Nanometer,
+        };
+        assert_eq!(scale.category(), CommandCategory::Input);
+        let rotate = Command::Rotate { angle_deg: 90.0 };
+        assert_eq!(rotate.category(), CommandCategory::Preprocess);
+        let levels = Command::Levels {
+            in_min: 0,
+            in_max: 100,
+        };
+        assert_eq!(levels.category(), CommandCategory::Preprocess);
+        let measure = Command::Measure {
+            data: MeasureData::default(),
+        };
+        assert_eq!(measure.category(), CommandCategory::Analysis);
+        let export = Command::ExportImage {
+            output: "a.png".into(),
+            annotation_scale: 1.0,
+            color: false,
+        };
+        assert_eq!(export.category(), CommandCategory::Output);
+        let filter = Command::Filter {
+            filter: Filter::GaussianBlur { sigma: 1.0 },
+        };
+        assert_eq!(filter.category(), CommandCategory::Preprocess);
+    }
+
+    /// フィルタコマンドの JSON ラウンドトリップ（種類のタグが付くこと）。
+    #[test]
+    fn filter_command_round_trips() {
+        for filter in [
+            Filter::GaussianBlur { sigma: 1.5 },
+            Filter::Median { radius: 2 },
+            Filter::UnsharpMask {
+                sigma: 2.0,
+                amount: 1.5,
+            },
+        ] {
+            let cmd = Command::Filter { filter };
+            let json = serde_json::to_string(&cmd).unwrap();
+            let back: Command = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, cmd, "JSON: {json}");
+        }
     }
 
     /// メタデータ由来のスケールが、そのまま読める単位のコマンドになること。

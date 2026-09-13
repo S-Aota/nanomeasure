@@ -8,15 +8,18 @@ use std::sync::Arc;
 
 use egui::{Color32, Context, Sense, Vec2};
 
-use crate::command::Command;
+use crate::command::{Command, Filter, FilterKind};
 use crate::document::Document;
 use crate::frame::LengthUnit;
 use crate::gray::Gray16;
 
 /// 編集対象のコマンドを差し替え、必要な範囲だけ再計算対象にする。
 pub(crate) fn set_command(doc: &mut Document, index: usize, cmd: Command) {
-    if doc.commands[index].command != cmd {
-        doc.commands[index].command = cmd;
+    let Some(item) = doc.commands.get_mut(index) else {
+        return;
+    };
+    if item.command != cmd {
+        item.command = cmd;
         doc.invalidate_from(index);
     }
 }
@@ -64,12 +67,12 @@ impl ScaleDialog {
     }
 
     fn start(&mut self, doc: &Document, index: usize, created: bool) {
-        let original = doc.commands[index].command.clone();
-        if let Command::SetScale {
+        let original = doc.commands.get(index).map(|c| c.command.clone());
+        if let Some(Command::SetScale {
             pixels,
             length,
             unit,
-        } = original
+        }) = original
         {
             self.pixels = format_number(pixels);
             self.length = format_number(length);
@@ -77,7 +80,7 @@ impl ScaleDialog {
         }
         self.index = Some(index);
         self.created = created;
-        self.original = Some(original);
+        self.original = original;
         self.open = true;
     }
 
@@ -237,14 +240,14 @@ impl RotateDialog {
     }
 
     fn start(&mut self, doc: &Document, index: usize, created: bool) {
-        let original = doc.commands[index].command.clone();
+        let original = doc.commands.get(index).map(|c| c.command.clone());
         self.angle = match original {
-            Command::Rotate { angle_deg } => angle_deg,
+            Some(Command::Rotate { angle_deg }) => angle_deg,
             _ => 0.0,
         };
         self.index = index;
         self.created = created;
-        self.original = Some(original);
+        self.original = original;
         self.open = true;
     }
 
@@ -355,9 +358,9 @@ impl LevelsDialog {
     }
 
     fn start(&mut self, doc: &Document, index: usize, created: bool) {
-        let original = doc.commands[index].command.clone();
+        let original = doc.commands.get(index).map(|c| c.command.clone());
         match original {
-            Command::Levels { in_min, in_max } => {
+            Some(Command::Levels { in_min, in_max }) => {
                 self.in_min = in_min;
                 self.in_max = in_max;
             }
@@ -368,7 +371,7 @@ impl LevelsDialog {
         }
         self.index = index;
         self.created = created;
-        self.original = Some(original);
+        self.original = original;
         self.hist_source = None;
         self.open = true;
     }
@@ -572,13 +575,13 @@ impl ExportDialog {
     }
 
     fn start(&mut self, doc: &Document, index: usize, created: bool) {
-        let original = doc.commands[index].command.clone();
+        let original = doc.commands.get(index).map(|c| c.command.clone());
         match &original {
-            Command::ExportImage {
+            Some(Command::ExportImage {
                 output,
                 annotation_scale,
                 color,
-            } => {
+            }) => {
                 self.output = output.clone();
                 self.annotation_scale = *annotation_scale;
                 self.color = *color;
@@ -591,7 +594,7 @@ impl ExportDialog {
         }
         self.index = Some(index);
         self.created = created;
-        self.original = Some(original);
+        self.original = original;
         self.open = true;
     }
 
@@ -691,6 +694,148 @@ impl ExportDialog {
             return true;
         }
         false
+    }
+
+    fn revert(&mut self, doc: &mut Document) {
+        let Some(index) = self.index else {
+            return;
+        };
+        if self.created {
+            doc.remove_command(index);
+        } else if let Some(original) = self.original.take() {
+            set_command(doc, index, original);
+        }
+    }
+}
+
+// -------------------------------------------------------------- フィルタ
+
+/// 前処理フィルタのパラメータ編集。処理が重いので、スライダーをドラッグ
+/// している間は反映せず、離したときに 1 回だけ適用する（ライブプレビューが
+/// 毎フレームの再計算にならないように）。クリックやキー入力など、
+/// ドラッグ以外の変更はその場で適用する。
+#[derive(Default)]
+pub struct FilterDialog {
+    pub open: bool,
+    index: Option<usize>,
+    created: bool,
+    original: Option<Command>,
+    filter: Filter,
+}
+
+impl FilterDialog {
+    /// 新しいフィルタコマンドを追加して編集を始める。既定値は `initial`。
+    pub fn open_new(&mut self, doc: &mut Document, initial: Filter) {
+        let index = doc.push_command(Command::Filter { filter: initial });
+        self.start(doc, index, true);
+    }
+
+    pub fn open_edit(&mut self, doc: &mut Document, index: usize) {
+        self.start(doc, index, false);
+    }
+
+    fn start(&mut self, doc: &Document, index: usize, created: bool) {
+        let original = doc.commands.get(index).map(|c| c.command.clone());
+        self.filter = match original {
+            Some(Command::Filter { filter }) => filter,
+            _ => Filter::GaussianBlur { sigma: 1.0 },
+        };
+        self.index = Some(index);
+        self.created = created;
+        self.original = original;
+        self.open = true;
+    }
+
+    pub fn show(&mut self, ctx: &Context, doc: &mut Document) {
+        if !self.open {
+            return;
+        }
+        if self.index.is_some_and(|i| i >= doc.commands.len()) {
+            self.open = false;
+            return;
+        }
+        let index = self.index.expect("open なら index あり");
+
+        let mut window_open = true;
+        let mut confirmed = false;
+        let mut cancelled = false;
+        let mut apply = false;
+
+        egui::Window::new("フィルタ")
+            .open(&mut window_open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(430.0)
+            .show(ctx, |ui| {
+                ui.label("画像を整える前処理フィルタです。端は最外周の画素値で埋めて計算します。");
+                ui.add_space(8.0);
+                let mut kind = self.filter.kind();
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut kind, FilterKind::GaussianBlur, "ガウシアンぼかし");
+                    ui.radio_value(&mut kind, FilterKind::Median, "メディアン");
+                    ui.radio_value(&mut kind, FilterKind::UnsharpMask, "アンシャープマスク");
+                });
+                if kind != self.filter.kind() {
+                    self.filter = Filter::default_of(kind);
+                    apply = true;
+                }
+                ui.add_space(8.0);
+
+                match &mut self.filter {
+                    Filter::GaussianBlur { sigma } => {
+                        let resp = ui.add(
+                            egui::Slider::new(sigma, 0.1..=20.0)
+                                .suffix(" px")
+                                .text("σ（標準偏差）"),
+                        );
+                        apply |= resp.drag_stopped() || (resp.changed() && !resp.dragged());
+                    }
+                    Filter::Median { radius } => {
+                        let resp = ui.add(
+                            egui::Slider::new(radius, 1..=3)
+                                .suffix(" px")
+                                .text("半径"),
+                        );
+                        ui.label("一辺 2r+1 の正方形窓の中央値を取ります。半径が大きいと計算が重くなります。");
+                        apply |= resp.drag_stopped() || (resp.changed() && !resp.dragged());
+                    }
+                    Filter::UnsharpMask { sigma, amount } => {
+                        let resp = ui.add(
+                            egui::Slider::new(sigma, 0.1..=20.0)
+                                .suffix(" px")
+                                .text("σ（ぼかしの標準偏差）"),
+                        );
+                        apply |= resp.drag_stopped() || (resp.changed() && !resp.dragged());
+                        let resp = ui.add(
+                            egui::Slider::new(amount, 0.0..=5.0).text("強さ"),
+                        );
+                        apply |= resp.drag_stopped() || (resp.changed() && !resp.dragged());
+                    }
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("決定").clicked() {
+                        confirmed = true;
+                    }
+                    if ui.button("キャンセル").clicked() {
+                        cancelled = true;
+                    }
+                });
+            });
+
+        if apply {
+            set_command(doc, index, Command::Filter { filter: self.filter });
+        }
+
+        if cancelled || !window_open {
+            self.revert(doc);
+            self.open = false;
+        } else if confirmed {
+            // 未適用の変更（ドラッグ直後の決定など）を取りこぼさないようにする。
+            set_command(doc, index, Command::Filter { filter: self.filter });
+            self.original = None;
+            self.open = false;
+        }
     }
 
     fn revert(&mut self, doc: &mut Document) {
