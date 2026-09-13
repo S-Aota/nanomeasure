@@ -75,7 +75,8 @@ impl Div<f64> for Pt2 {
     }
 }
 
-/// 端点の自動フィッティングの方式。1=Off / 2=Gaussian / 3=DerivativeGaussian。
+/// 端点の自動フィッティングの方式。
+/// 1=Off / 2=Gaussian / 3=DerivativeGaussian と、それぞれの符号固定版。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FitMode {
@@ -84,8 +85,16 @@ pub enum FitMode {
     Off,
     /// ガウシアン分布でフィッティング（明暗の境界線の検出）。
     Gaussian,
+    /// 正のピーク（明るいバンド）のみにフィッティング。振幅係数は正に制約。
+    GaussianPositive,
+    /// 負のピーク（暗いバンド）のみにフィッティング。振幅係数は負に制約。
+    GaussianNegative,
     /// プロファイルの微分（輝度のステップ）にガウシアンをフィッティング。
     DerivativeGaussian,
+    /// 正のステップ（fit 方向に輝度が上がる）のみにフィッティング。
+    DerivativeGaussianPositive,
+    /// 負のステップ（fit 方向に輝度が下がる）のみにフィッティング。
+    DerivativeGaussianNegative,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -480,7 +489,7 @@ fn fit_endpoint(
         settings.width_px,
         settings.mode,
     );
-    measure_fit::fit_endpoint(img, &region, settings.mode).unwrap_or(center)
+    measure_fit::fit_endpoint(img, &region).unwrap_or(center)
 }
 
 /// ツールの種類（計算結果側。描画の色・形の切り替えに使う）。

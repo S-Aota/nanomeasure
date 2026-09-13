@@ -20,6 +20,7 @@ use crate::measure::{
     AngleMode, ComputedMeasure, ComputedTool, FitMode, FitSettings, MeasureData, MeasureTool,
     NewMeasureMode, Pt2, SnapLine, ToolKind, format_measurement, snap_angle_four, snap_distance,
 };
+use crate::measure_fit::{self, FitRegion, GaussFit};
 use crate::view::ViewInfo;
 
 /// undo / redo スタックの深さ上限。
@@ -32,6 +33,9 @@ const SNAP_PX: f32 = 10.0;
 /// 画面 px 基準なので表示倍率を考慮した扱いになり、拡大しても画面上の
 /// 判定半径は変わらない。
 const PICK_PX: f32 = 20.0;
+
+/// 範囲選択枠の辺の判定幅（画面 px）。
+const RANGE_EDGE_PX: f32 = 6.0;
 
 /// 二点間測長（赤）。
 pub(crate) const COLOR_DISTANCE: Color32 = Color32::from_rgb(235, 70, 70);
@@ -47,8 +51,31 @@ const COLOR_IN_PROGRESS: Color32 = Color32::from_rgb(255, 150, 60);
 pub(crate) fn region_color(mode: FitMode) -> Color32 {
     match mode {
         FitMode::Off => COLOR_REGION_OFF,
-        FitMode::Gaussian => COLOR_REGION_GAUSSIAN,
-        FitMode::DerivativeGaussian => COLOR_REGION_DERIV,
+        FitMode::Gaussian | FitMode::GaussianPositive | FitMode::GaussianNegative => {
+            COLOR_REGION_GAUSSIAN
+        }
+        FitMode::DerivativeGaussian
+        | FitMode::DerivativeGaussianPositive
+        | FitMode::DerivativeGaussianNegative => COLOR_REGION_DERIV,
+    }
+}
+
+/// フィッティング枠の 4 辺それぞれの色。添字は `corners()` の辺の順
+/// （0: -fit 側の辺, 1: +avg 側, 2: +fit 側, 3: -avg 側。辺 1/3 が
+/// フィッティング方向に走る）。
+/// ガウシアン系はフィッティング方向に走る辺を符号で明/暗にし、
+/// 微分系は輝度が高くなる側の辺を明るく、逆の辺を暗くする。
+pub(crate) fn region_edge_colors(mode: FitMode) -> [Color32; 4] {
+    let base = region_color(mode);
+    let bright = base.gamma_multiply(1.6);
+    let dark = base.gamma_multiply(0.55);
+    match mode {
+        FitMode::Off | FitMode::Gaussian | FitMode::DerivativeGaussian => [base; 4],
+        FitMode::GaussianPositive => [base, bright, base, bright],
+        FitMode::GaussianNegative => [base, dark, base, dark],
+        // 微分の正 = fit 方向に輝度が上がる = +fit 側の辺（2）が明るい。
+        FitMode::DerivativeGaussianPositive => [dark, base, bright, base],
+        FitMode::DerivativeGaussianNegative => [bright, base, dark, base],
     }
 }
 
@@ -78,6 +105,8 @@ pub enum ToolButton {
     Boundary,
     Offset,
     LinearDuplicate,
+    /// 四角形で測長をまとめて選択し、一括移動する。
+    RangeSelect,
 }
 
 impl ToolButton {
@@ -87,8 +116,65 @@ impl ToolButton {
             Self::Boundary => "境界線",
             Self::Offset => "オフセット線",
             Self::LinearDuplicate => "直線複製",
+            Self::RangeSelect => "範囲選択",
         }
     }
+}
+
+/// 範囲選択で選ばれた測長と選択枠（画像座標の軸平行矩形）。
+#[derive(Clone, Debug, PartialEq)]
+struct RangeSelection {
+    ids: Vec<u64>,
+    min: Pt2,
+    max: Pt2,
+}
+
+/// undo / redo 1 段分。測長データと範囲選択（枠）をまとめて記録する。
+/// 範囲選択の移動・変形は測長と同じ操作として戻す必要があるため。
+#[derive(Clone)]
+struct Snapshot {
+    data: MeasureData,
+    range_selection: Option<RangeSelection>,
+}
+
+/// 範囲選択ツールのドラッグ状態。
+#[derive(Clone, Debug, PartialEq)]
+enum RangeState {
+    /// 枠を作成中（対角をドラッグ）。
+    Drawing { start: Pt2, current: Pt2 },
+    /// 枠の中をドラッグして選択測長をまとめて平行移動中。
+    /// `orig` はドラッグ開始時の各測長の p1/p2。
+    Moving {
+        start: Pt2,
+        orig_min: Pt2,
+        orig_max: Pt2,
+        orig: Vec<(u64, Pt2, Pt2)>,
+    },
+    /// 枠の辺・角をドラッグして拡大縮小中。反対側の辺を基準に、選択された
+    /// 測長の p1/p2 も枠と同じ線形写像で動かす。`orig` はドラッグ開始時の
+    /// 各測長の p1/p2。
+    Resizing {
+        orig_min: Pt2,
+        orig_max: Pt2,
+        /// どの辺がドラッグに追従するか（x/y それぞれ min/max 側）。
+        min_x: bool,
+        max_x: bool,
+        min_y: bool,
+        max_y: bool,
+        orig: Vec<(u64, Pt2, Pt2)>,
+    },
+}
+
+/// 枠への当たり判定の結果。
+enum RangeHit {
+    None,
+    Move,
+    Resize {
+        min_x: bool,
+        max_x: bool,
+        min_y: bool,
+        max_y: bool,
+    },
 }
 
 /// 移動する端点の側。
@@ -172,8 +258,8 @@ pub struct MeasureMode {
     drag_fitted: Option<ComputedMeasure>,
     /// フィッティング設定ポップアップの編集対象。
     popup: Option<FitPopupTarget>,
-    undo: Vec<MeasureData>,
-    redo: Vec<MeasureData>,
+    undo: Vec<Snapshot>,
+    redo: Vec<Snapshot>,
     /// キャンセルの確認モーダルを表示中か。
     confirm_cancel: bool,
     /// 名前編集中のグループ（id）。
@@ -183,6 +269,10 @@ pub struct MeasureMode {
     in_progress: Option<InProgress>,
     /// 直線複製のホイール入力の累積（20.0 たまるごとに複製数を 1 増減）。
     scroll_accum: f32,
+    /// 範囲選択で選ばれた測長と枠。
+    range_selection: Option<RangeSelection>,
+    /// 範囲選択ツールのドラッグ状態（枠の作成・移動・リサイズ）。
+    range_state: Option<RangeState>,
 }
 
 impl MeasureMode {
@@ -223,6 +313,8 @@ impl MeasureMode {
         self.rename_text.clear();
         self.in_progress = None;
         self.scroll_accum = 0.0;
+        self.range_selection = None;
+        self.range_state = None;
     }
 
     /// 編集を破棄してモードを閉じる（新規分のコマンドは取り除く）。
@@ -256,11 +348,22 @@ impl MeasureMode {
 
     /// 1 論理操作の記録を開始する（スライダーのドラッグ開始時などに呼ぶ）。
     fn begin_change(&mut self) {
-        self.undo.push(self.data.clone());
+        self.undo.push(Snapshot {
+            data: self.data.clone(),
+            range_selection: self.range_selection.clone(),
+        });
         if self.undo.len() > UNDO_LIMIT {
             self.undo.remove(0);
         }
         self.redo.clear();
+    }
+
+    /// 現状をスナップショットへまとめる。
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            data: self.data.clone(),
+            range_selection: self.range_selection.clone(),
+        }
     }
 
     /// 記録済みの変更を doc 側へ反映する。
@@ -306,24 +409,31 @@ impl MeasureMode {
 
     fn undo(&mut self, doc: &mut Document) {
         if let Some(prev) = self.undo.pop() {
-            self.redo.push(self.data.clone());
+            self.redo.push(self.snapshot());
             if self.redo.len() > UNDO_LIMIT {
                 self.redo.remove(0);
             }
-            self.data = prev;
-            self.apply_change(doc);
+            self.restore_snapshot(prev, doc);
         }
     }
 
     fn redo(&mut self, doc: &mut Document) {
         if let Some(next) = self.redo.pop() {
-            self.undo.push(self.data.clone());
+            self.undo.push(self.snapshot());
             if self.undo.len() > UNDO_LIMIT {
                 self.undo.remove(0);
             }
-            self.data = next;
-            self.apply_change(doc);
+            self.restore_snapshot(next, doc);
         }
+    }
+
+    /// スナップショットの内容（測長データ + 範囲選択の枠）を復元する。
+    /// ドラッグ途中の状態は復元対象にしない。
+    fn restore_snapshot(&mut self, snap: Snapshot, doc: &mut Document) {
+        self.data = snap.data;
+        self.range_selection = snap.range_selection;
+        self.range_state = None;
+        self.apply_change(doc);
     }
 
     // ------------------------------------------------------ パネル UI
@@ -445,11 +555,43 @@ impl MeasureMode {
                     // 対象のツールが消えていたら閉じる。
                     None => target_gone = true,
                 }
+                ui.separator();
+                // フィッティングの確認用プロット（輝度とフィット曲線）。
+                self.fit_plot_ui(ui, doc, target);
             });
         if !open || target_gone {
             self.popup = None;
         }
         self.handle_fit_outcome(doc, outcome);
+    }
+
+    /// ポップアップ下部のフィッティング確認プロット。輝度プロファイル
+    /// （微分モードはその微分）を灰線、フィット曲線を橙線で描く。
+    /// クリック位置そのままのモードではクリック位置（領域の中心）に縦線を引く。
+    fn fit_plot_ui(&self, ui: &mut Ui, doc: &Document, target: FitPopupTarget) {
+        let Some(img) = doc.input_to(self.index).map(|f| f.image.clone()) else {
+            return;
+        };
+        let scale = doc.input_to(self.index).and_then(|f| f.scale);
+        let computed = self.data.compute(&img, scale);
+        let tool_id = match target {
+            FitPopupTarget::Dist1 { tool }
+            | FitPopupTarget::Dist2 { tool }
+            | FitPopupTarget::Boundary { tool } => tool,
+        };
+        let Some(t) = computed.by_id(tool_id) else {
+            return;
+        };
+        let region_index = match target {
+            FitPopupTarget::Dist1 { .. } => 0,
+            FitPopupTarget::Dist2 { .. } => 1,
+            FitPopupTarget::Boundary { .. } => 0,
+        };
+        let Some(region) = t.fit_regions.get(region_index) else {
+            return;
+        };
+        let (profile, fit) = measure_fit::fit_profile(&img, region);
+        draw_profile_plot(ui, &profile, fit, region);
     }
 
     /// キャンセルの確認モーダル。
@@ -587,6 +729,11 @@ impl MeasureMode {
             ui.add_space(12.0);
             self.tool_button(ui, ToolButton::LinearDuplicate);
         });
+        ui.label(egui::RichText::new("選択").small().weak());
+        ui.horizontal(|ui| {
+            ui.add_space(12.0);
+            self.tool_button(ui, ToolButton::RangeSelect);
+        });
         ui.add_space(4.0);
 
         // フィッティング設定（二点間測長と境界線のみ）。
@@ -621,6 +768,9 @@ impl MeasureMode {
             Some(ToolButton::LinearDuplicate) => {
                 ui.weak("測長・境界線をクリック → マウス移動で方向と距離を指定 → クリックで確定。ホイールで複製数 (1-20)");
             }
+            Some(ToolButton::RangeSelect) => {
+                ui.weak("ドラッグで四角形を作ると、中心が枠内の測長をまとめて選択。枠の中のドラッグで一括移動、枠の辺・角のドラッグで測長ごと拡大縮小");
+            }
             None => {
                 ui.weak("画像上の測長・境界線を直接ドラッグで移動（Esc で解除）");
             }
@@ -636,6 +786,8 @@ impl MeasureMode {
             self.selected = None;
             self.drag = None;
             self.drag_fitted = None;
+            self.range_selection = None;
+            self.range_state = None;
         }
     }
 
@@ -1069,7 +1221,17 @@ fn fit_settings_ui(ui: &mut Ui, settings: &mut FitSettings) -> FitUiOutcome {
     for (label, mode) in [
         ("1. クリック位置そのまま", FitMode::Off),
         ("2. ガウシアン（境界線検出）", FitMode::Gaussian),
+        ("2+. ガウシアン（正ピークのみ）", FitMode::GaussianPositive),
+        ("2−. ガウシアン（負ピークのみ）", FitMode::GaussianNegative),
         ("3. 微分ガウシアン（ステップ）", FitMode::DerivativeGaussian),
+        (
+            "3+. 微分ガウシアン（正ステップのみ）",
+            FitMode::DerivativeGaussianPositive,
+        ),
+        (
+            "3−. 微分ガウシアン（負ステップのみ）",
+            FitMode::DerivativeGaussianNegative,
+        ),
     ] {
         if ui.radio_value(&mut settings.mode, mode, label).changed() {
             outcome.committed = true;
@@ -1090,6 +1252,73 @@ fn fit_settings_ui(ui: &mut Ui, settings: &mut FitSettings) -> FitUiOutcome {
         outcome.changed = true;
     }
     outcome
+}
+
+/// プロファイルとフィット曲線のプロット。フィット中心の位置に点を打ち、
+/// クリック位置そのままのモードではクリック位置（= 領域の中心）に縦線を引く。
+fn draw_profile_plot(ui: &mut Ui, profile: &[f64], fit: Option<GaussFit>, region: &FitRegion) {
+    let n = profile.len();
+    let label = match region.mode {
+        FitMode::DerivativeGaussian
+        | FitMode::DerivativeGaussianPositive
+        | FitMode::DerivativeGaussianNegative => "輝度の微分",
+        _ => "輝度",
+    };
+    ui.label(egui::RichText::new(label).small().weak());
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(360.0, 100.0), Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 2.0, Color32::from_gray(28));
+    if n < 2 {
+        return;
+    }
+    let (mut lo, mut hi) = profile.iter().cloned().fold(
+        (f64::INFINITY, f64::NEG_INFINITY),
+        |(l, h), v| (l.min(v), h.max(v)),
+    );
+    if hi - lo < 1e-9 {
+        lo -= 1.0;
+        hi += 1.0;
+    }
+    let x = |i: f64| rect.left() + (i / (n - 1) as f64) as f32 * rect.width();
+    let y = |v: f64| {
+        rect.bottom() - ((v - lo) / (hi - lo)) as f32 * (rect.height() - 4.0) - 2.0
+    };
+
+    // プロファイル（灰）。
+    let points: Vec<Pos2> = profile
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| Pos2::new(x(i as f64), y(v)))
+        .collect();
+    painter.add(egui::Shape::line(points, Stroke::new(1.5, Color32::from_gray(170))));
+
+    // フィット曲線（橙）とフィット中心の点。
+    if let Some(f) = fit {
+        let points: Vec<Pos2> = (0..n)
+            .map(|i| {
+                let xi = i as f64;
+                let v = f.amplitude * (-((xi - f.mu).powi(2)) / (2.0 * f.sigma * f.sigma)).exp()
+                    + f.baseline;
+                Pos2::new(x(xi), y(v))
+            })
+            .collect();
+        painter.add(egui::Shape::line(points, Stroke::new(1.5, COLOR_IN_PROGRESS)));
+        painter.circle_filled(
+            Pos2::new(x(f.mu), y(f.amplitude + f.baseline)),
+            2.5,
+            COLOR_IN_PROGRESS,
+        );
+    }
+
+    // クリック位置そのままのモード: クリック位置 = 領域の中心 =
+    // プロファイルの中央。そこに縦線を引く。
+    if region.mode == FitMode::Off {
+        let cx = x((n - 1) as f64 * 0.5);
+        painter.line_segment(
+            [Pos2::new(cx, rect.top() + 2.0), Pos2::new(cx, rect.bottom() - 2.0)],
+            Stroke::new(1.0, Color32::from_rgb(255, 220, 120)),
+        );
+    }
 }
 
 /// 単位なしの数値文字列（スケールがあれば実寸の値、なければ px）。
@@ -1213,15 +1442,19 @@ pub fn draw_computed(
         return;
     }
     for t in &computed.tools {
-        // フィッティング領域の枠（点線）。色はフィッティング設定で変える。
+        // フィッティング領域の枠（点線）。色はフィッティング設定で変え、
+        // 符号固定モードは辺ごとに明暗を付けて方向を示す。
         for region in &t.fit_regions {
             let pts: Vec<Pos2> = region.corners().iter().map(|&c| to_screen(info, c)).collect();
-            painter.add(egui::Shape::dashed_line(
-                &[pts[0], pts[1], pts[2], pts[3], pts[0]],
-                Stroke::new(1.5, region_color(region.mode)),
-                6.0,
-                5.0,
-            ));
+            let colors = region_edge_colors(region.mode);
+            for i in 0..4 {
+                painter.add(egui::Shape::dashed_line(
+                    &[pts[i], pts[(i + 1) % 4]],
+                    Stroke::new(1.5, colors[i]),
+                    6.0,
+                    5.0,
+                ));
+            }
         }
         match t.kind {
             ToolKind::Distance => {
@@ -1367,6 +1600,22 @@ fn set_endpoint(data: &mut MeasureData, id: u64, which: EndpointWhich, p: Pt2) {
     }
 }
 
+/// リサイズ前の矩形から新しい矩形への線形写像（反対側の辺が基準になる）。
+/// 元の矩形の幅が 0 の軸は平行移動だけにする。
+fn resize_map(omin: Pt2, omax: Pt2, nmin: Pt2, nmax: Pt2, p: Pt2) -> Pt2 {
+    let sx = if (omax.x - omin.x).abs() > 1e-9 {
+        (nmax.x - nmin.x) / (omax.x - omin.x)
+    } else {
+        1.0
+    };
+    let sy = if (omax.y - omin.y).abs() > 1e-9 {
+        (nmax.y - nmin.y) / (omax.y - omin.y)
+    } else {
+        1.0
+    };
+    Pt2::new(nmin.x + (p.x - omin.x) * sx, nmin.y + (p.y - omin.y) * sy)
+}
+
 /// 線分（a→b）までの距離。
 fn distance_to_segment(pos: Pt2, a: Pt2, b: Pt2) -> f64 {
     let ab = b - a;
@@ -1393,14 +1642,25 @@ impl MeasureMode {
         let computed = if let Some(fitted) = &self.drag_fitted {
             let raw = self.data.compute_without_fit(&img, scale);
             let mut tools = fitted.tools.clone();
-            // 選択ツールと、それを参照するオフセット線は生の位置（ドラッグ追従）。
-            if let Some(sel) = self.selected {
-                for r in &raw.tools {
-                    if (r.id == sel || r.source == Some(sel))
-                        && let Some(t) = tools.iter_mut().find(|t| t.id == r.id)
-                    {
-                        *t = r.clone();
-                    }
+            // 選択ツール（範囲選択なら選択中の測長すべて）と、それを参照する
+            // オフセット線は生の位置（ドラッグ追従）。
+            let raw_ids: Vec<u64> = if let Some(sel) = self.selected {
+                vec![sel]
+            } else if matches!(
+                self.range_state,
+                Some(RangeState::Moving { .. } | RangeState::Resizing { .. })
+            ) {
+                self.range_selection
+                    .as_ref()
+                    .map_or(Vec::new(), |s| s.ids.clone())
+            } else {
+                Vec::new()
+            };
+            for r in &raw.tools {
+                if (raw_ids.contains(&r.id) || raw_ids.iter().any(|&id| r.source == Some(id)))
+                    && let Some(t) = tools.iter_mut().find(|t| t.id == r.id)
+                {
+                    *t = r.clone();
                 }
             }
             ComputedMeasure { tools }
@@ -1418,6 +1678,9 @@ impl MeasureMode {
                 Stroke::new(3.0, COLOR_IN_PROGRESS),
             );
         }
+
+        // 範囲選択: 選択中の測長のハイライトと選択枠。
+        self.draw_range_overlay(painter, info, &computed);
 
         // ホバー時の視覚フィードバック（スナップ・選択可能・ドラッグ中）。
         self.hover_feedback(painter, info, &computed);
@@ -1498,6 +1761,117 @@ impl MeasureMode {
                     );
                 }
             }
+        }
+    }
+
+    /// 範囲選択: 選択中（または作成中）の測長を橙の太線でハイライトし、
+    /// 選択枠と四隅のハンドルを描く。
+    fn draw_range_overlay(&self, painter: &Painter, info: &ViewInfo, computed: &ComputedMeasure) {
+        let (ids, rect): (Vec<u64>, Option<(Pt2, Pt2)>) = match &self.range_state {
+            Some(RangeState::Drawing { start, current }) => {
+                (self.distance_ids_in(*start, *current), Some((*start, *current)))
+            }
+            _ => (
+                self.range_selection
+                    .as_ref()
+                    .map_or(Vec::new(), |s| s.ids.clone()),
+                self.range_selection.as_ref().map(|s| (s.min, s.max)),
+            ),
+        };
+        for id in &ids {
+            if let Some(t) = computed.by_id(*id) {
+                painter.line_segment(
+                    [to_screen(info, t.p1), to_screen(info, t.p2)],
+                    Stroke::new(4.0, COLOR_IN_PROGRESS.gamma_multiply(0.65)),
+                );
+            }
+        }
+        if let Some((min, max)) = rect {
+            let rect = Rect::from_two_pos(to_screen(info, min), to_screen(info, max));
+            painter.rect_stroke(
+                rect,
+                0.0,
+                Stroke::new(1.5, COLOR_IN_PROGRESS),
+                egui::StrokeKind::Inside,
+            );
+            // リサイズできることを示す四隅のハンドル。
+            for corner in [
+                rect.left_top(),
+                rect.right_top(),
+                rect.left_bottom(),
+                rect.right_bottom(),
+            ] {
+                painter.rect_filled(
+                    Rect::from_center_size(corner, Vec2::splat(5.0)),
+                    0.0,
+                    COLOR_IN_PROGRESS,
+                );
+            }
+        }
+    }
+
+    /// 中心位置（p1/p2 の中点）が枠内の二点間測長の ID。枠は作成中の
+    /// 生の矩形でも、確定済みの min/max でもよい。
+    fn distance_ids_in(&self, a: Pt2, b: Pt2) -> Vec<u64> {
+        let (min_x, max_x) = (a.x.min(b.x), a.x.max(b.x));
+        let (min_y, max_y) = (a.y.min(b.y), a.y.max(b.y));
+        self.data
+            .tools
+            .iter()
+            .filter_map(|t| match t {
+                MeasureTool::Distance { id, p1, p2, .. } => {
+                    let c = (*p1 + *p2) * 0.5;
+                    (c.x >= min_x && c.x <= max_x && c.y >= min_y && c.y <= max_y)
+                        .then_some(*id)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 選択中測長のドラッグ開始時の p1/p2 スナップショット。
+    fn range_orig(&self) -> Vec<(u64, Pt2, Pt2)> {
+        let Some(sel) = &self.range_selection else {
+            return Vec::new();
+        };
+        self.data
+            .tools
+            .iter()
+            .filter_map(|t| match t {
+                MeasureTool::Distance { id, p1, p2, .. } if sel.ids.contains(id) => {
+                    Some((*id, *p1, *p2))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 枠への当たり判定。辺（±t）→ 変形、内側 → 移動、それ以外 → なし。
+    fn range_hit(sel: &RangeSelection, pos: Pt2, t: f64) -> RangeHit {
+        let min_x = (pos.x - sel.min.x).abs() <= t
+            && pos.y >= sel.min.y - t
+            && pos.y <= sel.max.y + t;
+        let max_x = (pos.x - sel.max.x).abs() <= t
+            && pos.y >= sel.min.y - t
+            && pos.y <= sel.max.y + t;
+        let min_y = (pos.y - sel.min.y).abs() <= t
+            && pos.x >= sel.min.x - t
+            && pos.x <= sel.max.x + t;
+        let max_y = (pos.y - sel.max.y).abs() <= t
+            && pos.x >= sel.min.x - t
+            && pos.x <= sel.max.x + t;
+        if min_x || max_x || min_y || max_y {
+            RangeHit::Resize {
+                min_x,
+                max_x,
+                min_y,
+                max_y,
+            }
+        } else if pos.x > sel.min.x && pos.x < sel.max.x && pos.y > sel.min.y && pos.y < sel.max.y
+        {
+            RangeHit::Move
+        } else {
+            RangeHit::None
         }
     }
 
@@ -1603,12 +1977,45 @@ impl MeasureMode {
             None => {}
         }
 
+        // ---- 範囲選択の枠: 内側で移動、辺・角でリサイズのカーソル ----
+        if self.tool == Some(ToolButton::RangeSelect)
+            && self.range_state.is_none()
+            && let Some(sel) = &self.range_selection
+        {
+            let t = RANGE_EDGE_PX as f64 / zoom as f64;
+            match Self::range_hit(sel, pos, t) {
+                RangeHit::Move => {
+                    set_cursor(CursorIcon::Move);
+                    return;
+                }
+                RangeHit::Resize {
+                    min_x,
+                    max_x,
+                    min_y,
+                    max_y,
+                } => {
+                    let corner = (min_x || max_x) && (min_y || max_y);
+                    if corner && ((min_x && min_y) || (max_x && max_y)) {
+                        set_cursor(CursorIcon::ResizeNwSe);
+                    } else if corner {
+                        set_cursor(CursorIcon::ResizeNeSw);
+                    } else if min_x || max_x {
+                        set_cursor(CursorIcon::ResizeHorizontal);
+                    } else {
+                        set_cursor(CursorIcon::ResizeVertical);
+                    }
+                    return;
+                }
+                RangeHit::None => {}
+            }
+        }
+
         // ---- ホバーで選択可能な対象（選択モード・オフセット線の元選択・
         //      直線複製の元選択）----
         let picking = match self.tool {
             None => true,
             Some(ToolButton::Offset | ToolButton::LinearDuplicate) => self.in_progress.is_none(),
-            Some(ToolButton::Distance | ToolButton::Boundary) => false,
+            Some(ToolButton::Distance | ToolButton::Boundary | ToolButton::RangeSelect) => false,
         };
         if !picking {
             return;
@@ -1748,6 +2155,15 @@ impl MeasureMode {
             }
         }
 
+        // 範囲選択ツール: 枠の作成・一括移動・リサイズ。
+        if self.tool == Some(ToolButton::RangeSelect) {
+            // 当たり判定は「押した位置」で行う（drag_started の時点では
+            // ポインタがドラッグしきい値ぶん動いており、角のハンドルから
+            // 外れて新規作成と誤判定されるため）。
+            let press = resp.interact_pointer_pos().and_then(|p| to_image(info, p));
+            self.handle_range_input(doc, &resp, cursor, press, &img, info.zoom);
+        }
+
         // 直線複製: カーソル追従（4 方向固定を適用）。確定はクリック側。
         if let Some(InProgress::LinearDuplicate { start, current, .. }) = &mut self.in_progress
             && let Some(cursor) = cursor
@@ -1784,7 +2200,10 @@ impl MeasureMode {
             self.cancel_escape();
         }
         // ダブルクリック: フィッティング領域の上なら設定ポップアップ。
-        if resp.double_clicked()
+        // ツール選択中はダブルクリックがツール操作（2 回クリック）と
+        // 重なるので、ツール非選択時のみ開く。
+        if self.tool.is_none()
+            && resp.double_clicked()
             && let (Some(img), Some(pos)) = (&img, click_pos)
         {
             let scale = doc.input_to(self.index).and_then(|f| f.scale);
@@ -1804,7 +2223,7 @@ impl MeasureMode {
         hover
     }
 
-    /// Esc の解除順序: 作成中ツール → 選択 → ツールボタン。
+    /// Esc の解除順序: 作成中ツール → 選択 → 範囲選択 → ツールボタン。
     fn cancel_escape(&mut self) {
         if self.in_progress.is_some() {
             self.in_progress = None;
@@ -1812,6 +2231,9 @@ impl MeasureMode {
             self.selected = None;
             self.drag = None;
             self.drag_fitted = None;
+        } else if self.range_state.is_some() || self.range_selection.is_some() {
+            self.range_state = None;
+            self.range_selection = None;
         } else {
             self.tool = None;
         }
@@ -1854,6 +2276,180 @@ impl MeasureMode {
                 set_endpoint(&mut self.data, id, EndpointWhich::P2, orig_p2 + d);
                 self.apply_change(doc);
             }
+        }
+    }
+
+    /// 範囲選択ツールの画像上入力。ドラッグ開始位置（押した位置）で
+    /// 「枠の作成・一括移動・拡大縮小」を決め、ドラッグ中は状態を更新する。
+    /// 移動・変形中の測長は生の位置で描き、フィッティングの再計算は
+    /// ドラッグ終了後の通常描画に任せる。
+    fn handle_range_input(
+        &mut self,
+        doc: &mut Document,
+        resp: &egui::Response,
+        cursor: Option<Pt2>,
+        press: Option<Pt2>,
+        img: &Option<std::sync::Arc<Gray16>>,
+        zoom: f32,
+    ) {
+        let edge = RANGE_EDGE_PX as f64 / zoom as f64;
+
+        if resp.drag_started()
+            && let Some(press) = press
+        {
+            match &self.range_selection {
+                Some(sel) => match Self::range_hit(sel, press, edge) {
+                    RangeHit::Resize {
+                        min_x,
+                        max_x,
+                        min_y,
+                        max_y,
+                    } => {
+                        // ドラッグ中は生の位置で描く（フィッティング再計算を止める）。
+                        if let Some(img) = img {
+                            let scale = doc.input_to(self.index).and_then(|f| f.scale);
+                            self.drag_fitted = Some(self.data.compute(img, scale));
+                        }
+                        self.range_state = Some(RangeState::Resizing {
+                            orig_min: sel.min,
+                            orig_max: sel.max,
+                            min_x,
+                            max_x,
+                            min_y,
+                            max_y,
+                            orig: self.range_orig(),
+                        });
+                        self.begin_change();
+                    }
+                    RangeHit::Move => {
+                        // ドラッグ中は生の位置で描く（フィッティング再計算を止める）。
+                        if let Some(img) = img {
+                            let scale = doc.input_to(self.index).and_then(|f| f.scale);
+                            self.drag_fitted = Some(self.data.compute(img, scale));
+                        }
+                        self.range_state = Some(RangeState::Moving {
+                            start: press,
+                            orig_min: sel.min,
+                            orig_max: sel.max,
+                            orig: self.range_orig(),
+                        });
+                        self.begin_change();
+                    }
+                    RangeHit::None => {
+                        // 枠の外: 新しい枠の作成を始める。
+                        self.range_state =
+                            Some(RangeState::Drawing { start: press, current: press });
+                    }
+                },
+                None => {
+                    self.range_state = Some(RangeState::Drawing { start: press, current: press });
+                }
+            }
+        }
+
+        if resp.dragged()
+            && let Some(cursor) = cursor
+        {
+            match self.range_state.clone() {
+                Some(RangeState::Drawing { start, .. }) => {
+                    self.range_state = Some(RangeState::Drawing { start, current: cursor });
+                }
+                Some(RangeState::Moving {
+                    start,
+                    orig_min,
+                    orig_max,
+                    orig,
+                }) => {
+                    let d = cursor - start;
+                    for (id, p1, p2) in &orig {
+                        set_endpoint(&mut self.data, *id, EndpointWhich::P1, *p1 + d);
+                        set_endpoint(&mut self.data, *id, EndpointWhich::P2, *p2 + d);
+                    }
+                    self.range_selection = Some(RangeSelection {
+                        ids: orig.iter().map(|(id, _, _)| *id).collect(),
+                        min: orig_min + d,
+                        max: orig_max + d,
+                    });
+                    self.apply_change(doc);
+                }
+                Some(RangeState::Resizing {
+                    orig_min,
+                    orig_max,
+                    min_x,
+                    max_x,
+                    min_y,
+                    max_y,
+                    orig,
+                }) => {
+                    // 追従する辺だけを動かし、測長の p1/p2 も枠と同じ線形写像で
+                    // 動かす（反対側の辺が基準になる）。枠は 1 px 未満に
+                    // つぶれないよう制限する。
+                    let (mut nmin, mut nmax) = (orig_min, orig_max);
+                    if min_x {
+                        nmin.x = cursor.x.min(orig_max.x - 1.0);
+                    }
+                    if max_x {
+                        nmax.x = cursor.x.max(orig_min.x + 1.0);
+                    }
+                    if min_y {
+                        nmin.y = cursor.y.min(orig_max.y - 1.0);
+                    }
+                    if max_y {
+                        nmax.y = cursor.y.max(orig_min.y + 1.0);
+                    }
+                    for (id, p1, p2) in &orig {
+                        set_endpoint(
+                            &mut self.data,
+                            *id,
+                            EndpointWhich::P1,
+                            resize_map(orig_min, orig_max, nmin, nmax, *p1),
+                        );
+                        set_endpoint(
+                            &mut self.data,
+                            *id,
+                            EndpointWhich::P2,
+                            resize_map(orig_min, orig_max, nmin, nmax, *p2),
+                        );
+                    }
+                    self.range_selection = Some(RangeSelection {
+                        ids: orig.iter().map(|(id, _, _)| *id).collect(),
+                        min: nmin,
+                        max: nmax,
+                    });
+                    self.apply_change(doc);
+                }
+                None => {}
+            }
+        }
+
+        if resp.drag_stopped() {
+            match self.range_state.take() {
+                Some(RangeState::Drawing { start, current }) => {
+                    // 中心位置が枠内の測長を選ぶ。空なら選択なし
+                    // （極小のドラッグも実質クリックで、空になる）。
+                    let ids = self.distance_ids_in(start, current);
+                    self.range_selection = if ids.is_empty() {
+                        None
+                    } else {
+                        Some(RangeSelection {
+                            ids,
+                            min: Pt2::new(start.x.min(current.x), start.y.min(current.y)),
+                            max: Pt2::new(start.x.max(current.x), start.y.max(current.y)),
+                        })
+                    };
+                }
+                // フィッティングの再計算はこの後の通常描画（drag_fitted = None）で行う。
+                Some(RangeState::Moving { .. }) | Some(RangeState::Resizing { .. }) => {
+                    self.drag_fitted = None;
+                }
+                None => {}
+            }
+        }
+
+        // クリック（ドラッグなし）: 選択解除。
+        if resp.clicked() {
+            self.range_selection = None;
+            self.range_state = None;
         }
     }
 
@@ -2106,6 +2702,9 @@ impl MeasureMode {
                 // 選択モードではクリック単独では何もしない（ドラッグ開始時に
                 // handle_overlay_input 側で直接選択して移動する）。
             }
+            Some(ToolButton::RangeSelect) => {
+                // 選択の解除は handle_range_input のクリック判定が行う。
+            }
         }
     }
 
@@ -2230,6 +2829,60 @@ mod tests {
 
     fn computed_of(data: &MeasureData) -> ComputedMeasure {
         data.compute(&crate::gray::Gray16::black(200, 200), None)
+    }
+
+    /// 範囲選択の中心位置判定（p1/p2 の中点）と枠への当たり判定。
+    #[test]
+    fn range_selection_helpers() {
+        let (data, _g) = data_with_group(); // 中点は (100,15) / (20,50) / (55,5)
+        let mut mode = MeasureMode::default();
+        mode.index = 0;
+        mode.data = data;
+
+        // 中心位置が枠内の測長だけが選ばれる。
+        assert_eq!(mode.distance_ids_in(pt(90.0, 10.0), pt(110.0, 20.0)), vec![1]);
+        assert_eq!(mode.distance_ids_in(pt(0.0, 0.0), pt(90.0, 60.0)), vec![2, 3]);
+        assert!(mode.distance_ids_in(pt(90.0, 10.0), pt(95.0, 12.0)).is_empty());
+
+        // 当たり判定: 内側 = 移動、辺 = 変形、角 = 両軸の変形、外 = なし。
+        let sel = RangeSelection {
+            ids: vec![1],
+            min: pt(0.0, 0.0),
+            max: pt(20.0, 10.0),
+        };
+        assert!(matches!(MeasureMode::range_hit(&sel, pt(10.0, 5.0), 1.0), RangeHit::Move));
+        assert!(matches!(
+            MeasureMode::range_hit(&sel, pt(20.0, 5.0), 1.0),
+            RangeHit::Resize { max_x: true, min_x: false, min_y: false, max_y: false }
+        ));
+        assert!(matches!(
+            MeasureMode::range_hit(&sel, pt(0.0, 0.0), 1.0),
+            RangeHit::Resize { min_x: true, max_x: false, min_y: true, max_y: false }
+        ));
+        assert!(matches!(MeasureMode::range_hit(&sel, pt(50.0, 50.0), 1.0), RangeHit::None));
+        // 辺の延長線上（y が枠から外れる）は辺扱いしない。
+        assert!(matches!(MeasureMode::range_hit(&sel, pt(20.0, 50.0), 1.0), RangeHit::None));
+    }
+
+    /// リサイズ時の線形写像。反対側の辺が基準になり、測長の p1/p2 も
+    /// 枠と同じ倍率で動く。幅 0 の軸は平行移動になる。
+    #[test]
+    fn resize_map_scales_about_opposite_edge() {
+        let (omin, omax) = (pt(0.0, 0.0), pt(10.0, 10.0));
+        // 右辺だけ右へ 10 px: x 方向のみ 2 倍（左辺基準）。
+        let (nmin, nmax) = (pt(0.0, 0.0), pt(20.0, 10.0));
+        let p = resize_map(omin, omax, nmin, nmax, pt(5.0, 10.0));
+        assert!((p.x - 10.0).abs() < 1e-9);
+        assert!((p.y - 10.0).abs() < 1e-9, "動かさない軸はそのまま");
+        // 両辺を動かす（左上が原点基準）と、枠内の点はその比率で移る。
+        let (nmin, nmax) = (pt(5.0, 5.0), pt(15.0, 15.0));
+        let p = resize_map(omin, omax, nmin, nmax, pt(0.0, 0.0));
+        assert!((p.x - 5.0).abs() < 1e-9);
+        assert!((p.y - 5.0).abs() < 1e-9);
+        // 幅 0 の軸（すべての中心が同一 x）は平行移動だけになる。
+        let p = resize_map(pt(10.0, 0.0), pt(10.0, 10.0), pt(15.0, 0.0), pt(16.0, 10.0), pt(10.0, 5.0));
+        assert!((p.x - 15.0).abs() < 1e-9);
+        assert!((p.y - 5.0).abs() < 1e-9);
     }
 
     #[test]

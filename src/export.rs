@@ -21,7 +21,7 @@ use imageproc::point::Point;
 use crate::frame::Scale;
 use crate::gray::Gray16;
 use crate::measure::{ComputedMeasure, Pt2, ToolKind, format_measurement};
-use crate::measure_mode::{COLOR_DISTANCE, COLOR_GUIDE, region_color};
+use crate::measure_mode::{COLOR_DISTANCE, COLOR_GUIDE, region_edge_colors};
 
 /// 出力先テンプレートの既定値。`{dir}` / `{filename}` は保存時に画像パスから解決。
 pub const DEFAULT_EXPORT_PATH: &str = "{dir}/{filename}_result.jpg";
@@ -159,11 +159,19 @@ fn draw_computed<P>(
     P::Subpixel: Into<f32> + Clamp<f32>,
 {
     for t in &computed.tools {
-        // フィッティング領域の枠（点線）。
+        // フィッティング領域の枠（点線）。符号固定モードは辺ごとに明暗を
+        // 付けるので、画面と同じ `region_edge_colors` で 1 辺ずつ描く。
         for region in &t.fit_regions {
-            let mut poly = region.corners().to_vec();
-            poly.push(poly[0]);
-            draw_dashed_polyline(img, &poly, f, P::from_screen(region_color(region.mode)));
+            let poly = region.corners();
+            let colors = region_edge_colors(region.mode);
+            for i in 0..4 {
+                draw_dashed_polyline(
+                    img,
+                    &[poly[i], poly[(i + 1) % 4]],
+                    f,
+                    P::from_screen(colors[i]),
+                );
+            }
         }
         match t.kind {
             ToolKind::Distance => {

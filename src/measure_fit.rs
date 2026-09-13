@@ -82,6 +82,17 @@ pub struct GaussFit {
     pub baseline: f64,
 }
 
+/// 振幅係数の符号制約。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FitSign {
+    /// 正負どちらのピークにもフィットできる。
+    Any,
+    /// 正のピーク（振幅 > 0）のみ。
+    Positive,
+    /// 負のピーク（振幅 < 0）のみ。
+    Negative,
+}
+
 /// プロファイルの中心差分（境界は片側差分）。
 fn derivative(profile: &[f64]) -> Vec<f64> {
     let n = profile.len();
@@ -103,7 +114,8 @@ fn derivative(profile: &[f64]) -> Vec<f64> {
 
 /// `f(x) = A·exp(−(x−μ)²/(2σ²)) + B` をプロファイルへ当てはめる
 /// （Levenberg-Marquardt）。失敗（平坦・発散・振幅不足）なら None。
-pub fn fit_gaussian(profile: &[f64]) -> Option<GaussFit> {
+/// `sign` は振幅係数 A の符号制約（Positive なら正のピークのみ等）。
+pub fn fit_gaussian(profile: &[f64], sign: FitSign) -> Option<GaussFit> {
     let n = profile.len();
     if n < 3 {
         return None;
@@ -115,22 +127,26 @@ pub fn fit_gaussian(profile: &[f64]) -> Option<GaussFit> {
     }
 
     // 初期値: ベースラインは両端平均、ピークはベースラインからの
-    // ずれが最大の位置（近傍で重心補正）。
+    // ずれが符号制約に沿って最大の位置（近傍で重心補正）。
     let b0 = (profile[0] + profile[n - 1]) * 0.5;
     let dev: Vec<f64> = profile.iter().map(|v| v - b0).collect();
     let imax = (0..n)
-        .max_by(|&i, &j| dev[i].abs().partial_cmp(&dev[j].abs()).unwrap())
+        .max_by(|&i, &j| {
+            let (a, b) = (signed_dev(&dev[i], sign), signed_dev(&dev[j], sign));
+            a.abs().partial_cmp(&b.abs()).unwrap()
+        })
         .unwrap();
     let (lo, hi) = (imax.saturating_sub(1), (imax + 2).min(n));
     let (mut num, mut den) = (0.0, 0.0);
     for (i, &d) in dev.iter().enumerate().take(hi).skip(lo) {
-        num += i as f64 * d.abs();
-        den += d.abs();
+        num += i as f64 * signed_dev(&d, sign).abs();
+        den += signed_dev(&d, sign).abs();
     }
     let mu0 = if den > 0.0 { num / den } else { imax as f64 };
 
-    let mut params = [dev[imax], mu0, 1.5, b0];
-    if !lm_fit(profile, &mut params, true) {
+    // 符号固定のとき、振幅の初期値がその符号を持つよう dev を選ぶ。
+    let mut params = [signed_dev(&dev[imax], sign), mu0, 1.5, b0];
+    if !lm_fit(profile, &mut params, true, sign_amplitude(sign)) {
         return None;
     }
     let [a, mu, sigma, b] = params;
@@ -150,17 +166,21 @@ pub fn fit_gaussian(profile: &[f64]) -> Option<GaussFit> {
 }
 
 /// プロファイルの微分へガウシアンを当てはめ、輝度のステップ位置を求める。
-pub fn fit_derivative_gaussian(profile: &[f64]) -> Option<GaussFit> {
+/// `sign` は振幅係数の符号制約。
+pub fn fit_derivative_gaussian(profile: &[f64], sign: FitSign) -> Option<GaussFit> {
     let d = derivative(profile);
     let n = d.len();
     if n < 3 {
         return None;
     }
     let imax = (0..n)
-        .max_by(|&i, &j| d[i].abs().partial_cmp(&d[j].abs()).unwrap())
+        .max_by(|&i, &j| {
+            let (a, b) = (signed_dev(&d[i], sign), signed_dev(&d[j], sign));
+            a.abs().partial_cmp(&b.abs()).unwrap()
+        })
         .unwrap();
-    let mut params = [d[imax], imax as f64, 2.0, 0.0];
-    if !lm_fit(&d, &mut params, false) {
+    let mut params = [signed_dev(&d[imax], sign), imax as f64, 2.0, 0.0];
+    if !lm_fit(&d, &mut params, false, sign_amplitude(sign)) {
         return None;
     }
     let [a, mu, sigma, b] = params;
@@ -182,23 +202,86 @@ pub fn fit_derivative_gaussian(profile: &[f64]) -> Option<GaussFit> {
     })
 }
 
+/// 符号制約に沿った値。Any ならそのまま。Positive なら正の値だけ
+/// （負の値は無視して 0）、Negative なら負の値だけを取り出す。
+/// ピーク初期値の選択に使う（評価は絶対値で行うため、符号を揃える）。
+fn signed_dev(v: &f64, sign: FitSign) -> f64 {
+    match sign {
+        FitSign::Any => *v,
+        FitSign::Positive => v.max(0.0),
+        FitSign::Negative => v.min(0.0),
+    }
+}
+
+/// 振幅の符号制約を LM へ渡す形へ直す（None = 制約なし、Some(s) = 符号 s）。
+fn sign_amplitude(sign: FitSign) -> Option<f64> {
+    match sign {
+        FitSign::Any => None,
+        FitSign::Positive => Some(1.0),
+        FitSign::Negative => Some(-1.0),
+    }
+}
+
+/// `region` のモードに応じたプロファイルとフィット結果。
+/// 微分系は輝度プロファイルの微分を返す（プロットはこの微分を描く）。
+/// クリック位置そのままはプロファイルのみ（フィットなし）。
+pub fn fit_profile(img: &Gray16, region: &FitRegion) -> (Vec<f64>, Option<GaussFit>) {
+    let profile = extract_profile(img, region);
+    let sign = match region.mode {
+        FitMode::Off => return (profile, None),
+        FitMode::Gaussian => FitSign::Any,
+        FitMode::GaussianPositive => FitSign::Positive,
+        FitMode::GaussianNegative => FitSign::Negative,
+        FitMode::DerivativeGaussian => FitSign::Any,
+        FitMode::DerivativeGaussianPositive => FitSign::Positive,
+        FitMode::DerivativeGaussianNegative => FitSign::Negative,
+    };
+    match region.mode {
+        FitMode::Gaussian | FitMode::GaussianPositive | FitMode::GaussianNegative => {
+            let fit = fit_gaussian(&profile, sign);
+            (profile, fit)
+        }
+        _ => {
+            let d = derivative(&profile);
+            let fit = fit_derivative_gaussian(&profile, sign);
+            (d, fit)
+        }
+    }
+}
+
 /// Levenberg-Marquardt による 4 パラメータガウシアンフィット。
 /// `baseline` が true のとき B も自由、false（微分モード）なら B は 0 に固定。
-fn lm_fit(data: &[f64], params: &mut [f64; 4], baseline: bool) -> bool {
+/// `amp_sign` が Some(s) のとき振幅 A = s·c²（c = params[0]）と置き、
+/// A の符号を s に固定する。呼び出し後、params[0] は実際の振幅に戻る。
+fn lm_fit(data: &[f64], params: &mut [f64; 4], baseline: bool, amp_sign: Option<f64>) -> bool {
     let n = data.len();
     let mut lambda = 1e-3;
     let x: Vec<f64> = (0..n).map(|i| i as f64).collect();
+    // 振幅の実値と、c に関するヤコビアン。
+    let amp = |p: &[f64; 4]| match amp_sign {
+        Some(s) => s * p[0] * p[0],
+        None => p[0],
+    };
+    let damp = |p: &[f64; 4], e: f64| match amp_sign {
+        Some(s) => e * 2.0 * s * p[0],
+        None => e,
+    };
+    if amp_sign.is_some() {
+        // params[0] を符号付き振幅から c = √|A| へ変換する。
+        params[0] = params[0].abs().sqrt();
+    }
 
     for _ in 0..50 {
         // 残差とヤコビアン（数値微分は使わず解析的に計算する）。
         let mut r = vec![0.0; n];
         let mut j = vec![[0.0; 4]; n];
         for (i, &xi) in x.iter().enumerate() {
-            let [a, mu, sigma, b] = *params;
+            let [_, mu, sigma, b] = *params;
+            let a = amp(params);
             let e = (-((xi - mu).powi(2)) / (2.0 * sigma * sigma)).exp();
             let f = a * e + b;
             r[i] = data[i] - f;
-            j[i][0] = e; // dA
+            j[i][0] = damp(params, e); // dA（符号制約時は dc）
             j[i][1] = a * e * (xi - mu) / (sigma * sigma); // dμ
             j[i][2] = a * e * (xi - mu).powi(2) / sigma.powi(3); // dσ
             j[i][3] = if baseline { 1.0 } else { 0.0 }; // dB
@@ -240,7 +323,8 @@ fn lm_fit(data: &[f64], params: &mut [f64; 4], baseline: bool) -> bool {
                 return false;
             }
             let rss = |p: &[f64; 4]| -> f64 {
-                let [a, mu, sigma, b] = *p;
+                let [_, mu, sigma, b] = *p;
+                let a = amp(p);
                 x.iter()
                     .zip(data)
                     .map(|(&xi, &y)| {
@@ -257,6 +341,7 @@ fn lm_fit(data: &[f64], params: &mut [f64; 4], baseline: bool) -> bool {
                 let scale = params.iter().map(|v| v.abs()).fold(0.0, f64::max);
                 let step = delta.iter().map(|v| v.abs()).fold(0.0, f64::max);
                 if step < 1e-8 * (scale + 1.0) {
+                    params[0] = amp(params);
                     return true;
                 }
                 break;
@@ -265,10 +350,12 @@ fn lm_fit(data: &[f64], params: &mut [f64; 4], baseline: bool) -> bool {
             // 減衰が強すぎて更新できないなら、これ以上動かないので収束とみなす
             // （解の妥当性は呼び出し側の検証で判断する）。
             if lambda > 1e10 {
+                params[0] = amp(params);
                 return true;
             }
         }
     }
+    params[0] = amp(params);
     true
 }
 
@@ -310,13 +397,9 @@ fn solve4(m: [[f64; 4]; 4], v: [f64; 4]) -> Option<[f64; 4]> {
 
 /// 端点をフィッティングする。成功したら新しい端点位置（サブピクセル）、
 /// 失敗したら None（呼び出し側は元の位置のまま扱う）。
-pub fn fit_endpoint(img: &Gray16, region: &FitRegion, mode: FitMode) -> Option<Pt2> {
-    let profile = extract_profile(img, region);
-    let fit = match mode {
-        FitMode::Off => return None,
-        FitMode::Gaussian => fit_gaussian(&profile),
-        FitMode::DerivativeGaussian => fit_derivative_gaussian(&profile),
-    }?;
+pub fn fit_endpoint(img: &Gray16, region: &FitRegion) -> Option<Pt2> {
+    let (_, fit) = fit_profile(img, region);
+    let fit = fit?;
     let offset = fit.mu - (region.fit_len as f64 - 1.0) * 0.5;
     Some(region.center + region.fit_axis * offset)
 }
@@ -352,10 +435,10 @@ mod tests {
         let img = step_image(60, 60, 30.0, 200, 3000);
         let region = FitRegion::new(Pt2::new(30.0, 30.0), Pt2::new(1.0, 0.0), 41, 15, FitMode::DerivativeGaussian);
         let profile = extract_profile(&img, &region);
-        let fit = fit_derivative_gaussian(&profile).expect("ステップがあるので成功する");
+        let fit = fit_derivative_gaussian(&profile, FitSign::Any).expect("ステップがあるので成功する");
         // ステップは x=29 と x=30 の間なので、位置は 19.5 が正解。
         assert!((fit.mu - 19.5).abs() < 0.05, "{}", fit.mu);
-        let pos = fit_endpoint(&img, &region, FitMode::DerivativeGaussian).unwrap();
+        let pos = fit_endpoint(&img, &region).unwrap();
         assert!((pos.x - 29.5).abs() < 0.05, "{}", pos.x);
         assert!((pos.y - 30.0).abs() < 1e-9);
     }
@@ -373,9 +456,9 @@ mod tests {
         }
         let region = FitRegion::new(Pt2::new(40.0, 40.0), Pt2::new(1.0, 0.0), 31, 9, FitMode::Gaussian);
         let profile = extract_profile(&img, &region);
-        let fit = fit_gaussian(&profile).expect("バンドがあるので成功する");
+        let fit = fit_gaussian(&profile, FitSign::Any).expect("バンドがあるので成功する");
         assert!((fit.mu - 15.0).abs() < 0.1, "中心行 15: {}", fit.mu);
-        let pos = fit_endpoint(&img, &region, FitMode::Gaussian).unwrap();
+        let pos = fit_endpoint(&img, &region).unwrap();
         assert!((pos.x - 40.0).abs() < 0.1, "{}", pos.x);
     }
 
@@ -387,8 +470,62 @@ mod tests {
         }
         let region = FitRegion::new(Pt2::new(15.0, 15.0), Pt2::new(1.0, 0.0), 21, 5, FitMode::Gaussian);
         let profile = extract_profile(&img, &region);
-        assert!(fit_gaussian(&profile).is_none());
-        assert!(fit_derivative_gaussian(&profile).is_none());
+        assert!(fit_gaussian(&profile, FitSign::Any).is_none());
+        assert!(fit_derivative_gaussian(&profile, FitSign::Any).is_none());
+    }
+
+    /// 符号固定ガウシアン: 明るいバンドには正のみ、暗いバンドには負のみが
+    /// フィットし、振幅の符号が制約に従うこと。
+    #[test]
+    fn sign_constrained_gaussian_picks_matching_peak() {
+        let (w, h) = (80, 80);
+        let mut bright = Gray16::black(w, h);
+        let mut dark = Gray16::black(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let g = (-((x as f64 - 40.0).powi(2)) / 18.0).exp();
+                bright.data[(y * w + x) as usize] = (500.0 * g + 200.0).round() as u16;
+                dark.data[(y * w + x) as usize] = (200.0 - 500.0 * g).round() as u16;
+            }
+        }
+        let bright_region = FitRegion::new(Pt2::new(40.0, 40.0), Pt2::new(1.0, 0.0), 31, 9, FitMode::Gaussian);
+        let dark_region = FitRegion::new(Pt2::new(40.0, 40.0), Pt2::new(1.0, 0.0), 31, 9, FitMode::Gaussian);
+        let bp = extract_profile(&bright, &bright_region);
+        let dp = extract_profile(&dark, &dark_region);
+
+        // 明バンド: Positive は成功し振幅 > 0。Negative は正のピークが
+        // 無いので失敗する。
+        let pos = fit_gaussian(&bp, FitSign::Positive).expect("明バンドに正フィット");
+        assert!(pos.amplitude > 0.0);
+        assert!((pos.mu - 15.0).abs() < 0.1);
+        assert!(fit_gaussian(&bp, FitSign::Negative).is_none(), "明バンドに負ピークは無い");
+
+        // 暗バンド: Negative は成功し振幅 < 0。Positive は失敗する。
+        let neg = fit_gaussian(&dp, FitSign::Negative).expect("暗バンドに負フィット");
+        assert!(neg.amplitude < 0.0);
+        assert!((neg.mu - 15.0).abs() < 0.1);
+        assert!(fit_gaussian(&dp, FitSign::Positive).is_none(), "暗バンドに正ピークは無い");
+    }
+
+    /// 符号固定微分ガウシアン: 上がるステップには正のみがフィットし、
+    /// 下がるステップでは負のみがフィットする。
+    #[test]
+    fn sign_constrained_derivative_picks_matching_step() {
+        let rising = step_image(60, 60, 30.0, 200, 3000);
+        let falling = step_image(60, 60, 30.0, 3000, 200);
+        let region = FitRegion::new(Pt2::new(30.0, 30.0), Pt2::new(1.0, 0.0), 41, 15, FitMode::DerivativeGaussian);
+        let rp = extract_profile(&rising, &region);
+        let fp = extract_profile(&falling, &region);
+
+        let pos = fit_derivative_gaussian(&rp, FitSign::Positive).expect("上がるステップ");
+        assert!(pos.amplitude > 0.0);
+        assert!((pos.mu - 19.5).abs() < 0.05);
+        assert!(fit_derivative_gaussian(&rp, FitSign::Negative).is_none());
+
+        let neg = fit_derivative_gaussian(&fp, FitSign::Negative).expect("下がるステップ");
+        assert!(neg.amplitude < 0.0);
+        assert!((neg.mu - 19.5).abs() < 0.05);
+        assert!(fit_derivative_gaussian(&fp, FitSign::Positive).is_none());
     }
 
     #[test]
