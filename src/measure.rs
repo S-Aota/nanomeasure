@@ -76,7 +76,7 @@ impl Div<f64> for Pt2 {
 }
 
 /// 端点の自動フィッティングの方式。
-/// 1=Off / 2=Gaussian / 3=DerivativeGaussian と、それぞれの符号固定版。
+/// 1=Off / 2=Gaussian / 3=DerivativeGaussian。ピークの符号は `FitSign` で別に持つ。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FitMode {
@@ -85,16 +85,32 @@ pub enum FitMode {
     Off,
     /// ガウシアン分布でフィッティング（明暗の境界線の検出）。
     Gaussian,
-    /// 正のピーク（明るいバンド）のみにフィッティング。振幅係数は正に制約。
-    GaussianPositive,
-    /// 負のピーク（暗いバンド）のみにフィッティング。振幅係数は負に制約。
-    GaussianNegative,
     /// プロファイルの微分（輝度のステップ）にガウシアンをフィッティング。
     DerivativeGaussian,
-    /// 正のステップ（fit 方向に輝度が上がる）のみにフィッティング。
-    DerivativeGaussianPositive,
-    /// 負のステップ（fit 方向に輝度が下がる）のみにフィッティング。
-    DerivativeGaussianNegative,
+}
+
+/// フィッティングの振幅符号制約（ガウシアン・微分ガウシアン共通）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FitSign {
+    /// 正負どちらのピークにもフィットできる。
+    #[default]
+    Any,
+    /// 正のピーク（振幅 > 0）のみ。
+    Positive,
+    /// 負のピーク（振幅 < 0）のみ。
+    Negative,
+}
+
+impl FitSign {
+    /// 符号選択ボタンの表示名。
+    pub fn label(self) -> &'static str {
+        match self {
+            FitSign::Any => "auto",
+            FitSign::Positive => "positive",
+            FitSign::Negative => "negative",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,6 +137,9 @@ pub enum NewMeasureMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FitSettings {
     pub mode: FitMode,
+    /// 振幅の符号制約。モード 2/3（ガウシアン・微分ガウシアン）共通。
+    #[serde(default)]
+    pub sign: FitSign,
     /// 検出領域の横長さ（平均方向、ノイズ軽減）。1..=20。
     pub width_px: u32,
     /// 検出領域の縦長さ（フィッティング方向）。1..=50。
@@ -131,6 +150,7 @@ impl Default for FitSettings {
     fn default() -> Self {
         Self {
             mode: FitMode::Off,
+            sign: FitSign::Any,
             width_px: 11,
             length_px: 31,
         }
@@ -223,6 +243,10 @@ pub struct MeasureData {
     /// 二点間測長の端点 1 / 端点 2 のフィッティング設定（別々に持つ）。
     pub dist_fit1: FitSettings,
     pub dist_fit2: FitSettings,
+    /// 端点 2 のフィッティング設定を端点 1 と連動させる。
+    /// true なら dist_fit2 は dist_fit1 のコピーに追従し、個別編集は不可。
+    #[serde(default)]
+    pub link_fit: bool,
     /// 境界線のフィッティング設定（端点 1 のみ使用）。
     pub boundary_fit: FitSettings,
     pub tools: Vec<MeasureTool>,
@@ -246,6 +270,7 @@ impl Default for MeasureData {
             active_group: None,
             dist_fit1: FitSettings::default(),
             dist_fit2: FitSettings::default(),
+            link_fit: false,
             boundary_fit: FitSettings::default(),
             tools: Vec::new(),
             output_path: default_output_path(),
@@ -378,8 +403,8 @@ impl MeasureData {
                 // フィッティングで検出位置が動いても追従させない。
                 // モード 1（クリック位置そのまま）でも表示し、色で設定がわかる。
                 let regions = [
-                    FitRegion::new(*p1, dir, fit1.length_px, fit1.width_px, fit1.mode),
-                    FitRegion::new(*p2, dir, fit2.length_px, fit2.width_px, fit2.mode),
+                    FitRegion::new(*p1, dir, *fit1),
+                    FitRegion::new(*p2, dir, *fit2),
                 ]
                 .to_vec();
                 Some(ComputedTool {
@@ -405,13 +430,7 @@ impl MeasureData {
                 let half = (*p2 - *p1).length() * 0.5;
                 // 領域枠はユーザー入力の線分の中点を中心に固定（表示のみ。
                 // モード 2/3 でも同じ位置）。フィッティングで動かない。
-                let region = FitRegion::new(
-                    (*p1 + *p2) * 0.5,
-                    dir.perp(),
-                    boundary_fit.length_px,
-                    boundary_fit.width_px,
-                    boundary_fit.mode,
-                );
+                let region = FitRegion::new((*p1 + *p2) * 0.5, dir.perp(), *boundary_fit);
                 if boundary_fit.mode == FitMode::Off || !fit {
                     // モード 1（またはプレビュー）: ユーザー指定の二点間のまま。
                     return Some(ComputedTool {
@@ -482,13 +501,7 @@ fn fit_endpoint(
         return center;
     }
     let fit_axis = if fit_along_dir { dir } else { dir.perp() };
-    let region = FitRegion::new(
-        center,
-        fit_axis,
-        settings.length_px,
-        settings.width_px,
-        settings.mode,
-    );
+    let region = FitRegion::new(center, fit_axis, settings);
     measure_fit::fit_endpoint(img, &region).unwrap_or(center)
 }
 
@@ -850,6 +863,7 @@ mod tests {
         // 線方向は水平（二点目が右）。エッジから 1 px ずらして置く。
         let fit = FitSettings {
             mode: FitMode::DerivativeGaussian,
+            sign: FitSign::Any,
             width_px: 11,
             length_px: 41,
         };

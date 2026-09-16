@@ -6,12 +6,12 @@
 //! 依存クレートを増やさないため、Levenberg-Marquardt は自前の小さな実装。
 
 use crate::gray::Gray16;
-use crate::measure::{FitMode, Pt2};
+use crate::measure::{FitMode, FitSettings, FitSign, Pt2};
 
 /// フィッティング領域。中心 `center` に、`fit_axis`（縦 = フィッティング
 /// 方向）とそれに直交する `avg_axis`（横 = 平均方向）を持つ。
 /// 1 画素間隔でサンプリングし、中心行を含むよう長さは奇数が望ましい。
-/// `mode` はオーバーレイ描画で枠の色を変えるためのもの。
+/// `mode` / `sign` はオーバーレイ描画で枠の色を変えるためのもの。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FitRegion {
     pub center: Pt2,
@@ -20,18 +20,21 @@ pub struct FitRegion {
     pub fit_len: u32,
     pub avg_len: u32,
     pub mode: FitMode,
+    pub sign: FitSign,
 }
 
 impl FitRegion {
     /// `dir` をフィッティング方向、その垂直を平均方向とする領域。
-    pub fn new(center: Pt2, dir: Pt2, fit_len: u32, avg_len: u32, mode: FitMode) -> Self {
+    /// サイズとフィッティング設定は `settings` から取る。
+    pub fn new(center: Pt2, dir: Pt2, settings: FitSettings) -> Self {
         Self {
             center,
             fit_axis: dir.normalize(),
             avg_axis: dir.perp().normalize(),
-            fit_len,
-            avg_len,
-            mode,
+            fit_len: settings.length_px,
+            avg_len: settings.width_px,
+            mode: settings.mode,
+            sign: settings.sign,
         }
     }
 
@@ -80,17 +83,6 @@ pub struct GaussFit {
     pub sigma: f64,
     pub amplitude: f64,
     pub baseline: f64,
-}
-
-/// 振幅係数の符号制約。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FitSign {
-    /// 正負どちらのピークにもフィットできる。
-    Any,
-    /// 正のピーク（振幅 > 0）のみ。
-    Positive,
-    /// 負のピーク（振幅 < 0）のみ。
-    Negative,
 }
 
 /// プロファイルの中心差分（境界は片側差分）。
@@ -227,23 +219,15 @@ fn sign_amplitude(sign: FitSign) -> Option<f64> {
 /// クリック位置そのままはプロファイルのみ（フィットなし）。
 pub fn fit_profile(img: &Gray16, region: &FitRegion) -> (Vec<f64>, Option<GaussFit>) {
     let profile = extract_profile(img, region);
-    let sign = match region.mode {
-        FitMode::Off => return (profile, None),
-        FitMode::Gaussian => FitSign::Any,
-        FitMode::GaussianPositive => FitSign::Positive,
-        FitMode::GaussianNegative => FitSign::Negative,
-        FitMode::DerivativeGaussian => FitSign::Any,
-        FitMode::DerivativeGaussianPositive => FitSign::Positive,
-        FitMode::DerivativeGaussianNegative => FitSign::Negative,
-    };
     match region.mode {
-        FitMode::Gaussian | FitMode::GaussianPositive | FitMode::GaussianNegative => {
-            let fit = fit_gaussian(&profile, sign);
+        FitMode::Off => (profile, None),
+        FitMode::Gaussian => {
+            let fit = fit_gaussian(&profile, region.sign);
             (profile, fit)
         }
-        _ => {
+        FitMode::DerivativeGaussian => {
+            let fit = fit_derivative_gaussian(&profile, region.sign);
             let d = derivative(&profile);
-            let fit = fit_derivative_gaussian(&profile, sign);
             (d, fit)
         }
     }
@@ -408,6 +392,20 @@ pub fn fit_endpoint(img: &Gray16, region: &FitRegion) -> Option<Pt2> {
 mod tests {
     use super::*;
 
+    /// 符号 any で領域を作るテスト用ヘルパー。
+    fn region(center: Pt2, dir: Pt2, fit_len: u32, avg_len: u32, mode: FitMode) -> FitRegion {
+        FitRegion::new(
+            center,
+            dir,
+            FitSettings {
+                mode,
+                sign: FitSign::Any,
+                width_px: avg_len,
+                length_px: fit_len,
+            },
+        )
+    }
+
     /// x = edge で輝度が lo → hi に切り替わるステップエッジ画像。
     fn step_image(w: u32, h: u32, edge: f64, lo: u16, hi: u16) -> Gray16 {
         let mut img = Gray16::black(w, h);
@@ -423,7 +421,7 @@ mod tests {
     fn profile_extraction_averages_along_avg_axis() {
         // 垂直エッジ（x = 10）。fit_axis = x 方向、avg_axis = y 方向。
         let img = step_image(40, 40, 10.0, 0, 1000);
-        let region = FitRegion::new(Pt2::new(10.0, 20.0), Pt2::new(1.0, 0.0), 21, 11, FitMode::Gaussian);
+        let region = region(Pt2::new(10.0, 20.0), Pt2::new(1.0, 0.0), 21, 11, FitMode::Gaussian);
         let profile = extract_profile(&img, &region);
         assert_eq!(profile.len(), 21);
         assert!(profile[0] < 1e-9);
@@ -433,7 +431,7 @@ mod tests {
     #[test]
     fn derivative_gaussian_finds_step_position() {
         let img = step_image(60, 60, 30.0, 200, 3000);
-        let region = FitRegion::new(Pt2::new(30.0, 30.0), Pt2::new(1.0, 0.0), 41, 15, FitMode::DerivativeGaussian);
+        let region = region(Pt2::new(30.0, 30.0), Pt2::new(1.0, 0.0), 41, 15, FitMode::DerivativeGaussian);
         let profile = extract_profile(&img, &region);
         let fit = fit_derivative_gaussian(&profile, FitSign::Any).expect("ステップがあるので成功する");
         // ステップは x=29 と x=30 の間なので、位置は 19.5 が正解。
@@ -454,7 +452,7 @@ mod tests {
                 img.data[(y * w + x) as usize] = v.round() as u16;
             }
         }
-        let region = FitRegion::new(Pt2::new(40.0, 40.0), Pt2::new(1.0, 0.0), 31, 9, FitMode::Gaussian);
+        let region = region(Pt2::new(40.0, 40.0), Pt2::new(1.0, 0.0), 31, 9, FitMode::Gaussian);
         let profile = extract_profile(&img, &region);
         let fit = fit_gaussian(&profile, FitSign::Any).expect("バンドがあるので成功する");
         assert!((fit.mu - 15.0).abs() < 0.1, "中心行 15: {}", fit.mu);
@@ -468,7 +466,7 @@ mod tests {
         for v in img.data.iter_mut() {
             *v = 500;
         }
-        let region = FitRegion::new(Pt2::new(15.0, 15.0), Pt2::new(1.0, 0.0), 21, 5, FitMode::Gaussian);
+        let region = region(Pt2::new(15.0, 15.0), Pt2::new(1.0, 0.0), 21, 5, FitMode::Gaussian);
         let profile = extract_profile(&img, &region);
         assert!(fit_gaussian(&profile, FitSign::Any).is_none());
         assert!(fit_derivative_gaussian(&profile, FitSign::Any).is_none());
@@ -488,8 +486,8 @@ mod tests {
                 dark.data[(y * w + x) as usize] = (200.0 - 500.0 * g).round() as u16;
             }
         }
-        let bright_region = FitRegion::new(Pt2::new(40.0, 40.0), Pt2::new(1.0, 0.0), 31, 9, FitMode::Gaussian);
-        let dark_region = FitRegion::new(Pt2::new(40.0, 40.0), Pt2::new(1.0, 0.0), 31, 9, FitMode::Gaussian);
+        let bright_region = region(Pt2::new(40.0, 40.0), Pt2::new(1.0, 0.0), 31, 9, FitMode::Gaussian);
+        let dark_region = region(Pt2::new(40.0, 40.0), Pt2::new(1.0, 0.0), 31, 9, FitMode::Gaussian);
         let bp = extract_profile(&bright, &bright_region);
         let dp = extract_profile(&dark, &dark_region);
 
@@ -507,13 +505,38 @@ mod tests {
         assert!(fit_gaussian(&dp, FitSign::Positive).is_none(), "暗バンドに正ピークは無い");
     }
 
+    /// region 経由でも符号制約が効くこと（UI 設定 → FitRegion → fit_profile
+    /// の経路。符号固定モードを独立モードから分離したため確認）。
+    #[test]
+    fn fit_profile_uses_region_sign() {
+        let (w, h) = (80, 80);
+        let mut img = Gray16::black(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let g = (-((x as f64 - 40.0).powi(2)) / 18.0).exp();
+                img.data[(y * w + x) as usize] = (500.0 * g + 200.0).round() as u16;
+            }
+        }
+        let settings = |sign| FitSettings {
+            mode: FitMode::Gaussian,
+            sign,
+            width_px: 9,
+            length_px: 31,
+        };
+        let pos = FitRegion::new(Pt2::new(40.0, 40.0), Pt2::new(1.0, 0.0), settings(FitSign::Positive));
+        let neg = FitRegion::new(Pt2::new(40.0, 40.0), Pt2::new(1.0, 0.0), settings(FitSign::Negative));
+        let (_, fit) = fit_profile(&img, &pos);
+        assert!(fit.is_some_and(|f| f.amplitude > 0.0), "明バンドに正フィット");
+        assert!(fit_profile(&img, &neg).1.is_none(), "明バンドに負ピークは無い");
+    }
+
     /// 符号固定微分ガウシアン: 上がるステップには正のみがフィットし、
     /// 下がるステップでは負のみがフィットする。
     #[test]
     fn sign_constrained_derivative_picks_matching_step() {
         let rising = step_image(60, 60, 30.0, 200, 3000);
         let falling = step_image(60, 60, 30.0, 3000, 200);
-        let region = FitRegion::new(Pt2::new(30.0, 30.0), Pt2::new(1.0, 0.0), 41, 15, FitMode::DerivativeGaussian);
+        let region = region(Pt2::new(30.0, 30.0), Pt2::new(1.0, 0.0), 41, 15, FitMode::DerivativeGaussian);
         let rp = extract_profile(&rising, &region);
         let fp = extract_profile(&falling, &region);
 
@@ -530,7 +553,7 @@ mod tests {
 
     #[test]
     fn region_corners_form_rotated_rectangle() {
-        let region = FitRegion::new(
+        let region = region(
             Pt2::new(10.0, 10.0),
             Pt2::new(1.0, 1.0),
             11,
@@ -556,7 +579,7 @@ mod tests {
             height: 20,
             data: vec![700; 400],
         };
-        let region = FitRegion::new(Pt2::new(-5.0, -5.0), Pt2::new(1.0, 0.0), 11, 5, FitMode::Gaussian);
+        let region = region(Pt2::new(-5.0, -5.0), Pt2::new(1.0, 0.0), 11, 5, FitMode::Gaussian);
         let profile = extract_profile(&img, &region);
         assert!(profile.iter().all(|&v| (v - 700.0).abs() < 1e-9));
     }

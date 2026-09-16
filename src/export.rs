@@ -163,7 +163,7 @@ fn draw_computed<P>(
         // 付けるので、画面と同じ `region_edge_colors` で 1 辺ずつ描く。
         for region in &t.fit_regions {
             let poly = region.corners();
-            let colors = region_edge_colors(region.mode);
+            let colors = region_edge_colors(region.mode, region.sign);
             for i in 0..4 {
                 draw_dashed_polyline(
                     img,

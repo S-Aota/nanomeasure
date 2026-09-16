@@ -17,7 +17,8 @@ use crate::document::Document;
 use crate::frame::{format_length, Scale};
 use crate::gray::Gray16;
 use crate::measure::{
-    AngleMode, ComputedMeasure, ComputedTool, FitMode, FitSettings, MeasureData, MeasureTool,
+    AngleMode, ComputedMeasure, ComputedTool, FitMode, FitSettings, FitSign, MeasureData,
+    MeasureTool,
     NewMeasureMode, Pt2, SnapLine, ToolKind, format_measurement, snap_angle_four, snap_distance,
 };
 use crate::measure_fit::{self, FitRegion, GaussFit};
@@ -51,12 +52,8 @@ const COLOR_IN_PROGRESS: Color32 = Color32::from_rgb(255, 150, 60);
 pub(crate) fn region_color(mode: FitMode) -> Color32 {
     match mode {
         FitMode::Off => COLOR_REGION_OFF,
-        FitMode::Gaussian | FitMode::GaussianPositive | FitMode::GaussianNegative => {
-            COLOR_REGION_GAUSSIAN
-        }
-        FitMode::DerivativeGaussian
-        | FitMode::DerivativeGaussianPositive
-        | FitMode::DerivativeGaussianNegative => COLOR_REGION_DERIV,
+        FitMode::Gaussian => COLOR_REGION_GAUSSIAN,
+        FitMode::DerivativeGaussian => COLOR_REGION_DERIV,
     }
 }
 
@@ -65,17 +62,17 @@ pub(crate) fn region_color(mode: FitMode) -> Color32 {
 /// フィッティング方向に走る）。
 /// ガウシアン系はフィッティング方向に走る辺を符号で明/暗にし、
 /// 微分系は輝度が高くなる側の辺を明るく、逆の辺を暗くする。
-pub(crate) fn region_edge_colors(mode: FitMode) -> [Color32; 4] {
+pub(crate) fn region_edge_colors(mode: FitMode, sign: FitSign) -> [Color32; 4] {
     let base = region_color(mode);
     let bright = base.gamma_multiply(1.6);
     let dark = base.gamma_multiply(0.55);
-    match mode {
-        FitMode::Off | FitMode::Gaussian | FitMode::DerivativeGaussian => [base; 4],
-        FitMode::GaussianPositive => [base, bright, base, bright],
-        FitMode::GaussianNegative => [base, dark, base, dark],
+    match (mode, sign) {
+        (FitMode::Off, _) | (_, FitSign::Any) => [base; 4],
+        (FitMode::Gaussian, FitSign::Positive) => [base, bright, base, bright],
+        (FitMode::Gaussian, FitSign::Negative) => [base, dark, base, dark],
         // 微分の正 = fit 方向に輝度が上がる = +fit 側の辺（2）が明るい。
-        FitMode::DerivativeGaussianPositive => [dark, base, bright, base],
-        FitMode::DerivativeGaussianNegative => [bright, base, dark, base],
+        (FitMode::DerivativeGaussian, FitSign::Positive) => [dark, base, bright, base],
+        (FitMode::DerivativeGaussian, FitSign::Negative) => [bright, base, dark, base],
     }
 }
 
@@ -368,6 +365,11 @@ impl MeasureMode {
 
     /// 記録済みの変更を doc 側へ反映する。
     fn apply_change(&mut self, doc: &mut Document) {
+        // リンク中は端点 2 の設定を端点 1 に追従させる（doc と self.data を
+        // 常に一致させるため、反映のたびに同期する）。
+        if self.data.link_fit {
+            self.data.dist_fit2 = self.data.dist_fit1;
+        }
         set_command(
             doc,
             self.index,
@@ -748,9 +750,20 @@ impl MeasureMode {
                     if ui.selectable_label(self.ep_tab, "2").clicked() {
                         self.ep_tab = true;
                     }
+                    if ui.toggle_value(&mut self.data.link_fit, "link").changed() {
+                        // ON では端点 2 が端点 1 のコピーに置き換わるので、
+                        // ON/OFF とも 1 操作として記録する。
+                        self.begin_change();
+                        self.apply_change(doc);
+                    }
                 });
                 let outcome = if self.ep_tab {
-                    fit_settings_ui(ui, &mut self.data.dist_fit2)
+                    let mut outcome = FitUiOutcome::default();
+                    // リンク中は端点 2 の個別編集を無効化（値は端点 1 のコピー）。
+                    ui.add_enabled_ui(!self.data.link_fit, |ui| {
+                        outcome = fit_settings_ui(ui, &mut self.data.dist_fit2);
+                    });
+                    outcome
                 } else {
                     fit_settings_ui(ui, &mut self.data.dist_fit1)
                 };
@@ -1215,27 +1228,37 @@ struct FitUiOutcome {
     committed: bool,
 }
 
+/// 符号選択（auto / positive / negative を全部表示して 1 つ選ぶ）。
+/// 変更されたら true。
+fn sign_select_ui(ui: &mut Ui, sign: &mut FitSign) -> bool {
+    let mut changed = false;
+    for value in [FitSign::Any, FitSign::Positive, FitSign::Negative] {
+        if ui.selectable_label(*sign == value, value.label()).clicked() {
+            *sign = value;
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// フィッティング設定の共通 UI。
 fn fit_settings_ui(ui: &mut Ui, settings: &mut FitSettings) -> FitUiOutcome {
     let mut outcome = FitUiOutcome::default();
+    // モード選択。符号はモード 2/3 共通（同時に有効になるのは 1 つなので、
+    // 有効なツールの符号をそのまま使う）。両方の行のボタンで同じ値を選ぶ。
     for (label, mode) in [
         ("1. クリック位置そのまま", FitMode::Off),
         ("2. ガウシアン（境界線検出）", FitMode::Gaussian),
-        ("2+. ガウシアン（正ピークのみ）", FitMode::GaussianPositive),
-        ("2−. ガウシアン（負ピークのみ）", FitMode::GaussianNegative),
         ("3. 微分ガウシアン（ステップ）", FitMode::DerivativeGaussian),
-        (
-            "3+. 微分ガウシアン（正ステップのみ）",
-            FitMode::DerivativeGaussianPositive,
-        ),
-        (
-            "3−. 微分ガウシアン（負ステップのみ）",
-            FitMode::DerivativeGaussianNegative,
-        ),
     ] {
-        if ui.radio_value(&mut settings.mode, mode, label).changed() {
-            outcome.committed = true;
-        }
+        ui.horizontal(|ui| {
+            if ui.radio_value(&mut settings.mode, mode, label).changed() {
+                outcome.committed = true;
+            }
+            if mode != FitMode::Off && sign_select_ui(ui, &mut settings.sign) {
+                outcome.committed = true;
+            }
+        });
     }
     let w = ui.add(egui::Slider::new(&mut settings.width_px, 1..=20).text("検出領域の横"));
     if w.drag_started() {
@@ -1258,11 +1281,10 @@ fn fit_settings_ui(ui: &mut Ui, settings: &mut FitSettings) -> FitUiOutcome {
 /// クリック位置そのままのモードではクリック位置（= 領域の中心）に縦線を引く。
 fn draw_profile_plot(ui: &mut Ui, profile: &[f64], fit: Option<GaussFit>, region: &FitRegion) {
     let n = profile.len();
-    let label = match region.mode {
-        FitMode::DerivativeGaussian
-        | FitMode::DerivativeGaussianPositive
-        | FitMode::DerivativeGaussianNegative => "輝度の微分",
-        _ => "輝度",
+    let label = if region.mode == FitMode::DerivativeGaussian {
+        "輝度の微分"
+    } else {
+        "輝度"
     };
     ui.label(egui::RichText::new(label).small().weak());
     let (rect, _) = ui.allocate_exact_size(Vec2::new(360.0, 100.0), Sense::hover());
@@ -1446,11 +1468,11 @@ pub fn draw_computed(
         // 符号固定モードは辺ごとに明暗を付けて方向を示す。
         for region in &t.fit_regions {
             let pts: Vec<Pos2> = region.corners().iter().map(|&c| to_screen(info, c)).collect();
-            let colors = region_edge_colors(region.mode);
+            let colors = region_edge_colors(region.mode, region.sign);
             for i in 0..4 {
                 painter.add(egui::Shape::dashed_line(
                     &[pts[i], pts[(i + 1) % 4]],
-                    Stroke::new(1.5, colors[i]),
+                    Stroke::new(2.5, colors[i]),
                     6.0,
                     5.0,
                 ));
