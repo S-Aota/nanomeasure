@@ -389,13 +389,17 @@ impl MeasureData {
                 fit2,
             } => {
                 let dir = (*p2 - *p1).normalize();
+                // 端点 2 はフィット方向を反転し、符号付きフィッティングの
+                // 向きが両端点で線分に対して同じ側（内側 = 相手の端点方向）
+                // になるようにする。端点 1 は dir（p1 → p2）で内側を向くが、
+                // 端点 2 は dir のままだと外側を向いてしまう。
                 let p1_fit = if fit {
                     fit_endpoint(*p1, dir, *fit1, img, true)
                 } else {
                     *p1
                 };
                 let p2_fit = if fit {
-                    fit_endpoint(*p2, dir, *fit2, img, true)
+                    fit_endpoint(*p2, dir * -1.0, *fit2, img, true)
                 } else {
                     *p2
                 };
@@ -404,7 +408,7 @@ impl MeasureData {
                 // モード 1（フィッティングなし）でも表示し、色で設定がわかる。
                 let regions = [
                     FitRegion::new(*p1, dir, *fit1),
-                    FitRegion::new(*p2, dir, *fit2),
+                    FitRegion::new(*p2, dir * -1.0, *fit2),
                 ]
                 .to_vec();
                 Some(ComputedTool {
@@ -487,7 +491,8 @@ impl MeasureData {
 /// 端点のフィッティング。`dir` はツールの線方向。失敗時は元の点。
 ///
 /// - 二点間測長（`fit_along_dir` = true）: フィット方向 = 線方向、
-///   平均方向 = 垂直（仕様どおり横 = 平均 = 線に垂直）。
+///   平均方向 = 垂直（仕様どおり横 = 平均 = 線に垂直）。向きは
+///   呼び出し側が符号制約の向きを考えて与える。
 /// - 境界線モード 2/3（`fit_along_dir` = false）: 平均方向 = 線方向
 ///   （仕様どおり二点目方向が平均を取る方向）、フィット方向 = その垂直。
 fn fit_endpoint(
@@ -886,5 +891,45 @@ mod tests {
         // 領域枠は中点を中心に表示される（フィット位置には追従しない）。
         assert!((t.fit_regions[0].center.x - 75.0).abs() < 1e-9, "{}", t.fit_regions[0].center.x);
         assert!((t.fit_regions[0].center.y - 31.0).abs() < 1e-9, "{}", t.fit_regions[0].center.y);
+    }
+
+    #[test]
+    fn distance_second_endpoint_fit_axis_is_reversed() {
+        // 端点 2 のフィット方向は端点 1 と逆で、符号付きフィッティングの
+        // 向きが両端点で線分に対して同じ側（内側 = 相手の端点方向）になる。
+        // 明るいバンド（x = 30..170）をまたぐ二点間測長で、上がるステップ
+        // （内側へ行くほど明るい）が両端点とも Positive でフィットする。
+        let (w, h) = (200, 100);
+        let mut img = Gray16::black(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                img.data[(y * w + x) as usize] = if (30..170).contains(&x) { 3000 } else { 0 };
+            }
+        }
+        let mut data = MeasureData::default();
+        let g = data.group_for_new_measurement();
+        let fit = FitSettings {
+            mode: FitMode::DerivativeGaussian,
+            sign: FitSign::Positive,
+            width_px: 11,
+            length_px: 41,
+        };
+        data.tools.push(MeasureTool::Distance {
+            id: 1,
+            p1: pt(30.0, 50.0),
+            p2: pt(170.0, 50.0),
+            group: g,
+            fit1: fit,
+            fit2: fit,
+        });
+        let c = data.compute(&img, None);
+        let t = c.by_id(1).unwrap();
+        // 領域枠: 端点 1 は +x、端点 2 は -x をフィット方向とする。
+        assert!((t.fit_regions[0].fit_axis.x - 1.0).abs() < 1e-9);
+        assert!((t.fit_regions[1].fit_axis.x + 1.0).abs() < 1e-9);
+        // 両端点ともステップ（x = 29.5 / 169.5）へ収束する。
+        assert!((t.p1.x - 29.5).abs() < 0.5, "{}", t.p1.x);
+        assert!((t.p2.x - 169.5).abs() < 0.5, "{}", t.p2.x);
+        assert!((t.length_px.unwrap() - 140.0).abs() < 1.0);
     }
 }
