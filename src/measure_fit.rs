@@ -216,7 +216,7 @@ fn sign_amplitude(sign: FitSign) -> Option<f64> {
 
 /// `region` のモードに応じたプロファイルとフィット結果。
 /// 微分系は輝度プロファイルの微分を返す（プロットはこの微分を描く）。
-/// クリック位置そのままはプロファイルのみ（フィットなし）。
+/// フィッティングなしはプロファイルのみ（フィットなし）。
 pub fn fit_profile(img: &Gray16, region: &FitRegion) -> (Vec<f64>, Option<GaussFit>) {
     let profile = extract_profile(img, region);
     match region.mode {

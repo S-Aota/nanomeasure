@@ -80,7 +80,7 @@ impl Div<f64> for Pt2 {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FitMode {
-    /// クリック位置そのまま。
+    /// フィッティングなし。
     #[default]
     Off,
     /// ガウシアン分布でフィッティング（明暗の境界線の検出）。
@@ -401,7 +401,7 @@ impl MeasureData {
                 };
                 // 領域枠は最初に与えた端点位置を中心に固定し、
                 // フィッティングで検出位置が動いても追従させない。
-                // モード 1（クリック位置そのまま）でも表示し、色で設定がわかる。
+                // モード 1（フィッティングなし）でも表示し、色で設定がわかる。
                 let regions = [
                     FitRegion::new(*p1, dir, *fit1),
                     FitRegion::new(*p2, dir, *fit2),

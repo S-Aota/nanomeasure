@@ -569,7 +569,7 @@ impl MeasureMode {
 
     /// ポップアップ下部のフィッティング確認プロット。輝度プロファイル
     /// （微分モードはその微分）を灰線、フィット曲線を橙線で描く。
-    /// クリック位置そのままのモードではクリック位置（領域の中心）に縦線を引く。
+    /// フィッティングなしのモードではクリック位置（領域の中心）に縦線を引く。
     fn fit_plot_ui(&self, ui: &mut Ui, doc: &Document, target: FitPopupTarget) {
         let Some(img) = doc.input_to(self.index).map(|f| f.image.clone()) else {
             return;
@@ -1247,9 +1247,9 @@ fn fit_settings_ui(ui: &mut Ui, settings: &mut FitSettings) -> FitUiOutcome {
     // モード選択。符号はモード 2/3 共通（同時に有効になるのは 1 つなので、
     // 有効なツールの符号をそのまま使う）。両方の行のボタンで同じ値を選ぶ。
     for (label, mode) in [
-        ("1. クリック位置そのまま", FitMode::Off),
-        ("2. ガウシアン（境界線検出）", FitMode::Gaussian),
-        ("3. 微分ガウシアン（ステップ）", FitMode::DerivativeGaussian),
+        ("1. フィッティングなし", FitMode::Off),
+        ("2. ピーク", FitMode::Gaussian),
+        ("3. ステップ", FitMode::DerivativeGaussian),
     ] {
         ui.horizontal(|ui| {
             if ui.radio_value(&mut settings.mode, mode, label).changed() {
@@ -1278,7 +1278,7 @@ fn fit_settings_ui(ui: &mut Ui, settings: &mut FitSettings) -> FitUiOutcome {
 }
 
 /// プロファイルとフィット曲線のプロット。フィット中心の位置に点を打ち、
-/// クリック位置そのままのモードではクリック位置（= 領域の中心）に縦線を引く。
+/// フィッティングなしのモードではクリック位置（= 領域の中心）に縦線を引く。
 fn draw_profile_plot(ui: &mut Ui, profile: &[f64], fit: Option<GaussFit>, region: &FitRegion) {
     let n = profile.len();
     let label = if region.mode == FitMode::DerivativeGaussian {
@@ -1332,7 +1332,7 @@ fn draw_profile_plot(ui: &mut Ui, profile: &[f64], fit: Option<GaussFit>, region
         );
     }
 
-    // クリック位置そのままのモード: クリック位置 = 領域の中心 =
+    // フィッティングなしのモード: クリック位置 = 領域の中心 =
     // プロファイルの中央。そこに縦線を引く。
     if region.mode == FitMode::Off {
         let cx = x((n - 1) as f64 * 0.5);
