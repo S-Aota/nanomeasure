@@ -31,9 +31,11 @@ pub const SUPPORTED_EXTENSIONS: &[&str] = &["tif", "tiff", "png", "jpg", "jpeg"]
 
 /// 出力形式として対応している拡張子か。
 pub fn validate_extension(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| SUPPORTED_EXTENSIONS.iter().any(|s| e.eq_ignore_ascii_case(s)))
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+        SUPPORTED_EXTENSIONS
+            .iter()
+            .any(|s| e.eq_ignore_ascii_case(s))
+    })
 }
 
 /// 出力画素の型。グレースケール（16bit）と RGB（8bit）で同じ描画コードを
@@ -48,8 +50,7 @@ where
 impl AnnotationPixel for Luma<u16> {
     /// 色は輝度へ落とす（グレースケール出力では色を保持できない）。
     fn from_screen(color: Color32) -> Self {
-        let lum = (color.r() as u32 * 299 + color.g() as u32 * 587 + color.b() as u32 * 114)
-            / 1000;
+        let lum = (color.r() as u32 * 299 + color.g() as u32 * 587 + color.b() as u32 * 114) / 1000;
         Luma([(lum * 257) as u16])
     }
 }
@@ -66,13 +67,15 @@ impl AnnotationPixel for Rgb<u8> {
 /// `overlays` は画面上に重ねて表示しているのと同じ測長オーバーレイ
 /// （それぞれの計算結果と、そのときのスケール）。
 /// `annotation_scale` は解像度による自動調整に掛ける係数（既定 1.0）。
+/// `digits` はラベルの小数点以下桁数（表示設定）。
 pub fn render(
     img: &Gray16,
     overlays: &[(ComputedMeasure, Option<Scale>)],
     annotation_scale: f32,
+    digits: u8,
 ) -> ImageBuffer<Luma<u16>, Vec<u16>> {
     let mut out = img.to_luma16_buffer();
-    draw_overlays(&mut out, img, overlays, annotation_scale);
+    draw_overlays(&mut out, img, overlays, annotation_scale, digits);
     out
 }
 
@@ -82,21 +85,27 @@ pub fn render_rgb(
     img: &Gray16,
     overlays: &[(ComputedMeasure, Option<Scale>)],
     annotation_scale: f32,
+    digits: u8,
 ) -> ImageBuffer<Rgb<u8>, Vec<u8>> {
     let mut out = ImageBuffer::from_fn(img.width, img.height, |x, y| {
         let v = (img.at(x, y) >> 8) as u8;
         Rgb([v, v, v])
     });
-    draw_overlays(&mut out, img, overlays, annotation_scale);
+    draw_overlays(&mut out, img, overlays, annotation_scale, digits);
     out
 }
 
 /// 書き出した 16bit グレースケール画像を保存する。
 /// jpg / jpeg は 8bit に落とす（JPEG は 16bit 非対応）。
 pub fn save(buf: &ImageBuffer<Luma<u16>, Vec<u16>>, path: &Path) -> Result<(), String> {
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default();
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default();
     let result = if ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("jpeg") {
-        image::DynamicImage::ImageLuma16(buf.clone()).to_rgb8().save(path)
+        image::DynamicImage::ImageLuma16(buf.clone())
+            .to_rgb8()
+            .save(path)
     } else {
         buf.save(path)
     };
@@ -116,6 +125,7 @@ fn draw_overlays<P>(
     src: &Gray16,
     overlays: &[(ComputedMeasure, Option<Scale>)],
     annotation_scale: f32,
+    digits: u8,
 ) where
     P: AnnotationPixel,
     P::Subpixel: Into<f32> + Clamp<f32>,
@@ -123,7 +133,7 @@ fn draw_overlays<P>(
     let f = base_scale(src) * annotation_scale.clamp(0.25, 8.0);
     let font = font();
     for (computed, scale) in overlays {
-        draw_computed(img, computed, *scale, f, font.as_ref());
+        draw_computed(img, computed, *scale, f, font.as_ref(), digits);
     }
 }
 
@@ -154,11 +164,12 @@ fn draw_computed<P>(
     scale: Option<Scale>,
     f: f32,
     font: Option<&FontArc>,
+    digits: u8,
 ) where
     P: AnnotationPixel,
     P::Subpixel: Into<f32> + Clamp<f32>,
 {
-    for t in &computed.tools {
+    for (n, t) in computed.tools.iter().enumerate() {
         // フィッティング領域の枠（点線）。符号固定モードは辺ごとに明暗を
         // 付けるので、画面と同じ `region_edge_colors` で 1 辺ずつ描く。
         for region in &t.fit_regions {
@@ -177,8 +188,16 @@ fn draw_computed<P>(
             ToolKind::Distance => {
                 draw_line_and_arrows(img, t.p1, t.p2, f, P::from_screen(COLOR_DISTANCE));
                 if let Some(len) = t.length_px {
-                    let text = format_measurement(len, scale);
-                    draw_value_label(img, font, t.p1, t.p2, text, P::from_screen(COLOR_DISTANCE), f);
+                    let text = format!("#{} {}", n + 1, format_measurement(len, scale, digits));
+                    draw_value_label(
+                        img,
+                        font,
+                        t.p1,
+                        t.p2,
+                        text,
+                        P::from_screen(COLOR_DISTANCE),
+                        f,
+                    );
                 }
             }
             ToolKind::Boundary => {
@@ -194,7 +213,11 @@ fn draw_computed<P>(
                 draw_thick_line(img, t.p1, t.p2, (2.0 * f).max(1.0), guide);
                 if let Some(d) = t.distance_px {
                     let sign = if d >= 0.0 { "+" } else { "-" };
-                    let text = format!("{sign}{}", format_measurement(d.abs(), scale));
+                    let text = format!(
+                        "#{} {sign}{}",
+                        n + 1,
+                        format_measurement(d.abs(), scale, digits)
+                    );
                     draw_value_label(img, font, t.p1, t.p2, text, guide, f);
                 }
             }
@@ -359,11 +382,8 @@ fn draw_dashed_polyline<P>(
 }
 
 /// 多角形を塗る（頂点は i32 に丸める。範囲外の画素は無視される）。
-fn fill_polygon<P>(
-    img: &mut ImageBuffer<P, Vec<P::Subpixel>>,
-    pts: &[Pt2],
-    color: P,
-) where
+fn fill_polygon<P>(img: &mut ImageBuffer<P, Vec<P::Subpixel>>, pts: &[Pt2], color: P)
+where
     P: AnnotationPixel,
     P::Subpixel: Into<f32> + Clamp<f32>,
 {
@@ -391,7 +411,8 @@ mod tests {
         Luma::<u16>::from_screen(color).0[0]
     }
 
-    /// 二点間測長の線が画像へ描かれること（線の中点がアノテーション色になる）。
+    /// 二点間測長の線が画像へ描かれること（ラベルと重ならない線上の点が
+    /// アノテーション色になる）。
     #[test]
     fn distance_line_is_drawn() {
         let mut data = MeasureData::default();
@@ -406,9 +427,9 @@ mod tests {
         };
         let computed = computed_with_tool(tool, &data);
         let img = Gray16::black(200, 200);
-        let out = render(&img, &[(computed, None)], 1.0);
+        let out = render(&img, &[(computed, None)], 1.0, 5);
         let line = gray_of_line(COLOR_DISTANCE);
-        assert_eq!(out.get_pixel(100, 100).0[0], line, "線の中点");
+        assert_eq!(out.get_pixel(60, 100).0[0], line, "ラベル外の線上の点");
         assert_eq!(out.get_pixel(100, 0).0[0], 0, "線から離れた画素は元のまま");
     }
 
@@ -427,7 +448,7 @@ mod tests {
             fit2: Default::default(),
         });
         let computed = data.compute(&img, None);
-        let out = render(&img, &[(computed, None)], 1.0);
+        let out = render(&img, &[(computed, None)], 1.0, 5);
         let line = gray_of_line(COLOR_DISTANCE);
         // 端点 2 の矢印: tip=(300,200)、dir=(1,0)（線の内側向き）。
         // tip - rotate(dir, ±25°)*9 で羽は左側・上下に開く:
@@ -437,8 +458,16 @@ mod tests {
         // 鏡像（線の外側へ開く）だと羽は (308.2, 196.2) / (308.2, 203.8) に来る。
         // この位置はフィッティング領域の枠と重なるので 0 とは限らないが、
         // 少なくとも測長線の色ではないこと（正しい実装なら点線枠か背景）。
-        assert_ne!(out.get_pixel(308, 196).0[0], line, "鏡像位置には羽を描かない");
-        assert_ne!(out.get_pixel(308, 204).0[0], line, "鏡像位置には羽を描かない");
+        assert_ne!(
+            out.get_pixel(308, 196).0[0],
+            line,
+            "鏡像位置には羽を描かない"
+        );
+        assert_ne!(
+            out.get_pixel(308, 204).0[0],
+            line,
+            "鏡像位置には羽を描かない"
+        );
     }
 
     /// RGB 出力ではアノテーションの色がそのまま残ること。
@@ -456,8 +485,12 @@ mod tests {
         };
         let computed = computed_with_tool(tool, &data);
         let img = Gray16::black(200, 200);
-        let out = render_rgb(&img, &[(computed, None)], 1.0);
-        assert_eq!(out.get_pixel(100, 100).0, [235, 70, 70], "線の中点が赤");
+        let out = render_rgb(&img, &[(computed, None)], 1.0, 5);
+        assert_eq!(
+            out.get_pixel(60, 100).0,
+            [235, 70, 70],
+            "ラベル外の線上の点が赤"
+        );
         assert_eq!(out.get_pixel(100, 0).0, [0, 0, 0], "線から離れた画素は黒");
     }
 
@@ -501,7 +534,7 @@ mod tests {
             distance: 12.0,
         });
         let computed = data.compute(&img, None);
-        let out = render(&img, &[(computed.clone(), None)], 1.5);
+        let out = render(&img, &[(computed.clone(), None)], 1.5, 5);
 
         let dir = std::env::temp_dir().join(format!("tem_measure_smoke_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -520,11 +553,15 @@ mod tests {
             );
         }
         // RGB 版: png に保存して赤チャンネルが残ること。
-        let rgb = render_rgb(&img, &[(computed, None)], 1.5);
+        let rgb = render_rgb(&img, &[(computed, None)], 1.5, 5);
         let rgb_path = dir.join("out_rgb.png");
         save_rgb(&rgb, &rgb_path).expect("RGB 保存できる");
         let read = image::open(&rgb_path).expect("RGB が読める");
-        assert_eq!(read.to_rgb8().get_pixel(55, 25).0, [235, 70, 70], "線の中点が赤");
+        assert_eq!(
+            read.to_rgb8().get_pixel(55, 25).0,
+            [235, 70, 70],
+            "線の中点が赤"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

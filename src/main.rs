@@ -13,6 +13,7 @@ mod measure;
 mod measure_fit;
 mod measure_mode;
 mod metadata;
+mod settings;
 mod view;
 
 fn main() -> eframe::Result<()> {

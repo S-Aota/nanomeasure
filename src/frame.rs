@@ -66,23 +66,12 @@ impl Scale {
         (unit, w / unit.nm(), h / unit.nm())
     }
 
-    pub fn describe(&self) -> String {
+    pub fn describe(&self, digits: u8) -> String {
         format!(
             "1 px = {} {}",
-            format_length(self.per_px()),
+            crate::settings::format_length(self.per_px(), digits),
             self.unit.label()
         )
-    }
-}
-
-/// 末尾の余計な 0 を落として長さを文字列化する。
-pub fn format_length(v: f64) -> String {
-    let s = format!("{v:.5}");
-    let s = s.trim_end_matches('0').trim_end_matches('.');
-    if s.is_empty() {
-        "0".to_owned()
-    } else {
-        s.to_owned()
     }
 }
 
@@ -165,14 +154,14 @@ mod tests {
 
     #[test]
     fn describe_uses_held_unit() {
-        assert_eq!(Scale::new(0.5).describe(), "1 px = 0.5 nm");
-        assert_eq!(Scale::new(0.093517).describe(), "1 px = 0.09352 nm");
+        assert_eq!(Scale::new(0.5).describe(5), "1 px = 0.5 nm");
+        assert_eq!(Scale::new(0.093517).describe(5), "1 px = 0.09352 nm");
         // 自動選択は nm だが、保持されている単位があればそれが使われる。
         let scale = Scale {
             nm_per_px: 500.0,
             unit: LengthUnit::Micrometer,
         };
-        assert_eq!(scale.describe(), "1 px = 0.5 µm");
+        assert_eq!(scale.describe(5), "1 px = 0.5 µm");
         assert_eq!(scale.per_px(), 0.5);
     }
 

@@ -12,6 +12,7 @@ use crate::command::{Command, Filter, FilterKind};
 use crate::document::Document;
 use crate::frame::LengthUnit;
 use crate::gray::Gray16;
+use crate::settings::Settings;
 
 /// 編集対象のコマンドを差し替え、必要な範囲だけ再計算対象にする。
 pub(crate) fn set_command(doc: &mut Document, index: usize, cmd: Command) {
@@ -84,7 +85,7 @@ impl ScaleDialog {
         self.open = true;
     }
 
-    pub fn show(&mut self, ctx: &Context, doc: &mut Document) {
+    pub fn show(&mut self, ctx: &Context, doc: &mut Document, digits: u8) {
         if !self.open {
             return;
         }
@@ -124,7 +125,7 @@ impl ScaleDialog {
                 match self.pending() {
                     Some(cmd) => match cmd.scale() {
                         Some(scale) => {
-                            ui.label(scale.describe());
+                            ui.label(scale.describe(digits));
                         }
                         None => {
                             ui.colored_label(
@@ -824,7 +825,13 @@ impl FilterDialog {
             });
 
         if apply {
-            set_command(doc, index, Command::Filter { filter: self.filter });
+            set_command(
+                doc,
+                index,
+                Command::Filter {
+                    filter: self.filter,
+                },
+            );
         }
 
         if cancelled || !window_open {
@@ -832,7 +839,13 @@ impl FilterDialog {
             self.open = false;
         } else if confirmed {
             // 未適用の変更（ドラッグ直後の決定など）を取りこぼさないようにする。
-            set_command(doc, index, Command::Filter { filter: self.filter });
+            set_command(
+                doc,
+                index,
+                Command::Filter {
+                    filter: self.filter,
+                },
+            );
             self.original = None;
             self.open = false;
         }
@@ -847,5 +860,37 @@ impl FilterDialog {
         } else if let Some(original) = self.original.take() {
             set_command(doc, index, original);
         }
+    }
+}
+
+// -------------------------------------------------------------- 設定
+
+/// アプリ全体の設定ウィンドウ。コマンドには紐付かないので、
+/// 変更は即座に反映され、閉じたあとも eframe の persistence で保存される。
+#[derive(Default)]
+pub struct SettingsDialog {
+    pub open: bool,
+}
+
+impl SettingsDialog {
+    pub fn show(&mut self, ctx: &Context, settings: &mut Settings) {
+        if !self.open {
+            return;
+        }
+        let mut window_open = true;
+        egui::Window::new("設定")
+            .open(&mut window_open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.add(
+                    egui::Slider::new(&mut settings.length_digits, 1..=5)
+                        .text("小数点以下の表示桁数"),
+                );
+                ui.label(
+                    "長さ表示（ステータスバー・測定結果・画像アノテーション）の小数点以下桁数です。\nJSON 保存データは常に元の精度で保存されます。",
+                );
+            });
+        self.open = window_open;
     }
 }

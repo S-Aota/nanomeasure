@@ -5,11 +5,13 @@ use std::path::PathBuf;
 use egui::Ui;
 
 use crate::command::{Command, CommandCategory, CommandItem, Filter, HistoryFile, load_image};
-use crate::dialogs::{ExportDialog, FilterDialog, LevelsDialog, RotateDialog, ScaleDialog};
+use crate::dialogs::{
+    ExportDialog, FilterDialog, LevelsDialog, RotateDialog, ScaleDialog, SettingsDialog,
+};
 use crate::document::{Document, SourceCache};
-use crate::frame::format_length;
 use crate::measure_mode::MeasureMode;
 use crate::metadata;
+use crate::settings::{Settings, format_length};
 use crate::view::ViewInfo;
 
 const IMAGE_EXTENSIONS: &[&str] = &["tif", "tiff", "png", "jpg", "jpeg", "bmp"];
@@ -41,6 +43,7 @@ enum Action {
     OpenHistory,
     ApplyHistory,
     ExportImage,
+    OpenSettings,
     CloseTab(usize),
     Quit,
 }
@@ -67,6 +70,9 @@ pub struct TemApp {
     filter_dialog: FilterDialog,
     export_dialog: ExportDialog,
     measure_mode: MeasureMode,
+    /// アプリ全体の設定（表示桁数など）。eframe の persistence で保存される。
+    settings: Settings,
+    settings_dialog: SettingsDialog,
     /// データは変えずに、表示だけ min/max へ引き伸ばす。
     auto_contrast: bool,
     help_open: bool,
@@ -92,6 +98,8 @@ impl TemApp {
             filter_dialog: FilterDialog::default(),
             export_dialog: ExportDialog::default(),
             measure_mode: MeasureMode::default(),
+            settings: Settings::load(cc.storage),
+            settings_dialog: SettingsDialog::default(),
             auto_contrast: true,
             help_open: false,
             about_open: false,
@@ -157,6 +165,10 @@ impl TemApp {
                         ui.close();
                     }
                     ui.separator();
+                    if ui.button("設定...").clicked() {
+                        actions.push(Action::OpenSettings);
+                        ui.close();
+                    }
                     if ui.button("タブを閉じる").clicked() {
                         actions.push(Action::CloseTab(self.active));
                         ui.close();
@@ -351,6 +363,7 @@ impl TemApp {
     }
 
     fn ui_status_fields(&mut self, ui: &mut Ui) {
+        let digits = self.settings.length_digits;
         let doc = &self.docs[self.active];
         if let Some(frame) = doc.result() {
             let img = &frame.image;
@@ -361,14 +374,14 @@ impl TemApp {
                         "{} × {} px  ({} × {} {})",
                         img.width,
                         img.height,
-                        format_length(ex),
-                        format_length(ey),
+                        format_length(ex, digits),
+                        format_length(ey, digits),
                         extent_unit.label()
                     ));
                     ui.separator();
                     ui.label(format!("{:.0} %", doc.view.zoom * 100.0));
                     ui.separator();
-                    ui.label(scale.describe())
+                    ui.label(scale.describe(digits))
                         .on_hover_text("スケール設定コマンドで変更できます");
                     ui.separator();
                     // カーソル位置は画素と実寸法の両方を出す。
@@ -376,8 +389,8 @@ impl TemApp {
                     match (self.last_hover.hover_px, self.last_hover.hover_value) {
                         (Some((x, y)), Some(v)) => ui.monospace(format!(
                             "({x}, {y}) px = ({}, {}) {}  I={v}",
-                            format_length(x as f64 * per_px),
-                            format_length(y as f64 * per_px),
+                            format_length(x as f64 * per_px, digits),
+                            format_length(y as f64 * per_px, digits),
                             scale.unit.label()
                         )),
                         _ => ui.monospace("(-, -)"),
@@ -410,9 +423,11 @@ impl TemApp {
     fn ui_command_panel(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
         // 測長モード中は右パネルを測長ツール UI に置き換える。
         if self.measure_mode.open {
-            let save_requested = self
-                .measure_mode
-                .show_panel(ui, &mut self.docs[self.active]);
+            let save_requested = self.measure_mode.show_panel(
+                ui,
+                &mut self.docs[self.active],
+                self.settings.length_digits,
+            );
             if save_requested {
                 actions.push(Action::SaveMeasureResults);
             }
@@ -513,12 +528,10 @@ impl TemApp {
                                         let item = doc.commands.get_mut(i).expect("行は範囲内");
                                         let toggled = ui
                                             .checkbox(&mut item.enabled, "")
-                                            .on_hover_text(
-                                                "外すとこの処理を一時的に無効化します",
-                                            )
+                                            .on_hover_text("外すとこの処理を一時的に無効化します")
                                             .changed();
 
-                                        let label = item.command.label();
+                                        let label = item.command.label(self.settings.length_digits);
                                         let text = if item.enabled {
                                             egui::RichText::new(label)
                                         } else {
@@ -541,10 +554,12 @@ impl TemApp {
                                         if ui.small_button("×").on_hover_text("削除").clicked() {
                                             moved = Some(Action::DeleteCommand(i));
                                         }
-                                        if ui.small_button("▼").on_hover_text("下へ").clicked() {
+                                        if ui.small_button("▼").on_hover_text("下へ").clicked()
+                                        {
                                             moved = Some(Action::MoveCommand(i, 1));
                                         }
-                                        if ui.small_button("▲").on_hover_text("上へ").clicked() {
+                                        if ui.small_button("▲").on_hover_text("上へ").clicked()
+                                        {
                                             moved = Some(Action::MoveCommand(i, -1));
                                         }
                                         moved
@@ -688,6 +703,7 @@ impl TemApp {
                 self.export_dialog.open_new(&mut self.docs[index]);
             }
             Action::SaveImageExports => self.save_image_exports(),
+            Action::OpenSettings => self.settings_dialog.open = true,
             Action::EditCommand(i) => self.edit_command(i),
             Action::ToggleCommand(i) => self.doc_mut().invalidate_from(i),
             Action::DeleteCommand(i) => {
@@ -879,7 +895,7 @@ impl TemApp {
         self.status = match auto_scale {
             Some(scale) => format!(
                 "画像を挿入しました（メタデータからスケールを取得: {}）。",
-                scale.describe()
+                scale.describe(self.settings.length_digits)
             ),
             None => "画像を挿入しました（スケール情報なし）。".to_owned(),
         };
@@ -988,11 +1004,13 @@ impl TemApp {
                     overlays.push((data.compute(&fj.image, fj.scale), fj.scale));
                 }
             }
+            let digits = self.settings.length_digits;
             let result = if *color {
-                let buf = crate::export::render_rgb(&frame.image, &overlays, *annotation_scale);
+                let buf =
+                    crate::export::render_rgb(&frame.image, &overlays, *annotation_scale, digits);
                 crate::export::save_rgb(&buf, &path)
             } else {
-                let buf = crate::export::render(&frame.image, &overlays, *annotation_scale);
+                let buf = crate::export::render(&frame.image, &overlays, *annotation_scale, digits);
                 crate::export::save(&buf, &path)
             };
             match result {
@@ -1181,6 +1199,16 @@ impl TemApp {
 }
 
 impl eframe::App for TemApp {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, crate::settings::SETTINGS_KEY, &self.settings);
+    }
+
+    /// persistence 有効化で egui 内部状態（スクロール位置など）まで
+    /// 保存されないようにする。保存するのはアプリ設定だけ。
+    fn persist_egui_memory(&self) -> bool {
+        false
+    }
+
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let mut actions = Vec::new();
@@ -1226,7 +1254,9 @@ impl eframe::App for TemApp {
             .show(ui, |ui| {
                 let doc = &mut self.docs[index];
                 let image = doc.image().cloned();
-                let mut info = doc.view.show(ui, image.as_ref(), generation, range, interactive);
+                let mut info = doc
+                    .view
+                    .show(ui, image.as_ref(), generation, range, interactive);
 
                 // 測長オーバーレイ: 後段の回転等で画像が変わっていない
                 // 測長コマンドだけを、そのコマンドの画像座標系で描く。
@@ -1252,6 +1282,7 @@ impl eframe::App for TemApp {
                                 &info,
                                 &computed,
                                 frame.scale,
+                                self.settings.length_digits,
                             );
                         }
                     }
@@ -1260,7 +1291,12 @@ impl eframe::App for TemApp {
                 // 測長モード中は編集セッションの描画とツール入力処理を重ねる。
                 if self.measure_mode.open {
                     let painter = ui.painter_at(info.vp);
-                    self.measure_mode.draw_session(&painter, &info, doc);
+                    self.measure_mode.draw_session(
+                        &painter,
+                        &info,
+                        doc,
+                        self.settings.length_digits,
+                    );
                     let hover = self.measure_mode.handle_overlay_input(ui, &info, doc);
                     info.hover_px = hover.hover_px;
                     info.hover_value = hover.hover_value;
@@ -1272,17 +1308,20 @@ impl eframe::App for TemApp {
         self.ui_help_windows(&ctx);
 
         let doc = &mut self.docs[index];
-        self.scale_dialog.show(&ctx, doc);
+        let digits = self.settings.length_digits;
+        self.scale_dialog.show(&ctx, doc, digits);
         self.rotate_dialog.show(&ctx, doc);
         self.levels_dialog.show(&ctx, doc);
         self.filter_dialog.show(&ctx, doc);
         if self.export_dialog.show(&ctx, doc) {
             actions.push(Action::SaveImageExports);
         }
+        self.settings_dialog.show(&ctx, &mut self.settings);
         if self.measure_mode.open {
             let tab = self.measure_mode.tab;
             if tab < self.docs.len() {
-                self.measure_mode.show_confirm_modal(&ctx, &mut self.docs[tab]);
+                self.measure_mode
+                    .show_confirm_modal(&ctx, &mut self.docs[tab]);
                 self.measure_mode.show_fit_popup(&ctx, &mut self.docs[tab]);
             }
         }

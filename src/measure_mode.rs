@@ -14,14 +14,15 @@ use egui::{
 use crate::command::Command;
 use crate::dialogs::set_command;
 use crate::document::Document;
-use crate::frame::{format_length, Scale};
+use crate::frame::Scale;
 use crate::gray::Gray16;
 use crate::measure::{
     AngleMode, ComputedMeasure, ComputedTool, FitMode, FitSettings, FitSign, MeasureData,
-    MeasureTool,
-    NewMeasureMode, Pt2, SnapLine, ToolKind, format_measurement, snap_angle_four, snap_distance,
+    MeasureTool, NewMeasureMode, Pt2, SnapLine, ToolKind, format_measurement, snap_angle_four,
+    snap_distance,
 };
 use crate::measure_fit::{self, FitRegion, GaussFit};
+use crate::settings::format_length;
 use crate::view::ViewInfo;
 
 /// undo / redo スタックの深さ上限。
@@ -199,10 +200,16 @@ enum Drag {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FitPopupTarget {
     /// 二点間測長の端点 1 / 端点 2。
-    Dist1 { tool: u64 },
-    Dist2 { tool: u64 },
+    Dist1 {
+        tool: u64,
+    },
+    Dist2 {
+        tool: u64,
+    },
     /// 境界線。
-    Boundary { tool: u64 },
+    Boundary {
+        tool: u64,
+    },
 }
 
 /// 結果リストの UI から集めた操作（描画中は data を借りているため後処理する）。
@@ -215,9 +222,16 @@ enum ResultAction {
     /// グループと、そのグループに属するツールをまとめて削除。
     DeleteGroup(u64),
     /// グループ内で測定結果を上下に動かす（番号は表示時に振り直す）。
-    MoveTool { gid: u64, id: u64, delta: isize },
+    MoveTool {
+        gid: u64,
+        id: u64,
+        delta: isize,
+    },
     /// グループ内を代表座標（anchor_point）の x / y で昇順に並べ替える。
-    SortGroup { gid: u64, key: SortKey },
+    SortGroup {
+        gid: u64,
+        key: SortKey,
+    },
     /// 全グループの統計データをクリップボードへコピー。
     CopyStats,
     /// 1 グループの測長結果一覧をクリップボードへコピー。
@@ -442,7 +456,7 @@ impl MeasureMode {
 
     /// 右パネル（command_panel と同じ場所）に測長 UI を表示する。
     /// 戻り値は「保存」ボタンが押されたか（呼び出し側でファイルへ保存する）。
-    pub fn show_panel(&mut self, ui: &mut Ui, doc: &mut Document) -> bool {
+    pub fn show_panel(&mut self, ui: &mut Ui, doc: &mut Document, digits: u8) -> bool {
         if !self.open {
             return false;
         }
@@ -486,17 +500,18 @@ impl MeasureMode {
                     });
                     ui.add_space(2.0);
                 });
-                self.results_ui(ui, doc);
+                self.results_ui(ui, doc, digits);
             });
 
         if confirmed {
             self.finish();
         } else if cancel_requested {
             // 変更が無ければそのまま破棄してよい。
-            let unchanged = self
-                .original
-                .as_ref()
-                .is_some_and(|o| o == &Command::Measure { data: self.data.clone() });
+            let unchanged = self.original.as_ref().is_some_and(|o| {
+                o == &Command::Measure {
+                    data: self.data.clone(),
+                }
+            });
             if unchanged {
                 self.revert(doc);
             } else {
@@ -815,15 +830,10 @@ impl MeasureMode {
 
     /// 最後に作成したオフセット線の距離を数値で微調整する。
     fn offset_fine_tune_ui(&mut self, ui: &mut Ui, doc: &mut Document) {
-        let last = self
-            .data
-            .tools
-            .iter()
-            .rev()
-            .find_map(|t| match t {
-                MeasureTool::Offset { id, distance, .. } => Some((*id, *distance)),
-                _ => None,
-            });
+        let last = self.data.tools.iter().rev().find_map(|t| match t {
+            MeasureTool::Offset { id, distance, .. } => Some((*id, *distance)),
+            _ => None,
+        });
         let Some((id, mut distance)) = last else {
             return;
         };
@@ -845,7 +855,7 @@ impl MeasureMode {
         });
     }
 
-    fn results_ui(&mut self, ui: &mut Ui, doc: &mut Document) {
+    fn results_ui(&mut self, ui: &mut Ui, doc: &mut Document, digits: u8) {
         ui.strong("測定結果");
         let (img, scale) = match doc.input_to(self.index) {
             Some(frame) => (frame.image.clone(), frame.scale),
@@ -877,9 +887,7 @@ impl MeasureMode {
                                 egui::TextEdit::singleline(&mut self.rename_text)
                                     .desired_width(110.0),
                             );
-                            if resp.lost_focus()
-                                && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                            {
+                            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                                 actions.push(ResultAction::Rename(
                                     gid,
                                     self.rename_text.trim().to_owned(),
@@ -908,10 +916,7 @@ impl MeasureMode {
                                 }
                                 let has_data = !self.data.group_tools(gid).is_empty();
                                 if ui
-                                    .add_enabled(
-                                        has_data,
-                                        egui::Button::new("データ一覧をコピー"),
-                                    )
+                                    .add_enabled(has_data, egui::Button::new("データ一覧をコピー"))
                                     .on_disabled_hover_text("このグループに測長結果はありません")
                                     .clicked()
                                 {
@@ -924,7 +929,10 @@ impl MeasureMode {
                                     .clicked()
                                 {
                                     ui.close();
-                                    actions.push(ResultAction::SortGroup { gid, key: SortKey::X });
+                                    actions.push(ResultAction::SortGroup {
+                                        gid,
+                                        key: SortKey::X,
+                                    });
                                 }
                                 if ui
                                     .add_enabled(has_data, egui::Button::new("y 座標でソート"))
@@ -932,7 +940,10 @@ impl MeasureMode {
                                     .clicked()
                                 {
                                     ui.close();
-                                    actions.push(ResultAction::SortGroup { gid, key: SortKey::Y });
+                                    actions.push(ResultAction::SortGroup {
+                                        gid,
+                                        key: SortKey::Y,
+                                    });
                                 }
                             });
                         }
@@ -944,7 +955,7 @@ impl MeasureMode {
                         {
                             actions.push(ResultAction::DeleteGroup(gid));
                         }
-                        if let Some(stat) = group_stat(&computed, gid, scale) {
+                        if let Some(stat) = group_stat(&computed, gid, scale, digits) {
                             ui.label(egui::RichText::new(stat).weak());
                         }
                     });
@@ -959,7 +970,7 @@ impl MeasureMode {
                                 Some(t) => {
                                     let value = t
                                         .length_px
-                                        .map(|l| format_measurement(l, scale))
+                                        .map(|l| format_measurement(l, scale, digits))
                                         .unwrap_or_default();
                                     ui.label(format!("#{}  {}", n + 1, value));
                                 }
@@ -1038,9 +1049,9 @@ impl MeasureMode {
                         .data
                         .tools
                         .iter()
-                        .filter(|t| {
-                            matches!(t, MeasureTool::Offset { source, .. } if *source == id)
-                        })
+                        .filter(
+                            |t| matches!(t, MeasureTool::Offset { source, .. } if *source == id),
+                        )
                         .map(|t| t.id())
                         .collect();
                     self.mutate(doc, |data| {
@@ -1085,10 +1096,12 @@ impl MeasureMode {
                     self.mutate(doc, |data| sort_group(data, &computed, gid, key));
                 }
                 ResultAction::CopyStats => {
-                    ui.ctx().copy_text(stats_csv(&self.data, &computed, scale));
+                    ui.ctx()
+                        .copy_text(stats_csv(&self.data, &computed, scale, digits));
                 }
                 ResultAction::CopyGroupData(gid) => {
-                    ui.ctx().copy_text(group_data_csv(gid, &self.data, &computed, scale));
+                    ui.ctx()
+                        .copy_text(group_data_csv(gid, &self.data, &computed, scale, digits));
                 }
             }
         }
@@ -1104,8 +1117,7 @@ fn move_tool_in_group(data: &mut MeasureData, gid: u64, id: u64, delta: isize) {
     let step = delta.signum();
     let mut j = i as isize + step;
     while j >= 0 && (j as usize) < data.tools.len() {
-        if matches!(&data.tools[j as usize], MeasureTool::Distance { group, .. } if *group == gid)
-        {
+        if matches!(&data.tools[j as usize], MeasureTool::Distance { group, .. } if *group == gid) {
             data.tools.swap(i, j as usize);
             return;
         }
@@ -1181,16 +1193,15 @@ pub fn save_measure_json(doc: &Document, index: usize) -> Result<Option<PathBuf>
         .groups
         .iter()
         .map(|g| {
-            let values: Vec<String> = data
+            // 表示用の丸めはせず、元の精度の数値のまま保存する。
+            let values: Vec<f64> = data
                 .group_tools(g.id)
                 .iter()
                 .filter_map(|tid| {
-                    computed.by_id(*tid).and_then(|t| t.length_px).map(|l| {
-                        frame
-                            .scale
-                            .map(|s| format_length(l * s.per_px()))
-                            .unwrap_or_else(|| format_length(l))
-                    })
+                    computed
+                        .by_id(*tid)
+                        .and_then(|t| t.length_px)
+                        .map(|l| frame.scale.map(|s| l * s.per_px()).unwrap_or(l))
                 })
                 .collect();
             serde_json::json!({ "name": g.name, "values": values })
@@ -1300,18 +1311,18 @@ fn draw_profile_plot(ui: &mut Ui, profile: &[f64], fit: Option<GaussFit>, region
     if n < 2 {
         return;
     }
-    let (mut lo, mut hi) = profile.iter().cloned().fold(
-        (f64::INFINITY, f64::NEG_INFINITY),
-        |(l, h), v| (l.min(v), h.max(v)),
-    );
+    let (mut lo, mut hi) = profile
+        .iter()
+        .cloned()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(l, h), v| {
+            (l.min(v), h.max(v))
+        });
     if hi - lo < 1e-9 {
         lo -= 1.0;
         hi += 1.0;
     }
     let x = |i: f64| rect.left() + (i / (n - 1) as f64) as f32 * rect.width();
-    let y = |v: f64| {
-        rect.bottom() - ((v - lo) / (hi - lo)) as f32 * (rect.height() - 4.0) - 2.0
-    };
+    let y = |v: f64| rect.bottom() - ((v - lo) / (hi - lo)) as f32 * (rect.height() - 4.0) - 2.0;
 
     // プロファイル（灰）。
     let points: Vec<Pos2> = profile
@@ -1319,7 +1330,10 @@ fn draw_profile_plot(ui: &mut Ui, profile: &[f64], fit: Option<GaussFit>, region
         .enumerate()
         .map(|(i, &v)| Pos2::new(x(i as f64), y(v)))
         .collect();
-    painter.add(egui::Shape::line(points, Stroke::new(1.5, Color32::from_gray(170))));
+    painter.add(egui::Shape::line(
+        points,
+        Stroke::new(1.5, Color32::from_gray(170)),
+    ));
 
     // フィット曲線（橙）とフィット中心の点。
     if let Some(f) = fit {
@@ -1331,7 +1345,10 @@ fn draw_profile_plot(ui: &mut Ui, profile: &[f64], fit: Option<GaussFit>, region
                 Pos2::new(x(xi), y(v))
             })
             .collect();
-        painter.add(egui::Shape::line(points, Stroke::new(1.5, COLOR_IN_PROGRESS)));
+        painter.add(egui::Shape::line(
+            points,
+            Stroke::new(1.5, COLOR_IN_PROGRESS),
+        ));
         painter.circle_filled(
             Pos2::new(x(f.mu), y(f.amplitude + f.baseline)),
             2.5,
@@ -1344,17 +1361,20 @@ fn draw_profile_plot(ui: &mut Ui, profile: &[f64], fit: Option<GaussFit>, region
     if region.mode == FitMode::Off {
         let cx = x((n - 1) as f64 * 0.5);
         painter.line_segment(
-            [Pos2::new(cx, rect.top() + 2.0), Pos2::new(cx, rect.bottom() - 2.0)],
+            [
+                Pos2::new(cx, rect.top() + 2.0),
+                Pos2::new(cx, rect.bottom() - 2.0),
+            ],
             Stroke::new(1.0, Color32::from_rgb(255, 220, 120)),
         );
     }
 }
 
 /// 単位なしの数値文字列（スケールがあれば実寸の値、なければ px）。
-fn value_number(px: f64, scale: Option<Scale>) -> String {
+fn value_number(px: f64, scale: Option<Scale>, digits: u8) -> String {
     match scale {
-        Some(s) => format_length(px * s.per_px()),
-        None => format_length(px),
+        Some(s) => format_length(px * s.per_px(), digits),
+        None => format_length(px, digits),
     }
 }
 
@@ -1369,7 +1389,12 @@ fn csv_field(s: &str) -> String {
 
 /// 全グループの統計データを CSV にする。
 /// ヘッダー: グループ名, サンプル数, 平均, 標準偏差（単位なし・実寸の値）。
-fn stats_csv(data: &MeasureData, computed: &ComputedMeasure, scale: Option<Scale>) -> String {
+fn stats_csv(
+    data: &MeasureData,
+    computed: &ComputedMeasure,
+    scale: Option<Scale>,
+    digits: u8,
+) -> String {
     let mut out = String::from("グループ名, サンプル数, 平均, 標準偏差\n");
     for g in &data.groups {
         let values: Vec<f64> = computed
@@ -1388,13 +1413,13 @@ fn stats_csv(data: &MeasureData, computed: &ComputedMeasure, scale: Option<Scale
             String::new()
         } else {
             let var = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n - 1) as f64;
-            value_number(var.sqrt(), scale)
+            value_number(var.sqrt(), scale, digits)
         };
         out += &format!(
             "{}, {}, {}, {}\n",
             csv_field(&g.name),
             n,
-            value_number(mean, scale),
+            value_number(mean, scale, digits),
             sd,
         );
     }
@@ -1407,13 +1432,14 @@ fn group_data_csv(
     data: &MeasureData,
     computed: &ComputedMeasure,
     scale: Option<Scale>,
+    digits: u8,
 ) -> String {
     let mut out = String::from("番号, 値\n");
     for (n, tid) in data.group_tools(gid).iter().enumerate() {
         if let Some(t) = computed.by_id(*tid)
             && let Some(len) = t.length_px
         {
-            out += &format!("{}, {}\n", n + 1, value_number(len, scale));
+            out += &format!("{}, {}\n", n + 1, value_number(len, scale, digits));
         }
     }
     out
@@ -1424,6 +1450,7 @@ fn group_stat(
     computed: &crate::measure::ComputedMeasure,
     gid: u64,
     scale: Option<crate::frame::Scale>,
+    digits: u8,
 ) -> Option<String> {
     let values: Vec<f64> = computed
         .tools
@@ -1436,12 +1463,12 @@ fn group_stat(
     }
     let n = values.len();
     let mean = values.iter().sum::<f64>() / n as f64;
-    let avg = format_measurement(mean, scale);
+    let avg = format_measurement(mean, scale, digits);
     if n < 2 {
         return Some(format!("{avg} (n=1)"));
     }
     let var = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n - 1) as f64;
-    let sigma = format_measurement(var.sqrt(), scale);
+    let sigma = format_measurement(var.sqrt(), scale, digits);
     Some(format!("平均 {avg}  σ {sigma} (n={n})"))
 }
 
@@ -1466,15 +1493,20 @@ pub fn draw_computed(
     info: &ViewInfo,
     computed: &ComputedMeasure,
     scale: Option<Scale>,
+    digits: u8,
 ) {
     if info.image_rect.is_none() {
         return;
     }
-    for t in &computed.tools {
+    for (n, t) in computed.tools.iter().enumerate() {
         // フィッティング領域の枠（点線）。色はフィッティング設定で変え、
         // 符号固定モードは辺ごとに明暗を付けて方向を示す。
         for region in &t.fit_regions {
-            let pts: Vec<Pos2> = region.corners().iter().map(|&c| to_screen(info, c)).collect();
+            let pts: Vec<Pos2> = region
+                .corners()
+                .iter()
+                .map(|&c| to_screen(info, c))
+                .collect();
             let colors = region_edge_colors(region.mode, region.sign);
             for i in 0..4 {
                 painter.add(egui::Shape::dashed_line(
@@ -1491,7 +1523,8 @@ pub fn draw_computed(
                 let b = to_screen(info, t.p2);
                 draw_line_and_arrows(painter, a, b, COLOR_DISTANCE);
                 if let Some(len) = t.length_px {
-                    draw_value_label(painter, a, b, format_measurement(len, scale), COLOR_DISTANCE);
+                    let text = format!("#{} {}", n + 1, format_measurement(len, scale, digits));
+                    draw_value_label(painter, a, b, text, COLOR_DISTANCE);
                 }
             }
             ToolKind::Boundary => {
@@ -1511,7 +1544,11 @@ pub fn draw_computed(
                 painter.line_segment([a, b], Stroke::new(2.0, COLOR_GUIDE));
                 if let Some(d) = t.distance_px {
                     let sign = if d >= 0.0 { "+" } else { "-" };
-                    let text = format!("{sign}{}", format_measurement(d.abs(), scale));
+                    let text = format!(
+                        "#{} {sign}{}",
+                        n + 1,
+                        format_measurement(d.abs(), scale, digits)
+                    );
                     draw_value_label(painter, a, b, text, COLOR_GUIDE);
                 }
             }
@@ -1559,7 +1596,11 @@ fn draw_offset_link(painter: &Painter, info: &ViewInfo, src: (Pt2, Pt2), off: (P
 fn draw_value_label(painter: &Painter, a: Pos2, b: Pos2, text: String, color: Color32) {
     let mid = a.to_vec2() + (b - a) * 0.5;
     let d = b - a;
-    let n = if d.length() > 1.0 { d.rot90() / d.length() } else { Vec2::Y };
+    let n = if d.length() > 1.0 {
+        d.rot90() / d.length()
+    } else {
+        Vec2::Y
+    };
     painter.text(
         egui::pos2(mid.x + n.x * 8.0, mid.y + n.y * 8.0),
         Align2::CENTER_BOTTOM,
@@ -1659,7 +1700,7 @@ fn distance_to_segment(pos: Pt2, a: Pt2, b: Pt2) -> f64 {
 
 impl MeasureMode {
     /// 測長モード中の編集セッションを描画する（確定済みツール + 作成中ツール）。
-    pub fn draw_session(&mut self, painter: &Painter, info: &ViewInfo, doc: &Document) {
+    pub fn draw_session(&mut self, painter: &Painter, info: &ViewInfo, doc: &Document, digits: u8) {
         let Some(frame) = doc.input_to(self.index) else {
             return;
         };
@@ -1696,7 +1737,7 @@ impl MeasureMode {
         } else {
             self.data.compute(&img, scale)
         };
-        draw_computed(painter, info, &computed, scale);
+        draw_computed(painter, info, &computed, scale, digits);
 
         // 選択中のツールを橙の太線でハイライトする。
         if let Some(sel) = self.selected
@@ -1725,7 +1766,8 @@ impl MeasureMode {
             InProgress::Distance { p1, p1_line } => {
                 let Some(cursor) = cursor else { return };
                 let lines = self.data.snap_lines(&img, scale);
-                let (p1, p2, snapped) = self.resolve_distance(p1, p1_line, cursor, &lines, info.zoom);
+                let (p1, p2, snapped) =
+                    self.resolve_distance(p1, p1_line, cursor, &lines, info.zoom);
                 let p2 = self.resolve_angle(p1, p2, snapped);
                 let a = to_screen(info, p1);
                 let b = to_screen(info, p2);
@@ -1797,9 +1839,10 @@ impl MeasureMode {
     /// 選択枠と四隅のハンドルを描く。
     fn draw_range_overlay(&self, painter: &Painter, info: &ViewInfo, computed: &ComputedMeasure) {
         let (ids, rect): (Vec<u64>, Option<(Pt2, Pt2)>) = match &self.range_state {
-            Some(RangeState::Drawing { start, current }) => {
-                (self.distance_ids_in(*start, *current), Some((*start, *current)))
-            }
+            Some(RangeState::Drawing { start, current }) => (
+                self.distance_ids_in(*start, *current),
+                Some((*start, *current)),
+            ),
             _ => (
                 self.range_selection
                     .as_ref()
@@ -1850,8 +1893,7 @@ impl MeasureMode {
             .filter_map(|t| match t {
                 MeasureTool::Distance { id, p1, p2, .. } => {
                     let c = (*p1 + *p2) * 0.5;
-                    (c.x >= min_x && c.x <= max_x && c.y >= min_y && c.y <= max_y)
-                        .then_some(*id)
+                    (c.x >= min_x && c.x <= max_x && c.y >= min_y && c.y <= max_y).then_some(*id)
                 }
                 _ => None,
             })
@@ -1877,18 +1919,14 @@ impl MeasureMode {
 
     /// 枠への当たり判定。辺（±t）→ 変形、内側 → 移動、それ以外 → なし。
     fn range_hit(sel: &RangeSelection, pos: Pt2, t: f64) -> RangeHit {
-        let min_x = (pos.x - sel.min.x).abs() <= t
-            && pos.y >= sel.min.y - t
-            && pos.y <= sel.max.y + t;
-        let max_x = (pos.x - sel.max.x).abs() <= t
-            && pos.y >= sel.min.y - t
-            && pos.y <= sel.max.y + t;
-        let min_y = (pos.y - sel.min.y).abs() <= t
-            && pos.x >= sel.min.x - t
-            && pos.x <= sel.max.x + t;
-        let max_y = (pos.y - sel.max.y).abs() <= t
-            && pos.x >= sel.min.x - t
-            && pos.x <= sel.max.x + t;
+        let min_x =
+            (pos.x - sel.min.x).abs() <= t && pos.y >= sel.min.y - t && pos.y <= sel.max.y + t;
+        let max_x =
+            (pos.x - sel.max.x).abs() <= t && pos.y >= sel.min.y - t && pos.y <= sel.max.y + t;
+        let min_y =
+            (pos.y - sel.min.y).abs() <= t && pos.x >= sel.min.x - t && pos.x <= sel.max.x + t;
+        let max_y =
+            (pos.y - sel.max.y).abs() <= t && pos.x >= sel.min.x - t && pos.x <= sel.max.x + t;
         if min_x || max_x || min_y || max_y {
             RangeHit::Resize {
                 min_x,
@@ -1896,8 +1934,7 @@ impl MeasureMode {
                 min_y,
                 max_y,
             }
-        } else if pos.x > sel.min.x && pos.x < sel.max.x && pos.y > sel.min.y && pos.y < sel.max.y
-        {
+        } else if pos.x > sel.min.x && pos.x < sel.max.x && pos.y > sel.min.y && pos.y < sel.max.y {
             RangeHit::Move
         } else {
             RangeHit::None
@@ -2134,8 +2171,8 @@ impl MeasureMode {
                 factor *= (scroll_y * 0.0022).exp();
             }
             if factor != 1.0 {
-                let anchor =
-                    resp.hover_pos().map_or(info.vp.center(), |p| p).to_vec2() - info.vp.min.to_vec2();
+                let anchor = resp.hover_pos().map_or(info.vp.center(), |p| p).to_vec2()
+                    - info.vp.min.to_vec2();
                 doc.view.zoom_about(anchor, factor);
             }
         }
@@ -2285,7 +2322,8 @@ impl MeasureMode {
                 // スナップが効かなければ 4 方向固定を適用する
                 // （もう一方の端点を基準に方向を丸める）。
                 let (mut p, snapped) = self.resolve_endpoint_move(id, cursor, img, scale, zoom);
-                if !snapped && self.data.prefs.angle == AngleMode::FourDir
+                if !snapped
+                    && self.data.prefs.angle == AngleMode::FourDir
                     && let Some(other) = other_endpoint(&self.data, id, which)
                 {
                     p = snap_angle_four(other, p);
@@ -2366,12 +2404,17 @@ impl MeasureMode {
                     }
                     RangeHit::None => {
                         // 枠の外: 新しい枠の作成を始める。
-                        self.range_state =
-                            Some(RangeState::Drawing { start: press, current: press });
+                        self.range_state = Some(RangeState::Drawing {
+                            start: press,
+                            current: press,
+                        });
                     }
                 },
                 None => {
-                    self.range_state = Some(RangeState::Drawing { start: press, current: press });
+                    self.range_state = Some(RangeState::Drawing {
+                        start: press,
+                        current: press,
+                    });
                 }
             }
         }
@@ -2381,7 +2424,10 @@ impl MeasureMode {
         {
             match self.range_state.clone() {
                 Some(RangeState::Drawing { start, .. }) => {
-                    self.range_state = Some(RangeState::Drawing { start, current: cursor });
+                    self.range_state = Some(RangeState::Drawing {
+                        start,
+                        current: cursor,
+                    });
                 }
                 Some(RangeState::Moving {
                     start,
@@ -2521,9 +2567,7 @@ impl MeasureMode {
                     return Some(match t.kind {
                         ToolKind::Boundary => FitPopupTarget::Boundary { tool: t.id },
                         ToolKind::Distance => {
-                            if (region.center - t.p1).length()
-                                < (region.center - t.p2).length()
-                            {
+                            if (region.center - t.p1).length() < (region.center - t.p2).length() {
                                 FitPopupTarget::Dist1 { tool: t.id }
                             } else {
                                 FitPopupTarget::Dist2 { tool: t.id }
@@ -2567,7 +2611,8 @@ impl MeasureMode {
                 }
                 Some(InProgress::Distance { p1, p1_line }) => {
                     // 端点 2 を置いて確定。
-                    let (p1, p2, snapped) = self.resolve_distance(p1, p1_line, pos, &snap_lines, zoom);
+                    let (p1, p2, snapped) =
+                        self.resolve_distance(p1, p1_line, pos, &snap_lines, zoom);
                     let p2 = self.resolve_angle(p1, p2, snapped);
                     let (mut fit1, mut fit2) = (self.data.dist_fit1, self.data.dist_fit2);
                     // 片側だけスナップした端点はフィッティングせずクリック位置
@@ -2662,10 +2707,7 @@ impl MeasureMode {
                     }
                 }
                 Some(InProgress::LinearDuplicate {
-                    src,
-                    start,
-                    count,
-                    ..
+                    src, start, count, ..
                 }) => {
                     // クリックで確定。方向は 4 方向固定を適用した位置を使う。
                     let current = if self.data.prefs.angle == AngleMode::FourDir {
@@ -2683,12 +2725,17 @@ impl MeasureMode {
                             return;
                         };
                         let (base1, base2, group, fit1, fit2, is_boundary) = match source {
-                            MeasureTool::Distance { p1, p2, group, fit1, fit2, .. } => {
-                                (p1, p2, group, fit1, fit2, false)
-                            }
-                            MeasureTool::Boundary { p1, p2, group, fit, .. } => {
-                                (p1, p2, group, fit, fit, true)
-                            }
+                            MeasureTool::Distance {
+                                p1,
+                                p2,
+                                group,
+                                fit1,
+                                fit2,
+                                ..
+                            } => (p1, p2, group, fit1, fit2, false),
+                            MeasureTool::Boundary {
+                                p1, p2, group, fit, ..
+                            } => (p1, p2, group, fit, fit, true),
                             _ => {
                                 self.selected = None;
                                 return;
@@ -2869,9 +2916,18 @@ mod tests {
         mode.data = data;
 
         // 中心位置が枠内の測長だけが選ばれる。
-        assert_eq!(mode.distance_ids_in(pt(90.0, 10.0), pt(110.0, 20.0)), vec![1]);
-        assert_eq!(mode.distance_ids_in(pt(0.0, 0.0), pt(90.0, 60.0)), vec![2, 3]);
-        assert!(mode.distance_ids_in(pt(90.0, 10.0), pt(95.0, 12.0)).is_empty());
+        assert_eq!(
+            mode.distance_ids_in(pt(90.0, 10.0), pt(110.0, 20.0)),
+            vec![1]
+        );
+        assert_eq!(
+            mode.distance_ids_in(pt(0.0, 0.0), pt(90.0, 60.0)),
+            vec![2, 3]
+        );
+        assert!(
+            mode.distance_ids_in(pt(90.0, 10.0), pt(95.0, 12.0))
+                .is_empty()
+        );
 
         // 当たり判定: 内側 = 移動、辺 = 変形、角 = 両軸の変形、外 = なし。
         let sel = RangeSelection {
@@ -2879,18 +2935,37 @@ mod tests {
             min: pt(0.0, 0.0),
             max: pt(20.0, 10.0),
         };
-        assert!(matches!(MeasureMode::range_hit(&sel, pt(10.0, 5.0), 1.0), RangeHit::Move));
+        assert!(matches!(
+            MeasureMode::range_hit(&sel, pt(10.0, 5.0), 1.0),
+            RangeHit::Move
+        ));
         assert!(matches!(
             MeasureMode::range_hit(&sel, pt(20.0, 5.0), 1.0),
-            RangeHit::Resize { max_x: true, min_x: false, min_y: false, max_y: false }
+            RangeHit::Resize {
+                max_x: true,
+                min_x: false,
+                min_y: false,
+                max_y: false
+            }
         ));
         assert!(matches!(
             MeasureMode::range_hit(&sel, pt(0.0, 0.0), 1.0),
-            RangeHit::Resize { min_x: true, max_x: false, min_y: true, max_y: false }
+            RangeHit::Resize {
+                min_x: true,
+                max_x: false,
+                min_y: true,
+                max_y: false
+            }
         ));
-        assert!(matches!(MeasureMode::range_hit(&sel, pt(50.0, 50.0), 1.0), RangeHit::None));
+        assert!(matches!(
+            MeasureMode::range_hit(&sel, pt(50.0, 50.0), 1.0),
+            RangeHit::None
+        ));
         // 辺の延長線上（y が枠から外れる）は辺扱いしない。
-        assert!(matches!(MeasureMode::range_hit(&sel, pt(20.0, 50.0), 1.0), RangeHit::None));
+        assert!(matches!(
+            MeasureMode::range_hit(&sel, pt(20.0, 50.0), 1.0),
+            RangeHit::None
+        ));
     }
 
     /// リサイズ時の線形写像。反対側の辺が基準になり、測長の p1/p2 も
@@ -2909,7 +2984,13 @@ mod tests {
         assert!((p.x - 5.0).abs() < 1e-9);
         assert!((p.y - 5.0).abs() < 1e-9);
         // 幅 0 の軸（すべての中心が同一 x）は平行移動だけになる。
-        let p = resize_map(pt(10.0, 0.0), pt(10.0, 10.0), pt(15.0, 0.0), pt(16.0, 10.0), pt(10.0, 5.0));
+        let p = resize_map(
+            pt(10.0, 0.0),
+            pt(10.0, 10.0),
+            pt(15.0, 0.0),
+            pt(16.0, 10.0),
+            pt(10.0, 5.0),
+        );
         assert!((p.x - 15.0).abs() < 1e-9);
         assert!((p.y - 5.0).abs() < 1e-9);
     }
@@ -2931,7 +3012,11 @@ mod tests {
         else {
             panic!("Measure のはず");
         };
-        assert_eq!(d.group_tools(g), vec![2, 3, 1], "doc 側のコマンドにも反映される");
+        assert_eq!(
+            d.group_tools(g),
+            vec![2, 3, 1],
+            "doc 側のコマンドにも反映される"
+        );
     }
 
     #[test]
@@ -2994,19 +3079,20 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["unit"], "px", "スケール未設定は px");
         assert_eq!(v["groups"][0]["values"].as_array().unwrap().len(), 3);
-        let first = v["groups"][0]["values"][0].as_str().unwrap();
+        // 表示用の丸めはせず、元の精度の数値で保存される。
+        let first = v["groups"][0]["values"][0]
+            .as_f64()
+            .expect("数値で保存される");
         assert!(
-            !first.contains("px") && !first.contains("nm"),
-            "測定値に単位が付いていない: {first}"
+            first.is_finite() && first > 0.0,
+            "測定値が数値として保存されている: {first}"
         );
 
         // 出力先が空なら保存しない。
         let mut empty = MeasureData::default();
         empty.output_path = String::new();
-        doc.commands
-            .get_mut(1)
-            .expect("Measure コマンド")
-            .command = Command::Measure { data: empty };
+        doc.commands.get_mut(1).expect("Measure コマンド").command =
+            Command::Measure { data: empty };
         assert!(save_measure_json(&doc, 1).unwrap().is_none());
 
         std::fs::remove_file(&path).unwrap();

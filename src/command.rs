@@ -155,7 +155,7 @@ impl Command {
         }
     }
 
-    pub fn label(&self) -> String {
+    pub fn label(&self, digits: u8) -> String {
         match self {
             Self::InsertImage { path } => {
                 let name = path
@@ -165,7 +165,7 @@ impl Command {
                 format!("画像挿入: {name}")
             }
             Self::SetScale { .. } => match self.scale() {
-                Some(scale) => format!("スケール設定: {}", scale.describe()),
+                Some(scale) => format!("スケール設定: {}", scale.describe(digits)),
                 None => "スケール設定: (値が不正)".to_owned(),
             },
             Self::Rotate { angle_deg } => format!("回転: {angle_deg:.2}°"),
@@ -173,7 +173,11 @@ impl Command {
             Self::Filter { filter } => format!("フィルタ: {}", filter.label()),
             Self::Measure { data } => {
                 let measurements = data.tools.iter().filter(|t| t.is_measurement()).count();
-                format!("測長: グループ {} 件 / 測定 {} 件", data.groups.len(), measurements)
+                format!(
+                    "測長: グループ {} 件 / 測定 {} 件",
+                    data.groups.len(),
+                    measurements
+                )
             }
             Self::ExportImage { output, color, .. } => {
                 let mode = if *color { "（カラー）" } else { "" };
@@ -421,7 +425,7 @@ mod tests {
         let cmd = Command::scale_from(scale);
         let back = cmd.scale().expect("換算できること");
         assert!((back.nm_per_px - scale.nm_per_px).abs() < 1e-12);
-        assert_eq!(cmd.label(), "スケール設定: 1 px = 0.09352 nm");
+        assert_eq!(cmd.label(5), "スケール設定: 1 px = 0.09352 nm");
     }
 
     /// 測長コマンドの無い古い履歴はそのまま読めること。version キーは
@@ -446,9 +450,7 @@ mod tests {
     fn measure_command_round_trips() {
         let mut data = MeasureData::default();
         data.group_for_new_measurement();
-        let cmd = Command::Measure {
-            data: data.clone(),
-        };
+        let cmd = Command::Measure { data: data.clone() };
         let json = serde_json::to_string(&cmd).unwrap();
         let back: Command = serde_json::from_str(&json).unwrap();
         assert_eq!(back, cmd);

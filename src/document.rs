@@ -44,7 +44,10 @@ impl CommandLists {
 
     /// 全カテゴリのコマンド数。
     pub fn len(&self) -> usize {
-        CommandCategory::ALL.iter().map(|&c| self.list(c).len()).sum()
+        CommandCategory::ALL
+            .iter()
+            .map(|&c| self.list(c).len())
+            .sum()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -180,11 +183,11 @@ impl Document {
     }
 
     /// 各コマンドをそれぞれのカテゴリの末尾へ追加する。グローバル添字の列を返す。
-    pub fn extend_commands(
-        &mut self,
-        items: impl IntoIterator<Item = CommandItem>,
-    ) -> Vec<usize> {
-        items.into_iter().map(|item| self.append_item(item)).collect()
+    pub fn extend_commands(&mut self, items: impl IntoIterator<Item = CommandItem>) -> Vec<usize> {
+        items
+            .into_iter()
+            .map(|item| self.append_item(item))
+            .collect()
     }
 
     /// 全コマンドを入れ替える。処理順（カテゴリ順）になるよう分類し直す。
@@ -242,10 +245,12 @@ impl Document {
 
     /// `index` のコマンドまでで直近の画像挿入コマンドのパス。
     pub fn image_path_at(&self, index: usize) -> Option<&Path> {
-        (0..=index).rev().find_map(|j| match &self.commands.get(j).map(|c| &c.command) {
-            Some(Command::InsertImage { path }) => Some(path.as_path()),
-            _ => None,
-        })
+        (0..=index)
+            .rev()
+            .find_map(|j| match &self.commands.get(j).map(|c| &c.command) {
+                Some(Command::InsertImage { path }) => Some(path.as_path()),
+                _ => None,
+            })
     }
 
     // ------------------------------------------------------------ 選択
@@ -346,7 +351,10 @@ impl Document {
         };
 
         for i in start..self.commands.len() {
-            let item = self.commands.get(i).expect("コマンド数はループ開始時に確定");
+            let item = self
+                .commands
+                .get(i)
+                .expect("コマンド数はループ開始時に確定");
             if !item.enabled {
                 // 無効な行は素通し。直前の結果をそのまま次段へ渡す。
                 self.stages[i] = current.clone();
@@ -358,7 +366,10 @@ impl Document {
                     self.stages[i] = Some(out);
                 }
                 Err(e) => {
-                    self.error = Some(format!("{}: {e}", item.command.label()));
+                    self.error = Some(format!(
+                        "{}: {e}",
+                        item.command.label(crate::settings::DEFAULT_LENGTH_DIGITS)
+                    ));
                     // 失敗行以降は結果なしにして、古い画像が残らないようにする。
                     for s in &mut self.stages[i..] {
                         *s = None;

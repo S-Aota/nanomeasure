@@ -166,9 +166,7 @@ impl ImageView {
                 egui::StrokeKind::Outside,
             );
 
-            if interactive
-                && let Some(pos) = response.hover_pos()
-            {
+            if interactive && let Some(pos) = response.hover_pos() {
                 let rel = (pos - image_rect.min) / self.zoom;
                 if rel.x >= 0.0
                     && rel.y >= 0.0

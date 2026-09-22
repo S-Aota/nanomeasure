@@ -11,9 +11,10 @@ use std::ops::{Add, Div, Mul, Sub};
 
 use serde::{Deserialize, Serialize};
 
-use crate::frame::{format_length, Scale};
+use crate::frame::Scale;
 use crate::gray::Gray16;
 use crate::measure_fit::{self, FitRegion};
+use crate::settings::format_length;
 
 /// 画像 px 座標の点（小数可）。serde では `{"x": .., "y": ..}`。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -211,11 +212,7 @@ pub enum MeasureTool {
     },
     /// オフセット線。境界線を法線方向へずらした補助線（無限直線、紫）。
     /// `distance` は符号付き px。法線 = 境界線方向を +90° 回転した側が正。
-    Offset {
-        id: u64,
-        source: u64,
-        distance: f64,
-    },
+    Offset { id: u64, source: u64, distance: f64 },
 }
 
 impl MeasureTool {
@@ -230,7 +227,6 @@ impl MeasureTool {
     pub fn is_measurement(&self) -> bool {
         matches!(self, Self::Distance { .. })
     }
-
 }
 
 /// 測長コマンドのデータ全体。
@@ -270,7 +266,7 @@ impl Default for MeasureData {
             active_group: None,
             dist_fit1: FitSettings::default(),
             dist_fit2: FitSettings::default(),
-            link_fit: false,
+            link_fit: true,
             boundary_fit: FitSettings::default(),
             tools: Vec::new(),
             output_path: default_output_path(),
@@ -320,9 +316,7 @@ impl MeasureData {
     pub fn group_tools(&self, gid: u64) -> Vec<u64> {
         self.tools
             .iter()
-            .filter(|t| {
-                matches!(t, MeasureTool::Distance { group, .. } if *group == gid)
-            })
+            .filter(|t| matches!(t, MeasureTool::Distance { group, .. } if *group == gid))
             .map(|t| t.id())
             .collect()
     }
@@ -357,12 +351,7 @@ impl MeasureData {
         self.compute_impl(img, scale, false)
     }
 
-    fn compute_impl(
-        &self,
-        img: &Gray16,
-        scale: Option<Scale>,
-        fit: bool,
-    ) -> ComputedMeasure {
+    fn compute_impl(&self, img: &Gray16, scale: Option<Scale>, fit: bool) -> ComputedMeasure {
         let mut tools = Vec::new();
         for tool in &self.tools {
             if let Some(c) = self.compute_tool(tool, img, scale, fit) {
@@ -630,7 +619,8 @@ pub fn snap_angle_four(p1: Pt2, cursor: Pt2) -> Pt2 {
     if v.length() < 1e-9 {
         return cursor;
     }
-    let angle = (v.y.atan2(v.x) / std::f64::consts::FRAC_PI_2).round() * std::f64::consts::FRAC_PI_2;
+    let angle =
+        (v.y.atan2(v.x) / std::f64::consts::FRAC_PI_2).round() * std::f64::consts::FRAC_PI_2;
     let dir = Pt2::new(angle.cos(), angle.sin());
     let t = dir.x * v.x + dir.y * v.y;
     p1 + dir * t
@@ -647,14 +637,15 @@ pub fn next_group_name(groups: &[MeasureGroup]) -> String {
 }
 
 /// 測定値の表示。スケールがあれば実寸、なければ px。
-pub fn format_measurement(px: f64, scale: Option<Scale>) -> String {
+/// `digits` は小数点以下桁数（表示専用。保存には使わない）。
+pub fn format_measurement(px: f64, scale: Option<Scale>, digits: u8) -> String {
     match scale {
         Some(scale) => format!(
             "{} {}",
-            format_length(px * scale.per_px()),
+            format_length(px * scale.per_px(), digits),
             scale.unit.label()
         ),
-        None => format!("{} px", format_length(px)),
+        None => format!("{} px", format_length(px, digits)),
     }
 }
 
@@ -688,13 +679,7 @@ mod tests {
     fn snap_both_endpoints_even_same_line() {
         // 同一の水平線に両端点がスナップ: それぞれ射影位置に固定。
         let line = SnapLine::from_points(pt(0.0, 0.0), pt(100.0, 0.0));
-        let (p1, p2) = snap_distance(
-            pt(10.0, 2.0),
-            Some(&line),
-            pt(80.0, 3.0),
-            &[line],
-            10.0,
-        );
+        let (p1, p2) = snap_distance(pt(10.0, 2.0), Some(&line), pt(80.0, 3.0), &[line], 10.0);
         assert_eq!(p1, pt(10.0, 0.0));
         assert_eq!(p2, pt(80.0, 0.0));
     }
@@ -712,13 +697,7 @@ mod tests {
     fn snap_only_p1_follows_cursor_foot() {
         // 端点 1 がスナップ中でカーソルは線から離れた → 端点 1 が垂線の足へ追従。
         let line = SnapLine::from_points(pt(0.0, 0.0), pt(100.0, 0.0));
-        let (p1, p2) = snap_distance(
-            pt(10.0, 0.0),
-            Some(&line),
-            pt(70.0, 40.0),
-            &[line],
-            10.0,
-        );
+        let (p1, p2) = snap_distance(pt(10.0, 0.0), Some(&line), pt(70.0, 40.0), &[line], 10.0);
         assert_eq!(p1, pt(70.0, 0.0));
         assert_eq!(p2, pt(70.0, 40.0));
     }
@@ -728,10 +707,22 @@ mod tests {
         let origin = pt(50.0, 50.0);
         let close = |a: Pt2, b: Pt2| (a - b).length() < 1e-9;
         // 右・下・左・上の各方向（少しずらした入力）。
-        assert!(close(snap_angle_four(origin, pt(120.0, 58.0)), pt(120.0, 50.0)));
-        assert!(close(snap_angle_four(origin, pt(44.0, 130.0)), pt(50.0, 130.0)));
-        assert!(close(snap_angle_four(origin, pt(-20.0, 46.0)), pt(-20.0, 50.0)));
-        assert!(close(snap_angle_four(origin, pt(56.0, -30.0)), pt(50.0, -30.0)));
+        assert!(close(
+            snap_angle_four(origin, pt(120.0, 58.0)),
+            pt(120.0, 50.0)
+        ));
+        assert!(close(
+            snap_angle_four(origin, pt(44.0, 130.0)),
+            pt(50.0, 130.0)
+        ));
+        assert!(close(
+            snap_angle_four(origin, pt(-20.0, 46.0)),
+            pt(-20.0, 50.0)
+        ));
+        assert!(close(
+            snap_angle_four(origin, pt(56.0, -30.0)),
+            pt(50.0, -30.0)
+        ));
     }
 
     #[test]
@@ -889,8 +880,16 @@ mod tests {
         assert!((t.p2.x - 100.0).abs() < 1e-9, "{}", t.p2.x);
         assert!((t.length_px.unwrap() - 50.0).abs() < 1e-9);
         // 領域枠は中点を中心に表示される（フィット位置には追従しない）。
-        assert!((t.fit_regions[0].center.x - 75.0).abs() < 1e-9, "{}", t.fit_regions[0].center.x);
-        assert!((t.fit_regions[0].center.y - 31.0).abs() < 1e-9, "{}", t.fit_regions[0].center.y);
+        assert!(
+            (t.fit_regions[0].center.x - 75.0).abs() < 1e-9,
+            "{}",
+            t.fit_regions[0].center.x
+        );
+        assert!(
+            (t.fit_regions[0].center.y - 31.0).abs() < 1e-9,
+            "{}",
+            t.fit_regions[0].center.y
+        );
     }
 
     #[test]

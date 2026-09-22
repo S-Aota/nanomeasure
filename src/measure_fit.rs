@@ -421,7 +421,13 @@ mod tests {
     fn profile_extraction_averages_along_avg_axis() {
         // 垂直エッジ（x = 10）。fit_axis = x 方向、avg_axis = y 方向。
         let img = step_image(40, 40, 10.0, 0, 1000);
-        let region = region(Pt2::new(10.0, 20.0), Pt2::new(1.0, 0.0), 21, 11, FitMode::Gaussian);
+        let region = region(
+            Pt2::new(10.0, 20.0),
+            Pt2::new(1.0, 0.0),
+            21,
+            11,
+            FitMode::Gaussian,
+        );
         let profile = extract_profile(&img, &region);
         assert_eq!(profile.len(), 21);
         assert!(profile[0] < 1e-9);
@@ -431,9 +437,16 @@ mod tests {
     #[test]
     fn derivative_gaussian_finds_step_position() {
         let img = step_image(60, 60, 30.0, 200, 3000);
-        let region = region(Pt2::new(30.0, 30.0), Pt2::new(1.0, 0.0), 41, 15, FitMode::DerivativeGaussian);
+        let region = region(
+            Pt2::new(30.0, 30.0),
+            Pt2::new(1.0, 0.0),
+            41,
+            15,
+            FitMode::DerivativeGaussian,
+        );
         let profile = extract_profile(&img, &region);
-        let fit = fit_derivative_gaussian(&profile, FitSign::Any).expect("ステップがあるので成功する");
+        let fit =
+            fit_derivative_gaussian(&profile, FitSign::Any).expect("ステップがあるので成功する");
         // ステップは x=29 と x=30 の間なので、位置は 19.5 が正解。
         assert!((fit.mu - 19.5).abs() < 0.05, "{}", fit.mu);
         let pos = fit_endpoint(&img, &region).unwrap();
@@ -452,7 +465,13 @@ mod tests {
                 img.data[(y * w + x) as usize] = v.round() as u16;
             }
         }
-        let region = region(Pt2::new(40.0, 40.0), Pt2::new(1.0, 0.0), 31, 9, FitMode::Gaussian);
+        let region = region(
+            Pt2::new(40.0, 40.0),
+            Pt2::new(1.0, 0.0),
+            31,
+            9,
+            FitMode::Gaussian,
+        );
         let profile = extract_profile(&img, &region);
         let fit = fit_gaussian(&profile, FitSign::Any).expect("バンドがあるので成功する");
         assert!((fit.mu - 15.0).abs() < 0.1, "中心行 15: {}", fit.mu);
@@ -466,7 +485,13 @@ mod tests {
         for v in img.data.iter_mut() {
             *v = 500;
         }
-        let region = region(Pt2::new(15.0, 15.0), Pt2::new(1.0, 0.0), 21, 5, FitMode::Gaussian);
+        let region = region(
+            Pt2::new(15.0, 15.0),
+            Pt2::new(1.0, 0.0),
+            21,
+            5,
+            FitMode::Gaussian,
+        );
         let profile = extract_profile(&img, &region);
         assert!(fit_gaussian(&profile, FitSign::Any).is_none());
         assert!(fit_derivative_gaussian(&profile, FitSign::Any).is_none());
@@ -486,8 +511,20 @@ mod tests {
                 dark.data[(y * w + x) as usize] = (200.0 - 500.0 * g).round() as u16;
             }
         }
-        let bright_region = region(Pt2::new(40.0, 40.0), Pt2::new(1.0, 0.0), 31, 9, FitMode::Gaussian);
-        let dark_region = region(Pt2::new(40.0, 40.0), Pt2::new(1.0, 0.0), 31, 9, FitMode::Gaussian);
+        let bright_region = region(
+            Pt2::new(40.0, 40.0),
+            Pt2::new(1.0, 0.0),
+            31,
+            9,
+            FitMode::Gaussian,
+        );
+        let dark_region = region(
+            Pt2::new(40.0, 40.0),
+            Pt2::new(1.0, 0.0),
+            31,
+            9,
+            FitMode::Gaussian,
+        );
         let bp = extract_profile(&bright, &bright_region);
         let dp = extract_profile(&dark, &dark_region);
 
@@ -496,13 +533,19 @@ mod tests {
         let pos = fit_gaussian(&bp, FitSign::Positive).expect("明バンドに正フィット");
         assert!(pos.amplitude > 0.0);
         assert!((pos.mu - 15.0).abs() < 0.1);
-        assert!(fit_gaussian(&bp, FitSign::Negative).is_none(), "明バンドに負ピークは無い");
+        assert!(
+            fit_gaussian(&bp, FitSign::Negative).is_none(),
+            "明バンドに負ピークは無い"
+        );
 
         // 暗バンド: Negative は成功し振幅 < 0。Positive は失敗する。
         let neg = fit_gaussian(&dp, FitSign::Negative).expect("暗バンドに負フィット");
         assert!(neg.amplitude < 0.0);
         assert!((neg.mu - 15.0).abs() < 0.1);
-        assert!(fit_gaussian(&dp, FitSign::Positive).is_none(), "暗バンドに正ピークは無い");
+        assert!(
+            fit_gaussian(&dp, FitSign::Positive).is_none(),
+            "暗バンドに正ピークは無い"
+        );
     }
 
     /// region 経由でも符号制約が効くこと（UI 設定 → FitRegion → fit_profile
@@ -523,11 +566,25 @@ mod tests {
             width_px: 9,
             length_px: 31,
         };
-        let pos = FitRegion::new(Pt2::new(40.0, 40.0), Pt2::new(1.0, 0.0), settings(FitSign::Positive));
-        let neg = FitRegion::new(Pt2::new(40.0, 40.0), Pt2::new(1.0, 0.0), settings(FitSign::Negative));
+        let pos = FitRegion::new(
+            Pt2::new(40.0, 40.0),
+            Pt2::new(1.0, 0.0),
+            settings(FitSign::Positive),
+        );
+        let neg = FitRegion::new(
+            Pt2::new(40.0, 40.0),
+            Pt2::new(1.0, 0.0),
+            settings(FitSign::Negative),
+        );
         let (_, fit) = fit_profile(&img, &pos);
-        assert!(fit.is_some_and(|f| f.amplitude > 0.0), "明バンドに正フィット");
-        assert!(fit_profile(&img, &neg).1.is_none(), "明バンドに負ピークは無い");
+        assert!(
+            fit.is_some_and(|f| f.amplitude > 0.0),
+            "明バンドに正フィット"
+        );
+        assert!(
+            fit_profile(&img, &neg).1.is_none(),
+            "明バンドに負ピークは無い"
+        );
     }
 
     /// 符号固定微分ガウシアン: 上がるステップには正のみがフィットし、
@@ -536,7 +593,13 @@ mod tests {
     fn sign_constrained_derivative_picks_matching_step() {
         let rising = step_image(60, 60, 30.0, 200, 3000);
         let falling = step_image(60, 60, 30.0, 3000, 200);
-        let region = region(Pt2::new(30.0, 30.0), Pt2::new(1.0, 0.0), 41, 15, FitMode::DerivativeGaussian);
+        let region = region(
+            Pt2::new(30.0, 30.0),
+            Pt2::new(1.0, 0.0),
+            41,
+            15,
+            FitMode::DerivativeGaussian,
+        );
         let rp = extract_profile(&rising, &region);
         let fp = extract_profile(&falling, &region);
 
@@ -579,7 +642,13 @@ mod tests {
             height: 20,
             data: vec![700; 400],
         };
-        let region = region(Pt2::new(-5.0, -5.0), Pt2::new(1.0, 0.0), 11, 5, FitMode::Gaussian);
+        let region = region(
+            Pt2::new(-5.0, -5.0),
+            Pt2::new(1.0, 0.0),
+            11,
+            5,
+            FitMode::Gaussian,
+        );
         let profile = extract_profile(&img, &region);
         assert!(profile.iter().all(|&v| (v - 700.0).abs() < 1e-9));
     }
