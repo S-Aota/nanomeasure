@@ -1172,6 +1172,11 @@ pub fn save_measure_json(doc: &Document, index: usize) -> Result<Option<PathBuf>
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "image".to_owned());
     let computed = data.compute(&frame.image, frame.scale);
+    // 単位は JSON 先頭の unit にまとめ、各測定値からは落とす。
+    let unit = frame
+        .scale
+        .map(|s| s.unit.label().to_owned())
+        .unwrap_or_else(|| "px".to_owned());
     let groups: Vec<serde_json::Value> = data
         .groups
         .iter()
@@ -1180,16 +1185,18 @@ pub fn save_measure_json(doc: &Document, index: usize) -> Result<Option<PathBuf>
                 .group_tools(g.id)
                 .iter()
                 .filter_map(|tid| {
-                    computed
-                        .by_id(*tid)
-                        .and_then(|t| t.length_px)
-                        .map(|l| format_measurement(l, frame.scale))
+                    computed.by_id(*tid).and_then(|t| t.length_px).map(|l| {
+                        frame
+                            .scale
+                            .map(|s| format_length(l * s.per_px()))
+                            .unwrap_or_else(|| format_length(l))
+                    })
                 })
                 .collect();
             serde_json::json!({ "name": g.name, "values": values })
         })
         .collect();
-    let json = serde_json::json!({ "filename": filename, "groups": groups });
+    let json = serde_json::json!({ "filename": filename, "unit": unit, "groups": groups });
     std::fs::write(
         &path,
         serde_json::to_string_pretty(&json).map_err(|e| e.to_string())?,
@@ -2985,7 +2992,13 @@ mod tests {
             "先頭にファイル名: {text}"
         );
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["unit"], "px", "スケール未設定は px");
         assert_eq!(v["groups"][0]["values"].as_array().unwrap().len(), 3);
+        let first = v["groups"][0]["values"][0].as_str().unwrap();
+        assert!(
+            !first.contains("px") && !first.contains("nm"),
+            "測定値に単位が付いていない: {first}"
+        );
 
         // 出力先が空なら保存しない。
         let mut empty = MeasureData::default();
