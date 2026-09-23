@@ -68,11 +68,11 @@ impl Language {
 
 impl Default for Language {
     fn default() -> Self {
-        Language::Ja
+        Language::En
     }
 }
 
-/// 保存ファイルを手で書き換えられても既定値に戻せるよう、未知の値は Ja にする。
+/// 保存ファイルを手で書き換えられても既定値に戻せるよう、未知の値は En にする。
 impl<'de> Deserialize<'de> for Language {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where

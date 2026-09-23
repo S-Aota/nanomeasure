@@ -674,7 +674,8 @@ impl TemApp {
         let mut help_open = self.help_open;
         egui::Window::new(t!("help.title").as_ref())
             .open(&mut help_open)
-            .resizable(false)
+            .resizable(true)
+            .default_width(700.0)
             .show(ctx, |ui| {
                 ui.label(t!("help.drag_drop").as_ref());
                 ui.label(t!("help.zoom").as_ref());
