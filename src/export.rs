@@ -9,7 +9,7 @@
 //! 2 通り。描画コードは `AnnotationPixel` で共通化している。
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 use ab_glyph::{FontArc, FontVec, PxScale};
 use egui::Color32;
@@ -75,7 +75,7 @@ impl AnnotationPixel for Rgb<u8> {
 /// `digits` はラベルの小数点以下桁数（表示設定）。
 pub fn render(
     img: &Gray16,
-    overlays: &[(ComputedMeasure, Option<Scale>)],
+    overlays: &[(&ComputedMeasure, Option<Scale>)],
     annotation_scale: f32,
     digits: u8,
 ) -> ImageBuffer<Luma<u16>, Vec<u16>> {
@@ -88,7 +88,7 @@ pub fn render(
 /// 下地は 16bit グレーの上位 8bit をそのまま使う。
 pub fn render_rgb(
     img: &Gray16,
-    overlays: &[(ComputedMeasure, Option<Scale>)],
+    overlays: &[(&ComputedMeasure, Option<Scale>)],
     annotation_scale: f32,
     digits: u8,
 ) -> ImageBuffer<Rgb<u8>, Vec<u8>> {
@@ -102,15 +102,13 @@ pub fn render_rgb(
 
 /// 書き出した 16bit グレースケール画像を保存する。
 /// jpg / jpeg は 8bit に落とす（JPEG は 16bit 非対応）。
-pub fn save(buf: &ImageBuffer<Luma<u16>, Vec<u16>>, path: &Path) -> Result<(), String> {
+pub fn save(buf: ImageBuffer<Luma<u16>, Vec<u16>>, path: &Path) -> Result<(), String> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or_default();
     let result = if ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("jpeg") {
-        image::DynamicImage::ImageLuma16(buf.clone())
-            .to_rgb8()
-            .save(path)
+        image::DynamicImage::ImageLuma16(buf).to_rgb8().save(path)
     } else {
         buf.save(path)
     };
@@ -121,6 +119,60 @@ pub fn save(buf: &ImageBuffer<Luma<u16>, Vec<u16>>, path: &Path) -> Result<(), S
 pub fn save_rgb(buf: &ImageBuffer<Rgb<u8>, Vec<u8>>, path: &Path) -> Result<(), String> {
     buf.save(path)
         .map_err(|e| format!("{} に保存できません: {e}", path.to_string_lossy()))
+}
+
+/// 画像出力コマンドを実行する。`index` は画像出力コマンドの位置。
+/// アノテーションは、画面上に重ねて表示しているのと同じ測長オーバーレイ
+/// （`skip` は測長モードで編集中の未確定コマンド）。出力先テンプレートが
+/// 空のときは保存しない（Ok(None)）。戻り値は実際に保存したパス。
+pub fn save_image_export(
+    doc: &Document,
+    index: usize,
+    skip: Option<usize>,
+    digits: u8,
+) -> Result<Option<PathBuf>, String> {
+    let Some(Command::ExportImage {
+        output,
+        annotation_scale,
+        color,
+    }) = doc.commands.get(index).map(|c| &c.command)
+    else {
+        return Err("画像出力コマンドではありません".to_owned());
+    };
+    let template = output.trim();
+    if template.is_empty() {
+        return Ok(None);
+    }
+    let img_path = doc
+        .image_path_at(index)
+        .ok_or_else(|| "画像がありません（画像を挿入してから保存してください）".to_owned())?;
+    let Some(frame) = doc.input_to(index) else {
+        return Err("結果がまだ計算されていません".to_owned());
+    };
+    let path = resolve_output_path(template, img_path);
+    if !validate_extension(&path) {
+        return Err(format!(
+            "{} は対応していない拡張子です（tif / png / jpg）",
+            path.to_string_lossy()
+        ));
+    }
+    let measures = doc.measure_overlays(&frame.image, skip);
+    let overlays: Vec<(&ComputedMeasure, Option<Scale>)> = measures
+        .iter()
+        .map(|m| (m.computed.as_ref(), m.scale))
+        .collect();
+    if *color {
+        save_rgb(
+            &render_rgb(&frame.image, &overlays, *annotation_scale, digits),
+            &path,
+        )?;
+    } else {
+        save(
+            render(&frame.image, &overlays, *annotation_scale, digits),
+            &path,
+        )?;
+    }
+    Ok(Some(path))
 }
 
 /// 測定結果をまとめて JSON で保存する。`index` は結果出力コマンドの位置。
@@ -160,20 +212,8 @@ pub fn save_result_json(doc: &Document, index: usize) -> Result<Option<PathBuf>,
         .map(|s| s.unit.label().to_owned())
         .unwrap_or_else(|| "px".to_owned());
     let mut groups: Vec<serde_json::Value> = Vec::new();
-    for j in 0..doc.commands.len() {
-        let Some(item) = doc.commands.get(j) else {
-            continue;
-        };
-        let Command::Measure { data } = &item.command else {
-            continue;
-        };
-        let Some(fj) = doc.input_to(j) else {
-            continue;
-        };
-        if !Arc::ptr_eq(&fj.image, &frame.image) {
-            continue;
-        }
-        let computed = data.compute(&fj.image, fj.scale);
+    for overlay in doc.measure_overlays(&frame.image, None) {
+        let (data, computed) = (overlay.data, &overlay.computed);
         for g in &data.groups {
             // 表示用の丸めはせず、元の精度の数値のまま保存する。
             let values: Vec<f64> = data
@@ -183,7 +223,7 @@ pub fn save_result_json(doc: &Document, index: usize) -> Result<Option<PathBuf>,
                     computed
                         .by_id(*tid)
                         .and_then(|t| t.length_px)
-                        .map(|l| fj.scale.map(|s| l * s.per_px()).unwrap_or(l))
+                        .map(|l| overlay.scale.map(|s| l * s.per_px()).unwrap_or(l))
                 })
                 .collect();
             groups.push(serde_json::json!({ "name": g.name, "values": values }));
@@ -222,7 +262,7 @@ pub(crate) fn resolve_output_path(template: &str, img_path: &Path) -> PathBuf {
 fn draw_overlays<P>(
     img: &mut ImageBuffer<P, Vec<P::Subpixel>>,
     src: &Gray16,
-    overlays: &[(ComputedMeasure, Option<Scale>)],
+    overlays: &[(&ComputedMeasure, Option<Scale>)],
     annotation_scale: f32,
     digits: u8,
 ) where
@@ -529,7 +569,7 @@ mod tests {
         };
         let computed = computed_with_tool(tool, &data);
         let img = Gray16::black(200, 200);
-        let out = render(&img, &[(computed, None)], 1.0, 5);
+        let out = render(&img, &[(&computed, None)], 1.0, 5);
         let line = gray_of_line(COLOR_DISTANCE);
         assert_eq!(out.get_pixel(60, 100).0[0], line, "ラベル外の線上の点");
         assert_eq!(out.get_pixel(100, 0).0[0], 0, "線から離れた画素は元のまま");
@@ -550,7 +590,7 @@ mod tests {
             fit2: Default::default(),
         });
         let computed = data.compute(&img, None);
-        let out = render(&img, &[(computed, None)], 1.0, 5);
+        let out = render(&img, &[(&computed, None)], 1.0, 5);
         let line = gray_of_line(COLOR_DISTANCE);
         // 端点 2 の矢印: tip=(300,200)、dir=(1,0)（線の内側向き）。
         // tip - rotate(dir, ±25°)*9 で羽は左側・上下に開く:
@@ -587,7 +627,7 @@ mod tests {
         };
         let computed = computed_with_tool(tool, &data);
         let img = Gray16::black(200, 200);
-        let out = render_rgb(&img, &[(computed, None)], 1.0, 5);
+        let out = render_rgb(&img, &[(&computed, None)], 1.0, 5);
         assert_eq!(
             out.get_pixel(60, 100).0,
             [235, 70, 70],
@@ -636,13 +676,13 @@ mod tests {
             distance: 12.0,
         });
         let computed = data.compute(&img, None);
-        let out = render(&img, &[(computed.clone(), None)], 1.5, 5);
+        let out = render(&img, &[(&computed, None)], 1.5, 5);
 
         let dir = std::env::temp_dir().join(format!("tem_measure_smoke_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         for (name, tolerance) in [("out.tif", 32i32), ("out.png", 32), ("out.jpg", 5000)] {
             let path = dir.join(name);
-            save(&out, &path).expect("保存できる");
+            save(out.clone(), &path).expect("保存できる");
             let read = image::open(&path).expect("保存したファイルが読める");
             assert_eq!((read.width(), read.height()), (img.width, img.height));
             // 測長線の中点はアノテーション色になっている（jpg は非可逆なので許容を広く）。
@@ -655,7 +695,7 @@ mod tests {
             );
         }
         // RGB 版: png に保存して赤チャンネルが残ること。
-        let rgb = render_rgb(&img, &[(computed, None)], 1.5, 5);
+        let rgb = render_rgb(&img, &[(&computed, None)], 1.5, 5);
         let rgb_path = dir.join("out_rgb.png");
         save_rgb(&rgb, &rgb_path).expect("RGB 保存できる");
         let read = image::open(&rgb_path).expect("RGB が読める");

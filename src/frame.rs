@@ -24,6 +24,14 @@ impl Frame {
         Self { image, scale: None }
     }
 
+    /// スケールはそのままに、画像を `f` で変換した組を返す（前処理コマンド用）。
+    pub fn map_image(&self, f: impl FnOnce(&Gray16) -> Gray16) -> Self {
+        Self {
+            image: Arc::new(f(&self.image)),
+            scale: self.scale,
+        }
+    }
+
     /// 画像はそのままに、スケールだけ差し替えた組を返す。
     pub fn with_scale(&self, scale: Scale) -> Self {
         Self {

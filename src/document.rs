@@ -1,5 +1,6 @@
 //! タブ 1 枚分の状態。コマンド履歴・中間結果・表示状態を画像単位で持つ。
 
+use std::cell::OnceCell;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -7,9 +8,61 @@ use std::sync::Arc;
 use crate::command::{Command, CommandCategory, CommandItem};
 use crate::frame::{Frame, Scale};
 use crate::gray::Gray16;
+use crate::measure::{ComputedMeasure, MeasureData};
 use crate::view::ImageView;
 
 pub type SourceCache = HashMap<PathBuf, Arc<Gray16>>;
+
+/// どのタブからも参照されなくなったデコード済み画像を捨てる。
+/// 画像は各タブの段（stages）が `Arc` で握っているので、参照が
+/// キャッシュ自身だけになったものが不要な画像。
+pub fn prune_source_cache(cache: &mut SourceCache) {
+    cache.retain(|_, img| Arc::strong_count(img) > 1);
+}
+
+/// 1 コマンドを適用し終えた結果。
+#[derive(Clone)]
+struct Stage {
+    frame: Frame,
+    /// 有効な測長コマンドの段だけが持つ、再計算時点の測長データと計算結果。
+    measure: Option<MeasureStage>,
+}
+
+#[derive(Clone)]
+struct MeasureStage {
+    data: MeasureData,
+    /// フィッティング込みの計算結果。初めて参照されたときに一度だけ計算する
+    /// （測長モードで編集中のコマンドは参照されないので、ドラッグ中に
+    /// 毎フレームフィットし直すことはない）。
+    computed: OnceCell<Arc<ComputedMeasure>>,
+}
+
+impl MeasureStage {
+    /// 前回の段と測長データ・入力画像・スケールが同じなら計算結果を引き継ぎ、
+    /// 変わっていれば未計算の段を作る。
+    fn reuse_or_new(previous: Option<&Stage>, data: &MeasureData, frame: &Frame) -> Self {
+        if let Some(prev) = previous
+            && let Some(m) = &prev.measure
+            && m.data == *data
+            && Arc::ptr_eq(&prev.frame.image, &frame.image)
+            && prev.frame.scale == frame.scale
+        {
+            return m.clone();
+        }
+        Self {
+            data: data.clone(),
+            computed: OnceCell::new(),
+        }
+    }
+}
+
+/// 画像に重ねる 1 コマンド分の測長結果。
+pub struct MeasureOverlay<'a> {
+    /// 再計算時点の測長データ（グループ名・並び順の参照用）。
+    pub data: &'a MeasureData,
+    pub computed: Arc<ComputedMeasure>,
+    pub scale: Option<Scale>,
+}
 
 /// カテゴリごとのコマンド列。処理はカテゴリ順（入力 → 前処理 → 解析 → 出力）
 /// に実行され、追加したコマンドはそれぞれのカテゴリの末尾に入る。
@@ -112,7 +165,7 @@ pub struct Document {
     pub commands: CommandLists,
     /// `stages[i]` = グローバル添字 i のコマンドを適用し終えた結果。
     /// 無効な行は直前の結果をそのまま持つ。
-    stages: Vec<Option<Frame>>,
+    stages: Vec<Option<Stage>>,
     /// 再計算が必要な最小のコマンド添字。
     dirty_from: Option<usize>,
     pub error: Option<String>,
@@ -149,7 +202,10 @@ impl Document {
 
     /// パイプラインの最終結果。
     pub fn result(&self) -> Option<&Frame> {
-        self.stages.iter().rev().find_map(|s| s.as_ref())
+        self.stages
+            .iter()
+            .rev()
+            .find_map(|s| s.as_ref().map(|s| &s.frame))
     }
 
     pub fn image(&self) -> Option<&Arc<Gray16>> {
@@ -166,7 +222,39 @@ impl Document {
         self.stages[..index.min(self.stages.len())]
             .iter()
             .rev()
-            .find_map(|s| s.as_ref())
+            .find_map(|s| s.as_ref().map(|s| &s.frame))
+    }
+
+    /// `image` を入力とする測長コマンドの結果を処理順に集める（画面の
+    /// オーバーレイ・画像出力・結果出力で共通）。対象は最後の再計算で
+    /// 有効だった測長コマンドだけ。`skip` の添字（測長モードで編集中の
+    /// コマンド）は編集セッション側が描くので除く。
+    pub fn measure_overlays(
+        &self,
+        image: &Arc<Gray16>,
+        skip: Option<usize>,
+    ) -> Vec<MeasureOverlay<'_>> {
+        self.stages
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| Some(i) != skip)
+            .filter_map(|(_, stage)| {
+                let stage = stage.as_ref()?;
+                let m = stage.measure.as_ref()?;
+                if !Arc::ptr_eq(&stage.frame.image, image) {
+                    return None;
+                }
+                let computed = m
+                    .computed
+                    .get_or_init(|| Arc::new(m.data.compute(&stage.frame.image, stage.frame.scale)))
+                    .clone();
+                Some(MeasureOverlay {
+                    data: &m.data,
+                    computed,
+                    scale: stage.frame.scale,
+                })
+            })
+            .collect()
     }
 
     /// コマンドをそのカテゴリの末尾へ追加する。グローバル添字を返す。
@@ -245,12 +333,14 @@ impl Document {
 
     /// `index` のコマンドまでで直近の画像挿入コマンドのパス。
     pub fn image_path_at(&self, index: usize) -> Option<&Path> {
-        (0..=index)
-            .rev()
-            .find_map(|j| match &self.commands.get(j).map(|c| &c.command) {
-                Some(Command::InsertImage { path }) => Some(path.as_path()),
+        self.commands
+            .iter()
+            .take(index + 1)
+            .filter_map(|c| match &c.command {
+                Command::InsertImage { path } => Some(path.as_path()),
                 _ => None,
             })
+            .last()
     }
 
     // ------------------------------------------------------------ 選択
@@ -344,11 +434,7 @@ impl Document {
         // ため、再計算前後の結果画像を比較して世代を進めるか決める。
         let before = self.result_image_ptr();
         self.error = None;
-        let mut current: Option<Frame> = if start == 0 {
-            None
-        } else {
-            self.stages[..start].iter().rev().find_map(|s| s.clone())
-        };
+        let mut current: Option<Frame> = self.input_to(start).cloned();
 
         for i in start..self.commands.len() {
             let item = self
@@ -357,13 +443,24 @@ impl Document {
                 .expect("コマンド数はループ開始時に確定");
             if !item.enabled {
                 // 無効な行は素通し。直前の結果をそのまま次段へ渡す。
-                self.stages[i] = current.clone();
+                self.stages[i] = current.clone().map(|frame| Stage {
+                    frame,
+                    measure: None,
+                });
                 continue;
             }
             match item.command.apply(current.as_ref(), cache) {
-                Ok(out) => {
-                    current = Some(out.clone());
-                    self.stages[i] = Some(out);
+                Ok(frame) => {
+                    let measure = match &item.command {
+                        Command::Measure { data } => Some(MeasureStage::reuse_or_new(
+                            self.stages[i].as_ref(),
+                            data,
+                            &frame,
+                        )),
+                        _ => None,
+                    };
+                    current = Some(frame.clone());
+                    self.stages[i] = Some(Stage { frame, measure });
                 }
                 Err(e) => {
                     self.error = Some(format!(

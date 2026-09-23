@@ -3918,6 +3918,7 @@ dependencies = [
  "egui_extras",
  "image",
  "imageproc",
+ "rayon",
  "rfd",
  "serde",
  "serde_json",

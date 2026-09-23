@@ -337,8 +337,7 @@ impl MeasureData {
     }
 
     /// スナップ対象の無限直線（境界線の延長とオフセット線の計算結果）。
-    pub fn snap_lines(&self, img: &Gray16, scale: Option<Scale>) -> Vec<SnapLine> {
-        let computed = self.compute(img, scale);
+    pub fn snap_lines_from(&self, computed: &ComputedMeasure) -> Vec<SnapLine> {
         let mut lines = Vec::new();
         for t in &computed.tools {
             match self.tool_by_id(t.id) {
@@ -355,8 +354,8 @@ impl MeasureData {
         self.tools.iter().find(|t| t.id() == id)
     }
 
-    /// フィッティング結果と測定値を再計算する。オーバーレイ描画と
-    /// 結果リストの両方がこれを呼ぶ（毎フレーム再計算・キャッシュなし）。
+    /// フィッティング結果と測定値を計算する。呼び出し側がキャッシュする
+    /// （確定済みの測長は Document の段、編集中は MeasureMode のセッション）。
     pub fn compute(&self, img: &Gray16, scale: Option<Scale>) -> ComputedMeasure {
         self.compute_impl(img, scale, true)
     }

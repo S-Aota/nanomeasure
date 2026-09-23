@@ -238,8 +238,7 @@ impl ImageView {
             return;
         }
 
-        let reduced = img.downsample_box(ideal);
-        let color = reduced.to_color_image(range.0, range.1);
+        let color = img.to_display_image(ideal, range.0, range.1);
         let options = TextureOptions {
             magnification: egui::TextureFilter::Nearest,
             minification: egui::TextureFilter::Linear,

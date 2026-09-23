@@ -2,8 +2,12 @@
 //!
 //! アプリ内の画像は常にこの型で持ち回す。8bit 画像は読み込み時に 16bit へ
 //! 拡張し、8bit へ落とすのは画面表示用テクスチャを作るときだけ。
+//!
+//! 画素処理は行単位で rayon により並列化する。各行の計算順序は逐次版と
+//! 同じなので、結果はスレッド数によらず一致する。
 
-use egui::ColorImage;
+use egui::{Color32, ColorImage};
+use rayon::prelude::*;
 
 #[derive(Clone)]
 pub struct Gray16 {
@@ -43,28 +47,45 @@ impl Gray16 {
     }
 
     pub fn min_max(&self) -> (u16, u16) {
-        let mut lo = u16::MAX;
-        let mut hi = u16::MIN;
-        for &v in &self.data {
-            lo = lo.min(v);
-            hi = hi.max(v);
-        }
         if self.data.is_empty() {
-            (0, u16::MAX)
-        } else {
-            (lo, hi)
+            return (0, u16::MAX);
         }
+        self.data
+            .par_iter()
+            .fold(
+                || (u16::MAX, u16::MIN),
+                |(lo, hi), &v| (lo.min(v), hi.max(v)),
+            )
+            .reduce(
+                || (u16::MAX, u16::MIN),
+                |(a, b), (c, d)| (a.min(c), b.max(d)),
+            )
     }
 
     /// `bins` 個のビンに均等分割した輝度ヒストグラム。
     pub fn histogram(&self, bins: usize) -> Vec<u32> {
-        let mut h = vec![0u32; bins];
         let scale = bins as f32 / 65536.0;
-        for &v in &self.data {
-            let b = ((v as f32 * scale) as usize).min(bins - 1);
-            h[b] += 1;
-        }
-        h
+        // 大きめの塊ごとに部分ヒストグラムを作って足し合わせる
+        // （塊が小さいとビン配列の確保と合算が勝ってしまう）。
+        self.data
+            .par_chunks(1 << 18)
+            .map(|chunk| {
+                let mut h = vec![0u32; bins];
+                for &v in chunk {
+                    let b = ((v as f32 * scale) as usize).min(bins - 1);
+                    h[b] += 1;
+                }
+                h
+            })
+            .reduce(
+                || vec![0u32; bins],
+                |mut a, b| {
+                    for (x, y) in a.iter_mut().zip(b) {
+                        *x += y;
+                    }
+                    a
+                },
+            )
     }
 
     /// 累積ヒストグラムから下側/上側 `frac` を切り捨てた輝度を返す（オートレベル用）。
@@ -109,16 +130,19 @@ impl Gray16 {
         let cy = (h as f32 - 1.0) * 0.5;
 
         let mut out = Self::black(w, h);
-        for y in 0..h {
-            let dy = y as f32 - cy;
-            for x in 0..w {
-                let dx = x as f32 - cx;
-                // 出力→入力の逆写像なので -theta の回転行列を掛ける。
-                let sx = cx + cos * dx + sin * dy;
-                let sy = cy - sin * dx + cos * dy;
-                out.data[(y as usize) * (w as usize) + x as usize] = self.sample_bilinear(sx, sy);
-            }
-        }
+        out.data
+            .par_chunks_mut(w as usize)
+            .enumerate()
+            .for_each(|(y, row)| {
+                let dy = y as f32 - cy;
+                for (x, o) in row.iter_mut().enumerate() {
+                    let dx = x as f32 - cx;
+                    // 出力→入力の逆写像なので -theta の回転行列を掛ける。
+                    let sx = cx + cos * dx + sin * dy;
+                    let sy = cy - sin * dx + cos * dy;
+                    *o = self.sample_bilinear(sx, sy);
+                }
+            });
         out
     }
 
@@ -176,40 +200,32 @@ impl Gray16 {
         if w == 0 || h == 0 {
             return self.clone();
         }
-        let sigma = sigma.max(0.1);
-        let radius = ((sigma * 3.0).ceil() as usize).max(1);
-        let kernel: Vec<f32> = (0..=2 * radius)
-            .map(|i| {
-                let d = i as f32 - radius as f32;
-                (-(d * d) / (2.0 * sigma * sigma)).exp()
-            })
-            .collect();
-        let sum: f32 = kernel.iter().sum();
-        let kernel: Vec<f32> = kernel.iter().map(|k| k / sum).collect();
+        let kernel = gaussian_kernel(sigma);
+        let radius = kernel.len() / 2;
 
         // 横 → 縦の順に畳み込む。端はクランプ（0 埋めだと縁が暗くなるため）。
         let mut tmp = vec![0f32; w * h];
-        for y in 0..h {
-            for x in 0..w {
-                let mut acc = 0.0;
-                for (i, &k) in kernel.iter().enumerate() {
-                    let sx = (x + i).saturating_sub(radius).min(w - 1);
-                    acc += self.data[y * w + sx] as f32 * k;
-                }
-                tmp[y * w + x] = acc;
-            }
-        }
+        tmp.par_chunks_mut(w)
+            .zip(self.data.par_chunks(w))
+            .for_each(|(dst, src)| convolve_row(src, dst, &kernel));
+
+        // 縦方向は行単位で積算する（列方向に飛ぶアクセスを避ける）。
         let mut out = Self::black(self.width, self.height);
-        for y in 0..h {
-            for x in 0..w {
-                let mut acc = 0.0;
+        out.data.par_chunks_mut(w).enumerate().for_each_init(
+            || vec![0f32; w],
+            |acc, (y, row)| {
+                acc.fill(0.0);
                 for (i, &k) in kernel.iter().enumerate() {
                     let sy = (y + i).saturating_sub(radius).min(h - 1);
-                    acc += tmp[sy * w + x] * k;
+                    for (a, &v) in acc.iter_mut().zip(&tmp[sy * w..(sy + 1) * w]) {
+                        *a += v * k;
+                    }
                 }
-                out.data[y * w + x] = acc.round().clamp(0.0, 65535.0) as u16;
-            }
-        }
+                for (o, &a) in row.iter_mut().zip(acc.iter()) {
+                    *o = a.round().clamp(0.0, 65535.0) as u16;
+                }
+            },
+        );
         out
     }
 
@@ -223,40 +239,39 @@ impl Gray16 {
         }
         let r = radius as usize;
         let mut out = Self::black(self.width, self.height);
-        let mut window = Vec::with_capacity((2 * r + 1) * (2 * r + 1));
-        for y in 0..h {
-            let y0 = y.saturating_sub(r);
-            let y1 = (y + r).min(h - 1);
-            for x in 0..w {
-                let x0 = x.saturating_sub(r);
-                let x1 = (x + r).min(w - 1);
-                window.clear();
-                for j in y0..=y1 {
-                    for i in x0..=x1 {
-                        window.push(self.data[j * w + i]);
+        out.data.par_chunks_mut(w).enumerate().for_each_init(
+            || Vec::with_capacity((2 * r + 1) * (2 * r + 1)),
+            |window, (y, row)| {
+                let y0 = y.saturating_sub(r);
+                let y1 = (y + r).min(h - 1);
+                for (x, o) in row.iter_mut().enumerate() {
+                    let x0 = x.saturating_sub(r);
+                    let x1 = (x + r).min(w - 1);
+                    window.clear();
+                    for j in y0..=y1 {
+                        window.extend_from_slice(&self.data[j * w + x0..=j * w + x1]);
                     }
+                    let mid = window.len() / 2;
+                    window.select_nth_unstable(mid);
+                    *o = window[mid];
                 }
-                let mid = window.len() / 2;
-                window.select_nth_unstable(mid);
-                out.data[y * w + x] = window[mid];
-            }
-        }
+            },
+        );
         out
     }
 
     /// アンシャープマスク。`sigma` でぼかしたものとの差に `amount` を掛けて
     /// 元画像へ足し戻す（amount = 0 なら元のまま、1 が標準的な強さ）。
     pub fn unsharp_mask(&self, sigma: f32, amount: f32) -> Self {
-        let blurred = self.gaussian_blur(sigma);
-        let mut out = Self::black(self.width, self.height);
-        for (o, (&v, &b)) in out
-            .data
-            .iter_mut()
-            .zip(self.data.iter().zip(blurred.data.iter()))
-        {
-            let s = v as f32 + amount * (v as f32 - b as f32);
-            *o = s.round().clamp(0.0, 65535.0) as u16;
-        }
+        // ぼかした画像をそのまま出力先として上書きする（余分な確保をしない）。
+        let mut out = self.gaussian_blur(sigma);
+        out.data
+            .par_iter_mut()
+            .zip(self.data.par_iter())
+            .for_each(|(o, &v)| {
+                let s = v as f32 + amount * (v as f32 - *o as f32);
+                *o = s.round().clamp(0.0, 65535.0) as u16;
+            });
         out
     }
 
@@ -280,57 +295,125 @@ impl Gray16 {
         Self {
             width: self.width,
             height: self.height,
-            data: self.data.iter().map(|&v| lut[v as usize]).collect(),
+            data: self.data.par_iter().map(|&v| lut[v as usize]).collect(),
         }
     }
 
     /// factor x factor のブロック平均で縮小する（表示用ミップの生成）。
+    #[cfg(test)]
     pub fn downsample_box(&self, factor: u32) -> Self {
-        if factor <= 1 {
-            return self.clone();
+        let (width, height, data) = self.reduce_map(factor, |v| v);
+        Self {
+            width,
+            height,
+            data,
         }
-        let nw = (self.width / factor).max(1);
-        let nh = (self.height / factor).max(1);
-        let mut out = Self::black(nw, nh);
-        for y in 0..nh {
-            for x in 0..nw {
-                let mut sum = 0u64;
-                let mut n = 0u64;
-                for j in 0..factor {
-                    let sy = y * factor + j;
-                    if sy >= self.height {
-                        break;
-                    }
-                    for i in 0..factor {
-                        let sx = x * factor + i;
-                        if sx >= self.width {
-                            break;
-                        }
-                        sum += self.at(sx, sy) as u64;
-                        n += 1;
-                    }
-                }
-                out.data[(y as usize) * (nw as usize) + x as usize] =
-                    if n == 0 { 0 } else { (sum / n) as u16 };
-            }
-        }
-        out
     }
 
-    /// 表示レンジ `lo`..`hi` を 0..255 に写して egui のテクスチャ元画像を作る。
-    pub fn to_color_image(&self, lo: u16, hi: u16) -> ColorImage {
-        let (lo, hi) = if hi > lo { (lo, hi) } else { (0, u16::MAX) };
-        let span = (hi - lo) as f32;
-        let bytes: Vec<u8> = self
-            .data
-            .iter()
-            .map(|&v| {
-                let t = ((v as f32 - lo as f32) / span).clamp(0.0, 1.0);
-                (t * 255.0).round() as u8
+    /// 表示用テクスチャの元画像を作る。`factor` x `factor` のブロック平均で
+    /// 縮小しつつ、表示レンジ `lo`..`hi` を 0..255 に写す。縮小画像を
+    /// 中間に作らず 1 パスで変換する（等倍でも元画像の複製を作らない）。
+    pub fn to_display_image(&self, factor: u32, lo: u16, hi: u16) -> ColorImage {
+        let lut = display_lut(lo, hi);
+        let (w, h, pixels) = self.reduce_map(factor, |v| Color32::from_gray(lut[v as usize]));
+        ColorImage::new([w as usize, h as usize], pixels)
+    }
+
+    /// ブロック平均で縮小し、各画素を `map` で変換した列を返す（行優先）。
+    fn reduce_map<T: Send>(
+        &self,
+        factor: u32,
+        map: impl Fn(u16) -> T + Sync,
+    ) -> (u32, u32, Vec<T>) {
+        if factor <= 1 {
+            return (
+                self.width,
+                self.height,
+                self.data.par_iter().map(|&v| map(v)).collect(),
+            );
+        }
+        let (w, h, f) = (self.width as usize, self.height as usize, factor as usize);
+        let nw = (w / f).max(1);
+        let nh = (h / f).max(1);
+        let data = (0..nh)
+            .into_par_iter()
+            .flat_map_iter(|y| {
+                let (y0, y1) = (y * f, ((y + 1) * f).min(h));
+                let map = &map;
+                (0..nw).map(move |x| {
+                    let (x0, x1) = (x * f, ((x + 1) * f).min(w));
+                    let sum: u64 = (y0..y1)
+                        .map(|sy| {
+                            self.data[sy * w + x0..sy * w + x1]
+                                .iter()
+                                .map(|&v| v as u64)
+                                .sum::<u64>()
+                        })
+                        .sum();
+                    let n = ((y1 - y0) * (x1 - x0)) as u64;
+                    map(if n == 0 { 0 } else { (sum / n) as u16 })
+                })
             })
             .collect();
-        ColorImage::from_gray([self.width as usize, self.height as usize], &bytes)
+        (nw as u32, nh as u32, data)
     }
+}
+
+/// 正規化したガウシアンカーネル（半径 3σ、最低 1）。
+fn gaussian_kernel(sigma: f32) -> Vec<f32> {
+    let sigma = sigma.max(0.1);
+    let radius = ((sigma * 3.0).ceil() as usize).max(1);
+    let kernel: Vec<f32> = (0..=2 * radius)
+        .map(|i| {
+            let d = i as f32 - radius as f32;
+            (-(d * d) / (2.0 * sigma * sigma)).exp()
+        })
+        .collect();
+    let sum: f32 = kernel.iter().sum();
+    kernel.iter().map(|k| k / sum).collect()
+}
+
+/// 1 行の横方向畳み込み。端はクランプ。縁だけ添字を丸め、内側は
+/// 窓をそのまま掛ける（タップ毎の範囲判定を省く）。
+fn convolve_row(src: &[u16], dst: &mut [f32], kernel: &[f32]) {
+    let w = src.len();
+    let r = kernel.len() / 2;
+    let clamped = |x: usize| -> f32 {
+        let mut acc = 0.0;
+        for (i, &k) in kernel.iter().enumerate() {
+            let sx = (x + i).saturating_sub(r).min(w - 1);
+            acc += src[sx] as f32 * k;
+        }
+        acc
+    };
+    if w <= 2 * r {
+        for (x, d) in dst.iter_mut().enumerate() {
+            *d = clamped(x);
+        }
+        return;
+    }
+    for x in (0..r).chain(w - r..w) {
+        dst[x] = clamped(x);
+    }
+    for x in r..w - r {
+        let mut acc = 0.0;
+        for (&v, &k) in src[x - r..=x + r].iter().zip(kernel) {
+            acc += v as f32 * k;
+        }
+        dst[x] = acc;
+    }
+}
+
+/// 表示レンジ `lo`..`hi` を 0..255 に写す 16bit → 8bit の変換表。
+fn display_lut(lo: u16, hi: u16) -> Vec<u8> {
+    let (lo, hi) = if hi > lo { (lo, hi) } else { (0, u16::MAX) };
+    let span = (hi - lo) as f32;
+    (0..=u16::MAX)
+        .map(|v| {
+            let t = ((v as f32 - lo as f32) / span).clamp(0.0, 1.0);
+            (t * 255.0).round() as u8
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -381,6 +464,62 @@ mod tests {
         assert_eq!(out.data[2], 32768, "中点は中間輝度");
         assert_eq!(out.data[3], u16::MAX);
         assert_eq!(out.data[4], u16::MAX, "上限より明るい画素は最大値");
+    }
+
+    /// 等倍の表示画像は LUT 変換だけで、縮小版はブロック平均を通すこと。
+    #[test]
+    fn display_image_maps_range_and_reduces() {
+        let img = Gray16 {
+            width: 2,
+            height: 2,
+            data: vec![0, 100, 200, 300],
+        };
+        let full = img.to_display_image(1, 0, 300);
+        assert_eq!(full.size, [2, 2]);
+        assert_eq!(full.pixels[3], Color32::from_gray(255));
+        assert_eq!(full.pixels[0], Color32::from_gray(0));
+        let half = img.to_display_image(2, 0, 300);
+        assert_eq!(half.size, [1, 1]);
+        // 平均 150 → 150/300*255 = 127.5 → 128
+        assert_eq!(half.pixels[0], Color32::from_gray(128));
+    }
+
+    /// 縁の丸めと内側の窓掛けが同じ結果になること（逐次の定義どおり）。
+    #[test]
+    fn gaussian_blur_matches_naive_definition() {
+        let mut img = Gray16::black(23, 5);
+        for (i, v) in img.data.iter_mut().enumerate() {
+            *v = ((i * 7919) % 65536) as u16;
+        }
+        let out = img.gaussian_blur(1.3);
+        let kernel = gaussian_kernel(1.3);
+        let r = kernel.len() / 2;
+        let (w, h) = (23usize, 5usize);
+        let mut tmp = vec![0f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                tmp[y * w + x] = kernel
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &k)| {
+                        img.data[y * w + (x + i).saturating_sub(r).min(w - 1)] as f32 * k
+                    })
+                    .fold(0.0, |a, b| a + b);
+            }
+        }
+        for y in 0..h {
+            for x in 0..w {
+                let acc = kernel
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &k)| tmp[(y + i).saturating_sub(r).min(h - 1) * w + x] * k)
+                    .fold(0.0, |a, b| a + b);
+                assert_eq!(
+                    out.at(x as u32, y as u32),
+                    acc.round().clamp(0.0, 65535.0) as u16
+                );
+            }
+        }
     }
 
     #[test]

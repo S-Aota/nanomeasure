@@ -124,10 +124,10 @@ pub enum Command {
     /// 前処理フィルタ（ぼかし・メディアン・アンシャープマスク）。
     Filter { filter: Filter },
     /// 測長。画像は変えず、ツール・グループ・フィッティング設定を保持する。
-    /// フィッティングと測定値は適用のたびに再計算される。
+    /// フィッティングと測定値は再計算のたびに（データか入力画像が変わったときだけ）計算し直す。
     Measure { data: MeasureData },
     /// アノテーション付き画像の書き出し。画像は変えず、出力先テンプレートと
-    /// アノテーション倍率を保持する。ファイル保存は適用のたびにアプリ側で行う。
+    /// アノテーション倍率を保持する。ファイル保存は「再計算」(F5) のときにアプリ側で行う。
     ExportImage {
         /// 出力先テンプレート。`{dir}` / `{filename}` は保存時に画像パスから解決。
         output: String,
@@ -140,7 +140,7 @@ pub enum Command {
         color: bool,
     },
     /// 測定結果 JSON の書き出し。画像は変えず、出力先テンプレートを保持する。
-    /// ファイル保存は適用のたびにアプリ側で行う（画像出力コマンドと同じ）。
+    /// ファイル保存は「再計算」(F5) のときにアプリ側で行う（画像出力コマンドと同じ）。
     ExportResult {
         /// 出力先テンプレート。`{dir}` / `{filename}` は保存時に画像パスから解決。
         output: String,
@@ -245,29 +245,15 @@ impl Command {
                 Ok(frame.with_scale(scale))
             }
             Self::Rotate { angle_deg } => {
-                let frame = require_input(input)?;
-                Ok(Frame {
-                    image: Arc::new(frame.image.rotate(*angle_deg)),
-                    scale: frame.scale,
-                })
+                Ok(require_input(input)?.map_image(|img| img.rotate(*angle_deg)))
             }
             Self::Levels { in_min, in_max } => {
-                let frame = require_input(input)?;
-                Ok(Frame {
-                    image: Arc::new(frame.image.apply_levels(*in_min, *in_max)),
-                    scale: frame.scale,
-                })
+                Ok(require_input(input)?.map_image(|img| img.apply_levels(*in_min, *in_max)))
             }
-            Self::Filter { filter } => {
-                let frame = require_input(input)?;
-                Ok(Frame {
-                    image: Arc::new(filter.apply(&frame.image)),
-                    scale: frame.scale,
-                })
-            }
+            Self::Filter { filter } => Ok(require_input(input)?.map_image(|img| filter.apply(img))),
             // 測長・画像出力・結果出力は画像を変えない素通しコマンド。
-            // オーバーレイと測定値はアプリ側で MeasureData::compute により
-            // 毎回再計算される。
+            // 測長の計算結果は Document の段に保持され、初めて参照された
+            // ときに一度だけ計算される。
             Self::Measure { .. } | Self::ExportImage { .. } | Self::ExportResult { .. } => {
                 Ok(require_input(input)?.clone())
             }

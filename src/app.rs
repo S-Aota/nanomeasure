@@ -4,12 +4,14 @@ use std::path::PathBuf;
 
 use egui::Ui;
 
-use crate::command::{Command, CommandCategory, CommandItem, Filter, HistoryFile, load_image};
+use crate::command::{
+    Command, CommandCategory, CommandItem, Filter, FilterKind, HistoryFile, load_image,
+};
 use crate::dialogs::{
     ExportDialog, ExportResultDialog, FilterDialog, LevelsDialog, RotateDialog, ScaleDialog,
     SettingsDialog,
 };
-use crate::document::{Document, SourceCache};
+use crate::document::{Document, SourceCache, prune_source_cache};
 use crate::measure_mode::MeasureMode;
 use crate::metadata;
 use crate::settings::{Settings, format_length};
@@ -29,7 +31,6 @@ enum Action {
     NewMeasure,
     NewExport,
     NewExportResult,
-    SaveImageExports,
     EditCommand(usize),
     ToggleCommand(usize),
     DeleteCommand(usize),
@@ -39,13 +40,13 @@ enum Action {
     CopyCommands,
     PasteCommands,
     Recompute,
-    SaveResultExports,
     ReloadSources,
     SaveHistory,
     OpenHistory,
     ApplyHistory,
     ExportImage,
     OpenSettings,
+    SwitchTab(usize),
     CloseTab(usize),
     Quit,
 }
@@ -213,22 +214,16 @@ impl TemApp {
                             ui.close();
                         }
                         ui.menu_button("フィルタ", |ui| {
-                            for (name, filter) in [
-                                ("ガウシアンぼかし...", Filter::GaussianBlur { sigma: 1.0 }),
-                                ("メディアン...", Filter::Median { radius: 1 }),
-                                (
-                                    "アンシャープマスク...",
-                                    Filter::UnsharpMask {
-                                        sigma: 2.0,
-                                        amount: 1.5,
-                                    },
-                                ),
+                            for (name, kind) in [
+                                ("ガウシアンぼかし...", FilterKind::GaussianBlur),
+                                ("メディアン...", FilterKind::Median),
+                                ("アンシャープマスク...", FilterKind::UnsharpMask),
                             ] {
                                 if ui
                                     .add_enabled(self.has_image(), egui::Button::new(name))
                                     .clicked()
                                 {
-                                    actions.push(Action::NewFilter(filter));
+                                    actions.push(Action::NewFilter(Filter::default_of(kind)));
                                     ui.close();
                                 }
                             }
@@ -330,8 +325,8 @@ impl TemApp {
                     for i in 0..self.docs.len() {
                         let selected = i == self.active;
                         let title = self.docs[i].title.clone();
-                        if ui.selectable_label(selected, title).clicked() {
-                            self.active = i;
+                        if ui.selectable_label(selected, title).clicked() && !selected {
+                            actions.push(Action::SwitchTab(i));
                         }
                         if ui
                             .add(egui::Button::new("×").small().frame(false))
@@ -635,8 +630,10 @@ impl TemApp {
                 ui.label("・貼り付けは各カテゴリのリスト末尾に追加されます。");
                 ui.label("・処理は 入力 → 前処理 → 解析 → 出力 のカテゴリ順に実行されます。追加した処理はそのカテゴリの末尾に入り、▲▼ でカテゴリ内の順序だけを入れ替えられます。");
                 ui.separator();
-                ui.label("・並べ替え・有効無効の切り替え・削除・貼り付けは、すぐには計算されません。「再計算」(F5) を押すまで表示は変わらず、その間ボタンが橙色になります。");
-                ui.label("・パラメータ調整ダイアログを開いている間だけは、結果をその場で見られるように自動で計算します。");
+                ui.label("・並べ替え・有効無効の切り替え・削除・貼り付けは、すぐには計算されません。「再計算」(F5) を押すまで表示（測長の結果を含む）は変わらず、その間ボタンが橙色になります。");
+                ui.label("・パラメータ調整ダイアログ・測長モードを開いている間は、結果をその場で見られるように自動で計算します。閉じたとき（キャンセル時は元の値に戻して）にも計算し直します。");
+                ui.label("・画像挿入の行をダブルクリックして読み込むファイルを変えると、すぐに計算し直します。");
+                ui.label("・画像出力・結果出力のファイル保存は「再計算」(F5) を押したときだけ行います（ダイアログの「決定」では保存しません）。");
                 ui.label("・ディスク上の画像が更新されたときは、コマンド → 元ファイルを読み直して再計算 を使ってください。");
                 ui.separator();
                 ui.label("・TIFF の FEI / Thermo Fisher タグ、または ImageJ の単位情報から画素の実寸法が読めた場合、画像挿入の直後に「スケール設定」コマンドが自動で追加されます。");
@@ -656,8 +653,8 @@ impl TemApp {
                 ui.label("・複製した測長は、設定の「複製」が「そのまま」なら複製元のグループへ、「グループを追加」なら測長ごとに新しいグループへ入ります。");
                 ui.label("・範囲選択の枠の中を Ctrl キーを押しながらドラッグすると、選択中の測長を複製します（設定の「複製」に従います）。");
                 ui.label("・削除: ツールの「削除」で、測長・補助線をクリックで削除、ドラッグで矩形内のものを一括削除します。");
-                ui.label("・画像出力: コマンド → 出力 → 画像出力... でアノテーション付き画像の保存先を設定します（tif / png / jpg）。決定または「再計算」(F5) で保存されます。");
-                ui.label("・結果出力: コマンド → 出力 → 結果出力... で測定結果 JSON の保存先を設定します。決定または「再計算」(F5) で保存されます。");
+                ui.label("・画像出力: コマンド → 出力 → 画像出力... でアノテーション付き画像の保存先を設定します（tif / png / jpg）。「再計算」(F5) で保存されます。");
+                ui.label("・結果出力: コマンド → 出力 → 結果出力... で測定結果 JSON の保存先を設定します。「再計算」(F5) で保存されます。");
                 ui.label("・右ドラッグでパン、ホイールでズームできます（測長モード中も同じ）。");
             });
         self.help_open = help_open;
@@ -719,7 +716,6 @@ impl TemApp {
                 self.close_dialogs();
                 self.export_result_dialog.open_new(&mut self.docs[index]);
             }
-            Action::SaveImageExports => self.save_image_exports(),
             Action::OpenSettings => self.settings_dialog.open = true,
             Action::EditCommand(i) => self.edit_command(i),
             Action::ToggleCommand(i) => self.doc_mut().invalidate_from(i),
@@ -751,13 +747,10 @@ impl TemApp {
                 } else {
                     "変更はありません。".to_owned()
                 };
-                // 測定結果の JSON 出力（結果出力コマンドが無ければ何もしない）。
-                self.save_result_exports();
-                // アノテーション付き画像の書き出し（画像出力コマンドがあれば）。
-                self.save_image_exports();
+                // ファイル出力は副作用なので、このボタン（F5）を押したときだけ行う。
+                self.run_exports();
                 ctx.request_repaint();
             }
-            Action::SaveResultExports => self.save_result_exports(),
             Action::ReloadSources => {
                 // 元ファイルを読み直したいときだけキャッシュを捨てる。
                 self.cache.clear();
@@ -771,12 +764,25 @@ impl TemApp {
             Action::OpenHistory => self.open_history(),
             Action::ApplyHistory => self.apply_history(),
             Action::ExportImage => self.export_image(),
+            Action::SwitchTab(i) => {
+                // ダイアログ・測長モードは開いたタブのコマンド添字を持つので、
+                // 切り替える前に（元のタブで）破棄して閉じる。
+                if self.dialog_open() {
+                    self.close_dialogs();
+                    self.status = "タブが切り替わったため、編集中の処理を破棄しました。".to_owned();
+                }
+                self.active = i.min(self.docs.len() - 1);
+            }
             Action::CloseTab(i) => self.close_tab(i),
             Action::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
         }
     }
 
+    /// 開いているダイアログ・測長モードを破棄して閉じる。プレビュー用に
+    /// 書き換えていた値は元に戻し、その状態で計算し直しておく（閉じた後は
+    /// 自動計算されないため、戻した値が表示に反映されないまま残らないように）。
     fn close_dialogs(&mut self) {
+        let was_open = self.dialog_open();
         self.scale_dialog.open = false;
         self.rotate_dialog.open = false;
         self.levels_dialog.open = false;
@@ -789,10 +795,21 @@ impl TemApp {
             let tab = self.measure_mode.tab;
             if tab < self.docs.len() {
                 self.measure_mode.revert(&mut self.docs[tab]);
+                // タブ切り替えで閉じる場合は、編集していたタブの方を戻す。
+                self.docs[tab].recompute(&mut self.cache);
             } else {
                 self.measure_mode.open = false;
             }
         }
+        if was_open {
+            self.docs[self.active].recompute(&mut self.cache);
+        }
+    }
+
+    /// 測長モードで編集中のコマンドの添字（`tab` のタブで編集中のときだけ）。
+    /// そのコマンドは編集セッション側が描くので、確定済みの描画・出力から除く。
+    fn measure_editing(&self, tab: usize) -> Option<usize> {
+        (self.measure_mode.open && self.measure_mode.tab == tab).then_some(self.measure_mode.index)
     }
 
     /// パラメータ調整中はプレビューのため、結果を先に進めておく必要がある。
@@ -870,6 +887,9 @@ impl TemApp {
                     }
                     doc.invalidate_from(index);
                     doc.view.request_fit();
+                    // ファイルの差し替えはすぐに表示へ反映する（出力は F5 のときだけ）。
+                    doc.recompute(&mut self.cache);
+                    prune_source_cache(&mut self.cache);
                 }
             }
         }
@@ -927,130 +947,43 @@ impl TemApp {
         }
         self.close_dialogs();
         self.docs.remove(index);
+        prune_source_cache(&mut self.cache);
         if self.docs.is_empty() {
             self.docs.push(Document::new("(空)"));
         }
         self.active = self.active.min(self.docs.len() - 1);
     }
 
-    /// アクティブタブの結果出力コマンドを実行する。出力先は各コマンドの
-    /// テンプレート（`{dir}` / `{filename}` は画像パスから解決）。
-    fn save_result_exports(&mut self) {
+    /// アクティブタブの出力コマンド（画像出力・結果出力）を処理順に実行する。
+    /// 出力先は各コマンドのテンプレート（`{dir}` / `{filename}` は画像パスから解決）。
+    fn run_exports(&mut self) {
         let doc = &self.docs[self.active];
+        let skip = self.measure_editing(self.active);
+        let digits = self.settings.length_digits;
         let mut saved = Vec::new();
-        let mut error = None;
-        for i in 0..doc.commands.len() {
-            let Some(item) = doc.commands.get(i) else {
-                continue;
+        for (i, item) in doc.commands.iter().enumerate() {
+            let result = match &item.command {
+                Command::ExportImage { .. } => {
+                    crate::export::save_image_export(doc, i, skip, digits)
+                }
+                Command::ExportResult { .. } => crate::export::save_result_json(doc, i),
+                _ => continue,
             };
-            if !matches!(&item.command, Command::ExportResult { .. }) {
-                continue;
-            }
-            match crate::export::save_result_json(doc, i) {
+            match result {
                 Ok(Some(path)) => saved.push(path),
                 Ok(None) => {}
                 Err(e) => {
-                    error = Some(e);
-                    break;
+                    self.error = Some(e);
+                    return;
                 }
             }
-        }
-        if let Some(e) = error {
-            self.error = Some(e);
-            return;
         }
         if saved.is_empty() {
             return;
         }
         self.error = None;
         let names: Vec<String> = saved.iter().map(|p| file_label(p)).collect();
-        self.status = format!("測定結果を保存しました: {}", names.join(", "));
-    }
-
-    /// アクティブタブの画像出力コマンドを実行する。出力先は各コマンドの
-    /// テンプレート（`{dir}` / `{filename}` は画像パスから解決）。
-    /// アノテーションは、画面上に重ねて表示しているのと同じ測長オーバーレイ。
-    fn save_image_exports(&mut self) {
-        let doc = &self.docs[self.active];
-        let mut saved = Vec::new();
-        let mut error = None;
-        for i in 0..doc.commands.len() {
-            let Some(item) = doc.commands.get(i) else {
-                continue;
-            };
-            let Command::ExportImage {
-                output,
-                annotation_scale,
-                color,
-            } = &item.command
-            else {
-                continue;
-            };
-            let template = output.trim();
-            if template.is_empty() {
-                continue;
-            }
-            let Some(img_path) = doc.image_path_at(i) else {
-                error = Some("画像がありません（画像を挿入してから保存してください）".to_owned());
-                break;
-            };
-            let Some(frame) = doc.input_to(i) else {
-                error = Some("結果がまだ計算されていません".to_owned());
-                break;
-            };
-            let path = crate::export::resolve_output_path(template, img_path);
-            if !crate::export::validate_extension(&path) {
-                error = Some(format!(
-                    "{} は対応していない拡張子です（tif / png / jpg）",
-                    path.to_string_lossy()
-                ));
-                break;
-            }
-            // 書き出し画像と同じフレームに効いている測長オーバーレイを集める
-            // （表示のオーバーレイ描画と同じ判定。編集中の測長コマンドは除く）。
-            let mut overlays = Vec::new();
-            for j in 0..doc.commands.len() {
-                if self.measure_mode.open
-                    && self.measure_mode.tab == self.active
-                    && j == self.measure_mode.index
-                {
-                    continue;
-                }
-                if let Some(item) = doc.commands.get(j)
-                    && let Command::Measure { data } = &item.command
-                    && let Some(fj) = doc.input_to(j)
-                    && std::sync::Arc::ptr_eq(&fj.image, &frame.image)
-                {
-                    overlays.push((data.compute(&fj.image, fj.scale), fj.scale));
-                }
-            }
-            let digits = self.settings.length_digits;
-            let result = if *color {
-                let buf =
-                    crate::export::render_rgb(&frame.image, &overlays, *annotation_scale, digits);
-                crate::export::save_rgb(&buf, &path)
-            } else {
-                let buf = crate::export::render(&frame.image, &overlays, *annotation_scale, digits);
-                crate::export::save(&buf, &path)
-            };
-            match result {
-                Ok(()) => saved.push(path),
-                Err(e) => {
-                    error = Some(e);
-                    break;
-                }
-            }
-        }
-        if let Some(e) = error {
-            self.error = Some(e);
-            return;
-        }
-        if saved.is_empty() {
-            return;
-        }
-        self.error = None;
-        let names: Vec<String> = saved.iter().map(|p| file_label(p)).collect();
-        self.status = format!("画像を保存しました: {}", names.join(", "));
+        self.status = format!("保存しました: {}", names.join(", "));
     }
 
     fn save_history(&mut self) {
@@ -1270,6 +1203,7 @@ impl eframe::App for TemApp {
         // 測長モード中は画像上の入力（左ドラッグの移動、右ドラッグのパン、
         // ズーム）をすべて measure_mode 側で処理する。
         let interactive = !self.measure_mode.open;
+        let skip = self.measure_editing(index);
         self.last_hover = egui::CentralPanel::no_frame()
             .show(ui, |ui| {
                 let doc = &mut self.docs[index];
@@ -1282,29 +1216,18 @@ impl eframe::App for TemApp {
                 // 測長コマンドだけを、そのコマンドの画像座標系で描く。
                 // 測長モードで編集中のコマンドは draw_session 側が描くので
                 // ここではスキップする（二重描画を防ぐ）。
+                // 計算結果は再計算時の段に保持されたものを使う（毎フレーム
+                // フィッティングし直さない）。
                 if let Some(img) = &image {
                     let painter = ui.painter_at(info.vp);
-                    for i in 0..doc.commands.len() {
-                        if self.measure_mode.open
-                            && self.measure_mode.tab == index
-                            && i == self.measure_mode.index
-                        {
-                            continue;
-                        }
-                        if let Some(item) = doc.commands.get(i)
-                            && let Command::Measure { data } = &item.command
-                            && let Some(frame) = doc.input_to(i)
-                            && std::sync::Arc::ptr_eq(&frame.image, img)
-                        {
-                            let computed = data.compute(&frame.image, frame.scale);
-                            crate::measure_mode::draw_computed(
-                                &painter,
-                                &info,
-                                &computed,
-                                frame.scale,
-                                self.settings.length_digits,
-                            );
-                        }
+                    for m in doc.measure_overlays(img, skip) {
+                        crate::measure_mode::draw_computed(
+                            &painter,
+                            &info,
+                            &m.computed,
+                            m.scale,
+                            self.settings.length_digits,
+                        );
                     }
                 }
 
@@ -1333,12 +1256,8 @@ impl eframe::App for TemApp {
         self.rotate_dialog.show(&ctx, doc);
         self.levels_dialog.show(&ctx, doc);
         self.filter_dialog.show(&ctx, doc);
-        if self.export_dialog.show(&ctx, doc) {
-            actions.push(Action::SaveImageExports);
-        }
-        if self.export_result_dialog.show(&ctx, doc) {
-            actions.push(Action::SaveResultExports);
-        }
+        self.export_dialog.show(&ctx, doc);
+        self.export_result_dialog.show(&ctx, doc);
         self.settings_dialog.show(&ctx, &mut self.settings);
         if self.measure_mode.open {
             let tab = self.measure_mode.tab;
@@ -1347,6 +1266,12 @@ impl eframe::App for TemApp {
                     .show_confirm_modal(&ctx, &mut self.docs[tab]);
                 self.measure_mode.show_fit_popup(&ctx, &mut self.docs[tab]);
             }
+        }
+        // このフレームでダイアログ・測長モードが閉じたら（決定・キャンセル
+        // どちらも）、最後の値で計算し直しておく。キャンセルで元に戻した値が
+        // F5 を押すまで表示に反映されない、ということを防ぐ。
+        if preview && !self.dialog_open() && self.docs[index].is_dirty() {
+            self.docs[index].recompute(&mut self.cache);
         }
 
         for action in actions {

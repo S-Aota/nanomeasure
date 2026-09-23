@@ -599,14 +599,15 @@ impl ExportDialog {
         self.open = true;
     }
 
-    /// ウィンドウを表示する。戻り値は「決定」で保存が要求されたか。
-    pub fn show(&mut self, ctx: &Context, doc: &mut Document) -> bool {
+    /// ウィンドウを表示する。「決定」はコマンドを確定するだけで、
+    /// ファイル保存は「再計算」(F5) のときに行う。
+    pub fn show(&mut self, ctx: &Context, doc: &mut Document) {
         if !self.open {
-            return false;
+            return;
         }
         if self.index.is_some_and(|i| i >= doc.commands.len()) {
             self.open = false;
-            return false;
+            return;
         }
         let index = self.index.expect("open なら index あり");
 
@@ -687,14 +688,10 @@ impl ExportDialog {
         if cancelled || !window_open {
             self.revert(doc);
             self.open = false;
-            return false;
-        }
-        if confirmed {
+        } else if confirmed {
             self.original = None;
             self.open = false;
-            return true;
         }
-        false
     }
 
     fn revert(&mut self, doc: &mut Document) {
@@ -745,14 +742,15 @@ impl ExportResultDialog {
         self.open = true;
     }
 
-    /// ウィンドウを表示する。戻り値は「決定」で保存が要求されたか。
-    pub fn show(&mut self, ctx: &Context, doc: &mut Document) -> bool {
+    /// ウィンドウを表示する。「決定」はコマンドを確定するだけで、
+    /// ファイル保存は「再計算」(F5) のときに行う。
+    pub fn show(&mut self, ctx: &Context, doc: &mut Document) {
         if !self.open {
-            return false;
+            return;
         }
         if self.index.is_some_and(|i| i >= doc.commands.len()) {
             self.open = false;
-            return false;
+            return;
         }
         let index = self.index.expect("open なら index あり");
 
@@ -809,14 +807,10 @@ impl ExportResultDialog {
         if cancelled || !window_open {
             self.revert(doc);
             self.open = false;
-            return false;
-        }
-        if confirmed {
+        } else if confirmed {
             self.original = None;
             self.open = false;
-            return true;
         }
-        false
     }
 
     fn revert(&mut self, doc: &mut Document) {

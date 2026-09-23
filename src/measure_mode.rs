@@ -5,6 +5,9 @@
 //! 同じ方式）。決定で確定、キャンセルは確認を経て破棄。ツール操作は
 //! Ctrl+Z / Ctrl+Shift+Z で undo / redo できる。
 
+use std::cell::RefCell;
+use std::sync::Arc;
+
 use egui::{
     Align2, Color32, Context, CursorIcon, FontId, Painter, Pos2, Rect, Sense, Stroke, Ui, Vec2,
 };
@@ -276,7 +279,9 @@ pub struct MeasureMode {
     /// ドラッグ開始時のフィッティング済み計算結果。ドラッグ中は選択ツール
     /// だけ生の位置で描き、他のツールはこのキャッシュで描く（毎フレームの
     /// フィッティング再計算を避けつつ、二重線の重なりも出さない）。
-    drag_fitted: Option<ComputedMeasure>,
+    drag_fitted: Option<Arc<ComputedMeasure>>,
+    /// 作業コピーのフィッティング込み計算結果（[`Self::computed`] 参照）。
+    session: RefCell<Option<SessionCompute>>,
     /// フィッティング設定ポップアップの編集対象。
     popup: Option<FitPopupTarget>,
     undo: Vec<Snapshot>,
@@ -296,7 +301,53 @@ pub struct MeasureMode {
     range_state: Option<RangeState>,
 }
 
+/// 編集セッションの計算結果と、その計算に使った入力。
+struct SessionCompute {
+    data: MeasureData,
+    image: Arc<Gray16>,
+    scale: Option<Scale>,
+    computed: Arc<ComputedMeasure>,
+}
+
 impl MeasureMode {
+    /// 作業コピーのフィッティング込み計算結果。描画・結果リスト・クリック
+    /// 判定が同じフレームで何度も参照するので、データ・画像・スケールが
+    /// 前回と同じなら計算し直さずに使い回す（フィッティングは編集で
+    /// データが変わったときだけ走る）。
+    fn computed(&self, img: &Arc<Gray16>, scale: Option<Scale>) -> Arc<ComputedMeasure> {
+        let mut cache = self.session.borrow_mut();
+        if let Some(c) = cache.as_ref()
+            && c.data == self.data
+            && Arc::ptr_eq(&c.image, img)
+            && c.scale == scale
+        {
+            return c.computed.clone();
+        }
+        let computed = Arc::new(self.data.compute(img, scale));
+        *cache = Some(SessionCompute {
+            data: self.data.clone(),
+            image: img.clone(),
+            scale,
+            computed: computed.clone(),
+        });
+        computed
+    }
+
+    /// 表示・判定に使う計算結果。ドラッグ中はドラッグ開始時の結果を使い、
+    /// ドラッグの毎フレームでフィッティングし直さない（離した時点で再計算）。
+    fn computed_or_drag(&self, img: &Arc<Gray16>, scale: Option<Scale>) -> Arc<ComputedMeasure> {
+        match &self.drag_fitted {
+            Some(fitted) => fitted.clone(),
+            None => self.computed(img, scale),
+        }
+    }
+
+    /// スナップ対象の直線。ドラッグ中はドラッグ開始時の位置を使う。
+    fn snap_lines(&self, img: &Arc<Gray16>, scale: Option<Scale>) -> Vec<SnapLine> {
+        self.data
+            .snap_lines_from(&self.computed_or_drag(img, scale))
+    }
+
     /// 新しい測長コマンドを追加してモードに入る。
     pub fn open_new(&mut self, doc: &mut Document, tab: usize) {
         let index = doc.push_command(Command::Measure {
@@ -326,6 +377,7 @@ impl MeasureMode {
         self.selected = None;
         self.drag = None;
         self.drag_fitted = None;
+        *self.session.get_mut() = None;
         self.popup = None;
         self.undo.clear();
         self.redo.clear();
@@ -356,6 +408,7 @@ impl MeasureMode {
         self.open = false;
         self.undo.clear();
         self.redo.clear();
+        *self.session.get_mut() = None;
     }
 
     fn finish(&mut self) {
@@ -363,6 +416,7 @@ impl MeasureMode {
         self.open = false;
         self.undo.clear();
         self.redo.clear();
+        *self.session.get_mut() = None;
     }
 
     // -------------------------------------------------- undo / redo
@@ -597,7 +651,7 @@ impl MeasureMode {
             return;
         };
         let scale = doc.input_to(self.index).and_then(|f| f.scale);
-        let computed = self.data.compute(&img, scale);
+        let computed = self.computed(&img, scale);
         let tool_id = match target {
             FitPopupTarget::Dist1 { tool }
             | FitPopupTarget::Dist2 { tool }
@@ -871,7 +925,7 @@ impl MeasureMode {
             Some(frame) => (frame.image.clone(), frame.scale),
             None => return,
         };
-        let computed = self.data.compute(&img, scale);
+        let computed = self.computed_or_drag(&img, scale);
         let mut actions = Vec::new();
 
         egui::ScrollArea::vertical()
@@ -1669,13 +1723,13 @@ impl MeasureMode {
                     *t = r.clone();
                 }
             }
-            ComputedMeasure {
+            Arc::new(ComputedMeasure {
                 tools,
                 // 番号はドラッグ開始時の計算結果のまま（ID は変わらない）。
                 numbers: fitted.numbers.clone(),
-            }
+            })
         } else {
-            self.data.compute(&img, scale)
+            self.computed(&img, scale)
         };
         draw_computed(painter, info, &computed, scale, digits);
 
@@ -1705,7 +1759,7 @@ impl MeasureMode {
         match *prog {
             InProgress::Distance { p1, p1_line } => {
                 let Some(cursor) = cursor else { return };
-                let lines = self.data.snap_lines(&img, scale);
+                let lines = self.snap_lines(&img, scale);
                 let (p1, p2, snapped) =
                     self.resolve_distance(p1, p1_line, cursor, &lines, info.zoom);
                 let p2 = self.resolve_angle(p1, p2, snapped);
@@ -2172,7 +2226,7 @@ impl MeasureMode {
             && let (Some(img), Some(cursor)) = (&img, cursor)
         {
             let scale = doc.input_to(self.index).and_then(|f| f.scale);
-            let computed = self.data.compute(img, scale);
+            let computed = self.computed(img, scale);
             let threshold = PICK_PX as f64 / info.zoom as f64;
             self.select_at(&computed, cursor, threshold);
         }
@@ -2222,11 +2276,13 @@ impl MeasureMode {
         // オフセット線選択中の距離追従。
         if let Some(cursor) = cursor
             && let Some(img) = &img
-            && let Some(InProgress::OffsetPick { source, distance }) = &mut self.in_progress
+            && matches!(self.in_progress, Some(InProgress::OffsetPick { .. }))
         {
             let scale = doc.input_to(self.index).and_then(|f| f.scale);
-            let computed = self.data.compute(img, scale);
-            if let Some(t) = computed.by_id(*source) {
+            let computed = self.computed(img, scale);
+            if let Some(InProgress::OffsetPick { source, distance }) = &mut self.in_progress
+                && let Some(t) = computed.by_id(*source)
+            {
                 let n = (t.p2 - t.p1).normalize().perp();
                 let v = cursor - t.p1;
                 *distance = n.x * v.x + n.y * v.y;
@@ -2251,7 +2307,7 @@ impl MeasureMode {
             && let (Some(img), Some(pos)) = (&img, click_pos)
         {
             let scale = doc.input_to(self.index).and_then(|f| f.scale);
-            let computed = self.data.compute(img, scale);
+            let computed = self.computed(img, scale);
             if let Some(target) = self.fit_target_at(&computed, pos) {
                 self.popup = Some(target);
             }
@@ -2353,7 +2409,7 @@ impl MeasureMode {
                         // ドラッグ中は生の位置で描く（フィッティング再計算を止める）。
                         if let Some(img) = img {
                             let scale = doc.input_to(self.index).and_then(|f| f.scale);
-                            self.drag_fitted = Some(self.data.compute(img, scale));
+                            self.drag_fitted = Some(self.computed(img, scale));
                         }
                         self.range_state = Some(RangeState::Resizing {
                             orig_min: sel.min,
@@ -2380,7 +2436,7 @@ impl MeasureMode {
                             // ドラッグ中は生の位置で描く（フィッティング再計算を止める）。
                             if let Some(img) = img {
                                 let scale = doc.input_to(self.index).and_then(|f| f.scale);
-                                self.drag_fitted = Some(self.data.compute(img, scale));
+                                self.drag_fitted = Some(self.computed(img, scale));
                             }
                             self.range_state = Some(RangeState::Moving {
                                 start: press,
@@ -2514,7 +2570,11 @@ impl MeasureMode {
                 Some(RangeState::Moving { .. }) | Some(RangeState::Resizing { .. }) => {
                     self.drag_fitted = None;
                 }
-                Some(RangeState::Duplicating { start, current, orig }) => {
+                Some(RangeState::Duplicating {
+                    start,
+                    current,
+                    orig,
+                }) => {
                     // ドラッグ終了でまとめて複製する。
                     let offset = current - start;
                     if offset.length() >= 0.5 {
@@ -2598,7 +2658,7 @@ impl MeasureMode {
                 return;
             };
             let scale = doc.input_to(self.index).and_then(|f| f.scale);
-            let computed = self.data.compute(img, scale);
+            let computed = self.computed(img, scale);
             let ids = self.tools_in_rect(&computed, start, current);
             self.delete_tools(doc, &ids);
         }
@@ -2657,7 +2717,7 @@ impl MeasureMode {
         &self,
         id: u64,
         cursor: Pt2,
-        img: &Gray16,
+        img: &Arc<Gray16>,
         scale: Option<Scale>,
         zoom: f32,
     ) -> (Pt2, bool) {
@@ -2666,7 +2726,7 @@ impl MeasureMode {
         {
             return (cursor, false);
         }
-        let lines = self.data.snap_lines(img, scale);
+        let lines = self.snap_lines(img, scale);
         let threshold = SNAP_PX as f64 / zoom as f64;
         let nearest = lines
             .iter()
@@ -2704,11 +2764,11 @@ impl MeasureMode {
         None
     }
 
-    fn on_click(&mut self, doc: &mut Document, img: &Gray16, pos: Pt2, zoom: f32) {
+    fn on_click(&mut self, doc: &mut Document, img: &Arc<Gray16>, pos: Pt2, zoom: f32) {
         let scale = doc.input_to(self.index).and_then(|f| f.scale);
-        let computed = self.data.compute(img, scale);
+        let computed = self.computed(img, scale);
         let snap_lines = if self.data.prefs.snap {
-            self.data.snap_lines(img, scale)
+            self.data.snap_lines_from(&computed)
         } else {
             Vec::new()
         };
@@ -2941,7 +3001,7 @@ impl MeasureMode {
 
     /// クリック位置で選択方法を決める。端点に近ければ端点移動、
     /// 線分上なら全体移動。どちらでもなければ選択解除。
-    fn select_at(&mut self, computed: &ComputedMeasure, pos: Pt2, threshold: f64) {
+    fn select_at(&mut self, computed: &Arc<ComputedMeasure>, pos: Pt2, threshold: f64) {
         let mut best: Option<(u64, EndpointWhich, f64)> = None;
         for t in computed
             .tools
