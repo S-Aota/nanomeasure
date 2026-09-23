@@ -5,8 +5,6 @@
 //! 同じ方式）。決定で確定、キャンセルは確認を経て破棄。ツール操作は
 //! Ctrl+Z / Ctrl+Shift+Z で undo / redo できる。
 
-use std::path::{Path, PathBuf};
-
 use egui::{
     Align2, Color32, Context, CursorIcon, FontId, Painter, Pos2, Rect, Sense, Stroke, Ui, Vec2,
 };
@@ -17,8 +15,8 @@ use crate::document::Document;
 use crate::frame::Scale;
 use crate::gray::Gray16;
 use crate::measure::{
-    AngleMode, ComputedMeasure, ComputedTool, FitMode, FitSettings, FitSign, MeasureData,
-    MeasureTool, NewMeasureMode, Pt2, SnapLine, ToolKind, format_measurement, snap_angle_four,
+    AngleMode, ComputedMeasure, ComputedTool, FitMode, FitSettings, FitSign, GroupMode,
+    MeasureData, MeasureTool, Pt2, SnapLine, ToolKind, format_measurement, snap_angle_four,
     snap_distance,
 };
 use crate::measure_fit::{self, FitRegion, GaussFit};
@@ -93,6 +91,8 @@ enum InProgress {
         current: Pt2,
         count: usize,
     },
+    /// 削除ツールの矩形ドラッグ中（この矩形内のツールを一括削除する）。
+    DeleteRect { start: Pt2, current: Pt2 },
 }
 
 /// ツールボタンの選択。None は非選択状態（Esc で解除、パンが使える）。
@@ -105,6 +105,8 @@ pub enum ToolButton {
     LinearDuplicate,
     /// 四角形で測長をまとめて選択し、一括移動する。
     RangeSelect,
+    /// クリックで 1 つ、ドラッグで矩形内のツールをまとめて削除する。
+    Delete,
 }
 
 impl ToolButton {
@@ -115,6 +117,7 @@ impl ToolButton {
             Self::Offset => "オフセット線",
             Self::LinearDuplicate => "直線複製",
             Self::RangeSelect => "範囲選択",
+            Self::Delete => "削除",
         }
     }
 }
@@ -146,6 +149,13 @@ enum RangeState {
         start: Pt2,
         orig_min: Pt2,
         orig_max: Pt2,
+        orig: Vec<(u64, Pt2, Pt2)>,
+    },
+    /// Ctrl+ドラッグで選択測長を複製中（プレビューはドラッグ位置に描き、
+    /// データへはドラッグ終了時にまとめて反映する）。
+    Duplicating {
+        start: Pt2,
+        current: Pt2,
         orig: Vec<(u64, Pt2, Pt2)>,
     },
     /// 枠の辺・角をドラッグして拡大縮小中。反対側の辺を基準に、選択された
@@ -455,10 +465,9 @@ impl MeasureMode {
     // ------------------------------------------------------ パネル UI
 
     /// 右パネル（command_panel と同じ場所）に測長 UI を表示する。
-    /// 戻り値は「保存」ボタンが押されたか（呼び出し側でファイルへ保存する）。
-    pub fn show_panel(&mut self, ui: &mut Ui, doc: &mut Document, digits: u8) -> bool {
+    pub fn show_panel(&mut self, ui: &mut Ui, doc: &mut Document, digits: u8) {
         if !self.open {
-            return false;
+            return;
         }
         // 編集中にコマンド行が消えたり差し替わったら閉じる。
         if !matches!(
@@ -466,12 +475,11 @@ impl MeasureMode {
             Some(Command::Measure { .. })
         ) {
             self.open = false;
-            return false;
+            return;
         }
 
         let mut confirmed = false;
         let mut cancel_requested = false;
-        let mut save_requested = false;
 
         egui::Panel::right("command_panel")
             .resizable(true)
@@ -482,9 +490,9 @@ impl MeasureMode {
                 ui.strong("測長");
                 ui.separator();
 
-                save_requested |= self.settings_ui(ui, doc);
+                self.settings_ui(ui, doc);
                 ui.separator();
-                self.tools_ui(ui, doc);
+                self.tools_ui(ui, doc, digits);
                 ui.separator();
 
                 // 決定・キャンセルは最下部に固定し、残りの高さを結果リストに使う。
@@ -518,7 +526,6 @@ impl MeasureMode {
                 self.confirm_cancel = true;
             }
         }
-        save_requested
     }
 
     /// フィッティング領域をダブルクリック/右クリックしたときに開く
@@ -642,9 +649,8 @@ impl MeasureMode {
         }
     }
 
-    /// 設定 UI。戻り値は「保存」ボタンが押されたか。
-    fn settings_ui(&mut self, ui: &mut Ui, doc: &mut Document) -> bool {
-        let mut save_requested = false;
+    /// 設定 UI。
+    fn settings_ui(&mut self, ui: &mut Ui, doc: &mut Document) {
         ui.strong("設定");
         ui.horizontal(|ui| {
             ui.label("角度:");
@@ -675,14 +681,14 @@ impl MeasureMode {
             if ui
                 .radio_value(
                     &mut self.data.prefs.new_measure,
-                    NewMeasureMode::NewGroup,
+                    GroupMode::NewGroup,
                     "グループを追加",
                 )
                 .changed()
                 || ui
                     .radio_value(
                         &mut self.data.prefs.new_measure,
-                        NewMeasureMode::Keep,
+                        GroupMode::Keep,
                         "そのまま",
                     )
                     .changed()
@@ -690,43 +696,25 @@ impl MeasureMode {
                 self.change_once(doc);
             }
         });
-
-        // 測定結果 JSON の出力先。{dir} / {filename} は保存時に画像パスから
-        // 解決するので、自由なパスを書いてもよい。
         ui.horizontal(|ui| {
-            ui.label("出力:");
-            let resp = ui
-                .add(
-                    egui::TextEdit::singleline(&mut self.data.output_path)
-                        .desired_width(180.0)
-                        .hint_text("{dir}/{filename}_result.json"),
-                )
-                .on_hover_text(
-                    "測定結果 JSON の出力先。{dir} は開いている画像のフォルダ、\n\
-                     {filename} は拡張子なしのファイル名に置き換わります。\n\
-                     空欄にすると保存しません。",
-                );
-            if resp.gained_focus() {
-                self.begin_change();
-            }
-            if resp.changed() {
-                self.apply_change(doc);
-            }
-        });
-        ui.horizontal(|ui| {
+            ui.label("複製:");
             if ui
-                .button("保存")
-                .on_hover_text("測定結果を JSON で保存（再計算のときにも保存されます）")
-                .clicked()
+                .radio_value(
+                    &mut self.data.prefs.duplicate,
+                    GroupMode::NewGroup,
+                    "グループを追加",
+                )
+                .changed()
+                || ui
+                    .radio_value(&mut self.data.prefs.duplicate, GroupMode::Keep, "そのまま")
+                    .changed()
             {
-                save_requested = true;
+                self.change_once(doc);
             }
-            ui.weak("再計算時に自動保存");
         });
-        save_requested
     }
 
-    fn tools_ui(&mut self, ui: &mut Ui, doc: &mut Document) {
+    fn tools_ui(&mut self, ui: &mut Ui, doc: &mut Document, digits: u8) {
         ui.strong("ツール");
         ui.add_space(2.0);
         // 章ごとに分けて配置する。
@@ -750,6 +738,7 @@ impl MeasureMode {
         ui.horizontal(|ui| {
             ui.add_space(12.0);
             self.tool_button(ui, ToolButton::RangeSelect);
+            self.tool_button(ui, ToolButton::Delete);
         });
         ui.add_space(4.0);
 
@@ -791,13 +780,16 @@ impl MeasureMode {
             }
             Some(ToolButton::Offset) => {
                 ui.weak("画像上の境界線をクリック → クリックで距離を決定");
-                self.offset_fine_tune_ui(ui, doc);
+                self.offset_fine_tune_ui(ui, doc, digits);
             }
             Some(ToolButton::LinearDuplicate) => {
                 ui.weak("測長・境界線をクリック → マウス移動で方向と距離を指定 → クリックで確定。ホイールで複製数 (1-20)");
             }
             Some(ToolButton::RangeSelect) => {
-                ui.weak("ドラッグで四角形を作ると、中心が枠内の測長をまとめて選択。枠の中のドラッグで一括移動、枠の辺・角のドラッグで測長ごと拡大縮小");
+                ui.weak("ドラッグで四角形を作ると、中心が枠内の測長をまとめて選択。枠の中のドラッグで一括移動、枠の辺・角のドラッグで測長ごと拡大縮小。Ctrl+ドラッグで選択測長を複製");
+            }
+            Some(ToolButton::Delete) => {
+                ui.weak("測長・補助線をクリックで削除。ドラッグで四角形を作ると、中心が枠内のものをまとめて削除");
             }
             None => {
                 ui.weak("画像上の測長・境界線を直接ドラッグで移動（Esc で解除）");
@@ -829,7 +821,9 @@ impl MeasureMode {
     }
 
     /// 最後に作成したオフセット線の距離を数値で微調整する。
-    fn offset_fine_tune_ui(&mut self, ui: &mut Ui, doc: &mut Document) {
+    /// スケールが設定されていれば実寸の値（単位表示）で編集し、
+    /// データへは px に戻して保存する。
+    fn offset_fine_tune_ui(&mut self, ui: &mut Ui, doc: &mut Document, digits: u8) {
         let last = self.data.tools.iter().rev().find_map(|t| match t {
             MeasureTool::Offset { id, distance, .. } => Some((*id, *distance)),
             _ => None,
@@ -837,9 +831,25 @@ impl MeasureMode {
         let Some((id, mut distance)) = last else {
             return;
         };
+        let scale = doc.input_to(self.index).and_then(|f| f.scale);
         ui.horizontal(|ui| {
             ui.label("オフセット:");
-            let resp = ui.add(egui::DragValue::new(&mut distance).speed(0.5));
+            let resp = match scale {
+                // スケールあり: 実寸で編集する（ドラッグ感度も実寸換算）。
+                Some(s) => {
+                    let mut value = distance * s.per_px();
+                    let resp = ui.add(
+                        egui::DragValue::new(&mut value)
+                            .speed((0.5 * s.per_px()) as f32)
+                            .max_decimals(digits as usize),
+                    );
+                    if resp.changed() {
+                        distance = value / s.per_px();
+                    }
+                    resp
+                }
+                None => ui.add(egui::DragValue::new(&mut distance).speed(0.5)),
+            };
             if resp.drag_started() {
                 self.begin_change();
             }
@@ -851,7 +861,7 @@ impl MeasureMode {
                 }
                 self.apply_change(doc);
             }
-            ui.label("px");
+            ui.label(scale.map_or("px", |s| s.unit.label()));
         });
     }
 
@@ -961,21 +971,23 @@ impl MeasureMode {
                     });
 
                     // グループ内の測定結果（インデント + 自動採番）。番号は
-                    // 並べ替えるたびに先頭から振り直す。
+                    // グループごとに振り直さず、全体で通しに振る
+                    // （画像ラベルと同じ computed.numbers を使う）。
                     let ids = self.data.group_tools(gid);
                     for (n, tid) in ids.iter().enumerate() {
                         ui.horizontal(|ui| {
                             ui.add_space(24.0);
+                            let num = computed.number(*tid).unwrap_or(0);
                             match computed.by_id(*tid) {
                                 Some(t) => {
                                     let value = t
                                         .length_px
                                         .map(|l| format_measurement(l, scale, digits))
                                         .unwrap_or_default();
-                                    ui.label(format!("#{}  {}", n + 1, value));
+                                    ui.label(format!("#{num}  {value}"));
                                 }
                                 None => {
-                                    ui.label(format!("#{}", n + 1));
+                                    ui.label(format!("#{num}"));
                                 }
                             }
                             if ui
@@ -1154,85 +1166,6 @@ fn sort_group(data: &mut MeasureData, computed: &ComputedMeasure, gid: u64, key:
             }
         }
     }
-}
-
-/// 測長コマンド `index` の測定結果を JSON で保存する。
-/// 出力先は `data.output_path`（`{dir}` / `{filename}` は画像パスから解決）。
-/// 空文字列のときは保存しない（Ok(None)）。戻り値は実際に保存したパス。
-pub fn save_measure_json(doc: &Document, index: usize) -> Result<Option<PathBuf>, String> {
-    let Some(item) = doc.commands.get(index) else {
-        return Err("測長コマンドではありません".to_owned());
-    };
-    let Command::Measure { data } = &item.command else {
-        return Err("測長コマンドではありません".to_owned());
-    };
-    let template = data.output_path.trim();
-    if template.is_empty() {
-        return Ok(None);
-    }
-    let img_path = doc
-        .image_path_at(index)
-        .ok_or_else(|| "画像がありません（画像を挿入してから保存してください）".to_owned())?
-        .to_path_buf();
-    let Some(frame) = doc.input_to(index) else {
-        return Err("結果がまだ計算されていません".to_owned());
-    };
-    let path = resolve_output_path(template, &img_path);
-    // JSON の先頭にはファイル名を出す。
-    let filename = img_path
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "image".to_owned());
-    let computed = data.compute(&frame.image, frame.scale);
-    // 単位は JSON 先頭の unit にまとめ、各測定値からは落とす。
-    let unit = frame
-        .scale
-        .map(|s| s.unit.label().to_owned())
-        .unwrap_or_else(|| "px".to_owned());
-    let groups: Vec<serde_json::Value> = data
-        .groups
-        .iter()
-        .map(|g| {
-            // 表示用の丸めはせず、元の精度の数値のまま保存する。
-            let values: Vec<f64> = data
-                .group_tools(g.id)
-                .iter()
-                .filter_map(|tid| {
-                    computed
-                        .by_id(*tid)
-                        .and_then(|t| t.length_px)
-                        .map(|l| frame.scale.map(|s| l * s.per_px()).unwrap_or(l))
-                })
-                .collect();
-            serde_json::json!({ "name": g.name, "values": values })
-        })
-        .collect();
-    let json = serde_json::json!({ "filename": filename, "unit": unit, "groups": groups });
-    std::fs::write(
-        &path,
-        serde_json::to_string_pretty(&json).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| format!("{} に保存できません: {e}", path.to_string_lossy()))?;
-    Ok(Some(path))
-}
-
-/// `{dir}` / `{filename}` を画像パスから解決する（画像出力コマンドでも共用）。
-pub(crate) fn resolve_output_path(template: &str, img_path: &Path) -> PathBuf {
-    let dir = img_path
-        .parent()
-        .map(|p| p.to_string_lossy().into_owned())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| ".".to_owned());
-    let stem = img_path
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| {
-            img_path
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "image".to_owned())
-        });
-    PathBuf::from(template.replace("{dir}", &dir).replace("{filename}", &stem))
 }
 
 /// フィッティング設定 UI の変更検出結果。
@@ -1427,6 +1360,7 @@ fn stats_csv(
 }
 
 /// 1 グループの測長結果一覧を CSV にする。ヘッダー: 番号, 値。
+/// 番号は結果リストと同じ通し番号。
 fn group_data_csv(
     gid: u64,
     data: &MeasureData,
@@ -1435,11 +1369,12 @@ fn group_data_csv(
     digits: u8,
 ) -> String {
     let mut out = String::from("番号, 値\n");
-    for (n, tid) in data.group_tools(gid).iter().enumerate() {
-        if let Some(t) = computed.by_id(*tid)
+    for tid in data.group_tools(gid) {
+        if let Some(t) = computed.by_id(tid)
             && let Some(len) = t.length_px
         {
-            out += &format!("{}, {}\n", n + 1, value_number(len, scale, digits));
+            let n = computed.number(tid).unwrap_or(0);
+            out += &format!("{n}, {}\n", value_number(len, scale, digits));
         }
     }
     out
@@ -1498,7 +1433,7 @@ pub fn draw_computed(
     if info.image_rect.is_none() {
         return;
     }
-    for (n, t) in computed.tools.iter().enumerate() {
+    for t in computed.tools.iter() {
         // フィッティング領域の枠（点線）。色はフィッティング設定で変え、
         // 符号固定モードは辺ごとに明暗を付けて方向を示す。
         for region in &t.fit_regions {
@@ -1523,7 +1458,11 @@ pub fn draw_computed(
                 let b = to_screen(info, t.p2);
                 draw_line_and_arrows(painter, a, b, COLOR_DISTANCE);
                 if let Some(len) = t.length_px {
-                    let text = format!("#{} {}", n + 1, format_measurement(len, scale, digits));
+                    // 番号は結果リストと同じ通し番号（補助線には振らない）。
+                    let text = match computed.number(t.id) {
+                        Some(n) => format!("#{n} {}", format_measurement(len, scale, digits)),
+                        None => format_measurement(len, scale, digits),
+                    };
                     draw_value_label(painter, a, b, text, COLOR_DISTANCE);
                 }
             }
@@ -1543,12 +1482,9 @@ pub fn draw_computed(
                 let b = to_screen(info, t.p2);
                 painter.line_segment([a, b], Stroke::new(2.0, COLOR_GUIDE));
                 if let Some(d) = t.distance_px {
+                    // 補助線は結果リストに出ないので番号は付けない。
                     let sign = if d >= 0.0 { "+" } else { "-" };
-                    let text = format!(
-                        "#{} {sign}{}",
-                        n + 1,
-                        format_measurement(d.abs(), scale, digits)
-                    );
+                    let text = format!("{sign}{}", format_measurement(d.abs(), scale, digits));
                     draw_value_label(painter, a, b, text, COLOR_GUIDE);
                 }
             }
@@ -1733,7 +1669,11 @@ impl MeasureMode {
                     *t = r.clone();
                 }
             }
-            ComputedMeasure { tools }
+            ComputedMeasure {
+                tools,
+                // 番号はドラッグ開始時の計算結果のまま（ID は変わらない）。
+                numbers: fitted.numbers.clone(),
+            }
         } else {
             self.data.compute(&img, scale)
         };
@@ -1832,6 +1772,16 @@ impl MeasureMode {
                     );
                 }
             }
+            InProgress::DeleteRect { start, current } => {
+                // 削除対象の矩形（赤枠）。
+                let rect = Rect::from_two_pos(to_screen(info, start), to_screen(info, current));
+                painter.rect_stroke(
+                    rect,
+                    0.0,
+                    Stroke::new(1.5, COLOR_DISTANCE),
+                    egui::StrokeKind::Inside,
+                );
+            }
         }
     }
 
@@ -1877,6 +1827,22 @@ impl MeasureMode {
                     Rect::from_center_size(corner, Vec2::splat(5.0)),
                     0.0,
                     COLOR_IN_PROGRESS,
+                );
+            }
+        }
+
+        // Ctrl+ドラッグの複製プレビュー（オフセット位置のコピー）。
+        if let Some(RangeState::Duplicating {
+            start,
+            current,
+            orig,
+        }) = &self.range_state
+        {
+            let off = *current - *start;
+            for (_, p1, p2) in orig {
+                painter.line_segment(
+                    [to_screen(info, *p1 + off), to_screen(info, *p2 + off)],
+                    Stroke::new(3.0, COLOR_IN_PROGRESS.gamma_multiply(0.7)),
                 );
             }
         }
@@ -2080,7 +2046,9 @@ impl MeasureMode {
         //      直線複製の元選択）----
         let picking = match self.tool {
             None => true,
-            Some(ToolButton::Offset | ToolButton::LinearDuplicate) => self.in_progress.is_none(),
+            Some(ToolButton::Offset | ToolButton::LinearDuplicate | ToolButton::Delete) => {
+                self.in_progress.is_none()
+            }
             Some(ToolButton::Distance | ToolButton::Boundary | ToolButton::RangeSelect) => false,
         };
         if !picking {
@@ -2088,6 +2056,10 @@ impl MeasureMode {
         }
         let pred = |t: &ComputedTool| match self.tool {
             Some(ToolButton::Offset) => t.kind == ToolKind::Boundary,
+            Some(ToolButton::Delete) => matches!(
+                t.kind,
+                ToolKind::Distance | ToolKind::Boundary | ToolKind::Offset
+            ),
             _ => matches!(t.kind, ToolKind::Distance | ToolKind::Boundary),
         };
         let threshold = PICK_PX as f64 / zoom as f64;
@@ -2228,6 +2200,12 @@ impl MeasureMode {
             // 外れて新規作成と誤判定されるため）。
             let press = resp.interact_pointer_pos().and_then(|p| to_image(info, p));
             self.handle_range_input(doc, &resp, cursor, press, &img, info.zoom);
+        }
+
+        // 削除ツール: ドラッグで矩形内を一括削除（クリック削除は on_click 側）。
+        if self.tool == Some(ToolButton::Delete) {
+            let press = resp.interact_pointer_pos().and_then(|p| to_image(info, p));
+            self.handle_delete_input(doc, &resp, cursor, press, &img);
         }
 
         // 直線複製: カーソル追従（4 方向固定を適用）。確定はクリック側。
@@ -2389,18 +2367,29 @@ impl MeasureMode {
                         self.begin_change();
                     }
                     RangeHit::Move => {
-                        // ドラッグ中は生の位置で描く（フィッティング再計算を止める）。
-                        if let Some(img) = img {
-                            let scale = doc.input_to(self.index).and_then(|f| f.scale);
-                            self.drag_fitted = Some(self.data.compute(img, scale));
+                        // Ctrl+ドラッグ: 選択測長の複製（プレビュー →
+                        // ドラッグ終了で確定）。
+                        let ctrl = resp.ctx.input(|i| i.modifiers.command);
+                        if ctrl {
+                            self.range_state = Some(RangeState::Duplicating {
+                                start: press,
+                                current: press,
+                                orig: self.range_orig(),
+                            });
+                        } else {
+                            // ドラッグ中は生の位置で描く（フィッティング再計算を止める）。
+                            if let Some(img) = img {
+                                let scale = doc.input_to(self.index).and_then(|f| f.scale);
+                                self.drag_fitted = Some(self.data.compute(img, scale));
+                            }
+                            self.range_state = Some(RangeState::Moving {
+                                start: press,
+                                orig_min: sel.min,
+                                orig_max: sel.max,
+                                orig: self.range_orig(),
+                            });
+                            self.begin_change();
                         }
-                        self.range_state = Some(RangeState::Moving {
-                            start: press,
-                            orig_min: sel.min,
-                            orig_max: sel.max,
-                            orig: self.range_orig(),
-                        });
-                        self.begin_change();
                     }
                     RangeHit::None => {
                         // 枠の外: 新しい枠の作成を始める。
@@ -2493,6 +2482,14 @@ impl MeasureMode {
                     });
                     self.apply_change(doc);
                 }
+                Some(RangeState::Duplicating { start, orig, .. }) => {
+                    // データは動かさず、プレビュー位置だけ更新する。
+                    self.range_state = Some(RangeState::Duplicating {
+                        start,
+                        current: cursor,
+                        orig,
+                    });
+                }
                 None => {}
             }
         }
@@ -2517,6 +2514,47 @@ impl MeasureMode {
                 Some(RangeState::Moving { .. }) | Some(RangeState::Resizing { .. }) => {
                     self.drag_fitted = None;
                 }
+                Some(RangeState::Duplicating { start, current, orig }) => {
+                    // ドラッグ終了でまとめて複製する。
+                    let offset = current - start;
+                    if offset.length() >= 0.5 {
+                        let sources: Vec<MeasureTool> = orig
+                            .iter()
+                            .filter_map(|(id, _, _)| self.data.tool_by_id(*id).cloned())
+                            .filter(|t| matches!(t, MeasureTool::Distance { .. }))
+                            .collect();
+                        if !sources.is_empty() {
+                            self.mutate(doc, |data| {
+                                for src in sources {
+                                    let MeasureTool::Distance {
+                                        p1,
+                                        p2,
+                                        group,
+                                        fit1,
+                                        fit2,
+                                        ..
+                                    } = src
+                                    else {
+                                        continue;
+                                    };
+                                    let id = data.next_id();
+                                    // 複製設定に従い、複製元と同じグループか
+                                    // 複製ごとの新しいグループへ入れる。
+                                    let group = data.group_for_duplicate(group);
+                                    data.tools.push(MeasureTool::Distance {
+                                        id,
+                                        p1: p1 + offset,
+                                        p2: p2 + offset,
+                                        group,
+                                        fit1,
+                                        fit2,
+                                    });
+                                }
+                            });
+                        }
+                    }
+                    self.drag_fitted = None;
+                }
                 None => {}
             }
         }
@@ -2525,6 +2563,91 @@ impl MeasureMode {
         if resp.clicked() {
             self.range_selection = None;
             self.range_state = None;
+        }
+    }
+
+    /// 削除ツールの画像上入力。クリック削除は on_click 側で行い、
+    /// ここではドラッグによる矩形内の一括削除だけを扱う。
+    fn handle_delete_input(
+        &mut self,
+        doc: &mut Document,
+        resp: &egui::Response,
+        cursor: Option<Pt2>,
+        press: Option<Pt2>,
+        img: &Option<std::sync::Arc<Gray16>>,
+    ) {
+        if resp.drag_started()
+            && let Some(press) = press
+        {
+            self.in_progress = Some(InProgress::DeleteRect {
+                start: press,
+                current: press,
+            });
+        }
+        if resp.dragged()
+            && let Some(cursor) = cursor
+            && let Some(InProgress::DeleteRect { current, .. }) = &mut self.in_progress
+        {
+            *current = cursor;
+        }
+        if resp.drag_stopped() {
+            let Some(InProgress::DeleteRect { start, current }) = self.in_progress.take() else {
+                return;
+            };
+            let Some(img) = img else {
+                return;
+            };
+            let scale = doc.input_to(self.index).and_then(|f| f.scale);
+            let computed = self.data.compute(img, scale);
+            let ids = self.tools_in_rect(&computed, start, current);
+            self.delete_tools(doc, &ids);
+        }
+    }
+
+    /// 矩形（画像座標）内に中心（p1/p2 の中点）があるツールの ID。
+    /// 測長・補助線のすべてが対象。
+    fn tools_in_rect(&self, computed: &ComputedMeasure, a: Pt2, b: Pt2) -> Vec<u64> {
+        let (min_x, max_x) = (a.x.min(b.x), a.x.max(b.x));
+        let (min_y, max_y) = (a.y.min(b.y), a.y.max(b.y));
+        computed
+            .tools
+            .iter()
+            .filter(|t| {
+                matches!(
+                    t.kind,
+                    ToolKind::Distance | ToolKind::Boundary | ToolKind::Offset
+                )
+            })
+            .filter(|t| {
+                let c = (t.p1 + t.p2) * 0.5;
+                c.x >= min_x && c.x <= max_x && c.y >= min_y && c.y <= max_y
+            })
+            .map(|t| t.id)
+            .collect()
+    }
+
+    /// 指定したツールと、それらを参照するオフセット線をまとめて削除する。
+    /// 削除したツールを指している選択・範囲選択も整理する。
+    fn delete_tools(&mut self, doc: &mut Document, ids: &[u64]) {
+        if ids.is_empty() {
+            return;
+        }
+        self.mutate(doc, |data| {
+            data.tools.retain(|t| {
+                !ids.contains(&t.id())
+                    && !matches!(t, MeasureTool::Offset { source, .. } if ids.contains(source))
+            });
+        });
+        // 削除したツールを指している状態を消す。
+        self.selected = None;
+        self.drag = None;
+        self.drag_fitted = None;
+        if let Some(sel) = &mut self.range_selection {
+            sel.ids.retain(|id| !ids.contains(id));
+            if sel.ids.is_empty() {
+                self.range_selection = None;
+                self.range_state = None;
+            }
         }
     }
 
@@ -2747,24 +2870,28 @@ impl MeasureMode {
                                 let id = data.next_id();
                                 let p1 = base1 + off;
                                 let p2 = base2 + off;
-                                data.tools.push(if is_boundary {
-                                    MeasureTool::Boundary {
+                                if is_boundary {
+                                    // 補助線は結果リストに出ないのでグループは元のまま。
+                                    data.tools.push(MeasureTool::Boundary {
                                         id,
                                         p1,
                                         p2,
                                         group,
                                         fit: fit1,
-                                    }
+                                    });
                                 } else {
-                                    MeasureTool::Distance {
+                                    // 複製設定に従い、複製元と同じグループか
+                                    // 複製ごとの新しいグループへ入れる。
+                                    let group = data.group_for_duplicate(group);
+                                    data.tools.push(MeasureTool::Distance {
                                         id,
                                         p1,
                                         p2,
                                         group,
                                         fit1,
                                         fit2,
-                                    }
-                                });
+                                    });
+                                }
                             }
                         });
                     }
@@ -2780,6 +2907,34 @@ impl MeasureMode {
             }
             Some(ToolButton::RangeSelect) => {
                 // 選択の解除は handle_range_input のクリック判定が行う。
+            }
+            Some(ToolButton::Delete) => {
+                // クリック: その測長・補助線を削除（端点優先 → 線分）。
+                let pred = |t: &ComputedTool| {
+                    matches!(
+                        t.kind,
+                        ToolKind::Distance | ToolKind::Boundary | ToolKind::Offset
+                    )
+                };
+                let mut best: Option<u64> = None;
+                let mut best_d = f64::INFINITY;
+                for t in computed.tools.iter().filter(|t| pred(t)) {
+                    for p in [t.p1, t.p2] {
+                        let d = (pos - p).length();
+                        if d <= pick_threshold && d < best_d {
+                            best = Some(t.id);
+                            best_d = d;
+                        }
+                    }
+                }
+                if best.is_none()
+                    && let Some(t) = nearest_tool(&computed, pos, pick_threshold, pred)
+                {
+                    best = Some(t.id);
+                }
+                if let Some(id) = best {
+                    self.delete_tools(doc, &[id]);
+                }
             }
         }
     }
@@ -2873,7 +3028,6 @@ fn nearest_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::document::SourceCache;
 
     fn pt(x: f64, y: f64) -> Pt2 {
         Pt2::new(x, y)
@@ -3050,53 +3204,73 @@ mod tests {
         assert_eq!(data.group_tools(g), vec![2, 3, 1]);
     }
 
+    /// 削除: 対象ツールと、それを参照するオフセット線が一緒に消えること。
     #[test]
-    fn save_measure_json_writes_filename_first() {
-        let dir = std::env::temp_dir().join(format!("tem_measure_test_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let img_path = dir.join("sample.tif");
-        image::GrayImage::from_raw(4, 4, vec![0u8; 16])
-            .unwrap()
-            .save(&img_path)
-            .unwrap();
-
-        let mut doc = Document::new("sample.tif");
-        doc.push_command(Command::InsertImage {
-            path: img_path.clone(),
+    fn delete_tools_removes_tool_and_dependent_offsets() {
+        let mut data = MeasureData::default();
+        let g = data.group_for_new_measurement();
+        data.tools.push(MeasureTool::Distance {
+            id: 1,
+            p1: pt(0.0, 0.0),
+            p2: pt(10.0, 0.0),
+            group: g,
+            fit1: crate::measure::FitSettings::default(),
+            fit2: crate::measure::FitSettings::default(),
         });
-        let (mut data, _g) = data_with_group();
-        data.output_path = "{dir}/{filename}_result.json".to_owned();
-        doc.push_command(Command::Measure { data });
-        doc.recompute(&mut SourceCache::new());
+        data.tools.push(MeasureTool::Boundary {
+            id: 2,
+            p1: pt(0.0, 20.0),
+            p2: pt(10.0, 20.0),
+            group: 0,
+            fit: crate::measure::FitSettings::default(),
+        });
+        data.tools.push(MeasureTool::Offset {
+            id: 3,
+            source: 2,
+            distance: 5.0,
+        });
+        let mut doc = Document::new("t");
+        doc.push_command(Command::Measure { data: data.clone() });
+        let mut mode = MeasureMode::default();
+        mode.index = 0;
+        mode.data = data;
+        // 境界線を削除 → それを参照するオフセット線も消える。
+        mode.delete_tools(&mut doc, &[2]);
+        let ids: Vec<u64> = mode.data.tools.iter().map(|t| t.id()).collect();
+        assert_eq!(ids, vec![1]);
+        let Command::Measure { data: d } = &doc.commands.get(0).expect("Measure のみ").command
+        else {
+            panic!("Measure のはず");
+        };
+        assert_eq!(d.tools.len(), 1, "doc 側にも反映される");
+    }
 
-        let path = save_measure_json(&doc, 1).unwrap().expect("保存される");
-        assert_eq!(path, dir.join("sample_result.json"));
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            text.starts_with("{\n  \"filename\": \"sample.tif\""),
-            "先頭にファイル名: {text}"
-        );
-        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(v["unit"], "px", "スケール未設定は px");
-        assert_eq!(v["groups"][0]["values"].as_array().unwrap().len(), 3);
-        // 表示用の丸めはせず、元の精度の数値で保存される。
-        let first = v["groups"][0]["values"][0]
-            .as_f64()
-            .expect("数値で保存される");
-        assert!(
-            first.is_finite() && first > 0.0,
-            "測定値が数値として保存されている: {first}"
-        );
-
-        // 出力先が空なら保存しない。
-        let mut empty = MeasureData::default();
-        empty.output_path = String::new();
-        doc.commands.get_mut(1).expect("Measure コマンド").command =
-            Command::Measure { data: empty };
-        assert!(save_measure_json(&doc, 1).unwrap().is_none());
-
-        std::fs::remove_file(&path).unwrap();
-        std::fs::remove_file(&img_path).unwrap();
-        std::fs::remove_dir(&dir).unwrap();
+    /// 削除矩形: 中心位置（p1/p2 の中点）が枠内の測長・補助線が対象になること。
+    #[test]
+    fn tools_in_rect_uses_center() {
+        let mut data = MeasureData::default();
+        let g = data.group_for_new_measurement();
+        data.tools.push(MeasureTool::Distance {
+            id: 1,
+            p1: pt(10.0, 10.0),
+            p2: pt(30.0, 10.0),
+            group: g,
+            fit1: crate::measure::FitSettings::default(),
+            fit2: crate::measure::FitSettings::default(),
+        });
+        data.tools.push(MeasureTool::Boundary {
+            id: 2,
+            p1: pt(100.0, 100.0),
+            p2: pt(120.0, 100.0),
+            group: 0,
+            fit: crate::measure::FitSettings::default(),
+        });
+        let mut mode = MeasureMode::default();
+        mode.data = data;
+        let computed = computed_of(&mode.data);
+        let ids = mode.tools_in_rect(&computed, pt(0.0, 0.0), pt(50.0, 50.0));
+        assert_eq!(ids, vec![1], "枠内は測長 1 のみ（境界線の中心は枠外）");
+        let ids = mode.tools_in_rect(&computed, pt(90.0, 90.0), pt(130.0, 130.0));
+        assert_eq!(ids, vec![2], "境界線も対象");
     }
 }

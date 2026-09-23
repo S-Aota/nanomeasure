@@ -6,7 +6,8 @@ use egui::Ui;
 
 use crate::command::{Command, CommandCategory, CommandItem, Filter, HistoryFile, load_image};
 use crate::dialogs::{
-    ExportDialog, FilterDialog, LevelsDialog, RotateDialog, ScaleDialog, SettingsDialog,
+    ExportDialog, ExportResultDialog, FilterDialog, LevelsDialog, RotateDialog, ScaleDialog,
+    SettingsDialog,
 };
 use crate::document::{Document, SourceCache};
 use crate::measure_mode::MeasureMode;
@@ -27,6 +28,7 @@ enum Action {
     NewFilter(Filter),
     NewMeasure,
     NewExport,
+    NewExportResult,
     SaveImageExports,
     EditCommand(usize),
     ToggleCommand(usize),
@@ -37,7 +39,7 @@ enum Action {
     CopyCommands,
     PasteCommands,
     Recompute,
-    SaveMeasureResults,
+    SaveResultExports,
     ReloadSources,
     SaveHistory,
     OpenHistory,
@@ -69,6 +71,7 @@ pub struct TemApp {
     levels_dialog: LevelsDialog,
     filter_dialog: FilterDialog,
     export_dialog: ExportDialog,
+    export_result_dialog: ExportResultDialog,
     measure_mode: MeasureMode,
     /// アプリ全体の設定（表示桁数など）。eframe の persistence で保存される。
     settings: Settings,
@@ -97,6 +100,7 @@ impl TemApp {
             levels_dialog: LevelsDialog::default(),
             filter_dialog: FilterDialog::default(),
             export_dialog: ExportDialog::default(),
+            export_result_dialog: ExportResultDialog::default(),
             measure_mode: MeasureMode::default(),
             settings: Settings::load(cc.storage),
             settings_dialog: SettingsDialog::default(),
@@ -245,6 +249,13 @@ impl TemApp {
                             .clicked()
                         {
                             actions.push(Action::NewExport);
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(self.has_image(), egui::Button::new("結果出力..."))
+                            .clicked()
+                        {
+                            actions.push(Action::NewExportResult);
                             ui.close();
                         }
                     });
@@ -423,14 +434,11 @@ impl TemApp {
     fn ui_command_panel(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
         // 測長モード中は右パネルを測長ツール UI に置き換える。
         if self.measure_mode.open {
-            let save_requested = self.measure_mode.show_panel(
+            self.measure_mode.show_panel(
                 ui,
                 &mut self.docs[self.active],
                 self.settings.length_digits,
             );
-            if save_requested {
-                actions.push(Action::SaveMeasureResults);
-            }
             return;
         }
         let dirty = self.doc().is_dirty();
@@ -645,7 +653,11 @@ impl TemApp {
                 ui.label("・フィッティングはピーク（正ピーク固定・負ピーク固定あり）とステップ（正ステップ固定・負ステップ固定あり）を選べます。枠の辺の明暗が方向を示します。");
                 ui.label("・ツール非選択時にフィッティング領域をダブルクリックすると、その測長だけのフィッティング設定を再編集できます（下部に輝度プロファイルとフィット曲線のプロットが出ます。フィッティングなしのモードはクリック位置に縦線）。");
                 ui.label("・直線複製: 測長・境界線をクリックで選択し、マウス移動で方向と距離を指定して、もう一度クリックで確定。ホイールで複製数 (1-20) を調整し、距離を等分した位置に複製します。");
+                ui.label("・複製した測長は、設定の「複製」が「そのまま」なら複製元のグループへ、「グループを追加」なら測長ごとに新しいグループへ入ります。");
+                ui.label("・範囲選択の枠の中を Ctrl キーを押しながらドラッグすると、選択中の測長を複製します（設定の「複製」に従います）。");
+                ui.label("・削除: ツールの「削除」で、測長・補助線をクリックで削除、ドラッグで矩形内のものを一括削除します。");
                 ui.label("・画像出力: コマンド → 出力 → 画像出力... でアノテーション付き画像の保存先を設定します（tif / png / jpg）。決定または「再計算」(F5) で保存されます。");
+                ui.label("・結果出力: コマンド → 出力 → 結果出力... で測定結果 JSON の保存先を設定します。決定または「再計算」(F5) で保存されます。");
                 ui.label("・右ドラッグでパン、ホイールでズームできます（測長モード中も同じ）。");
             });
         self.help_open = help_open;
@@ -702,6 +714,11 @@ impl TemApp {
                 self.close_dialogs();
                 self.export_dialog.open_new(&mut self.docs[index]);
             }
+            Action::NewExportResult => {
+                let index = self.active;
+                self.close_dialogs();
+                self.export_result_dialog.open_new(&mut self.docs[index]);
+            }
             Action::SaveImageExports => self.save_image_exports(),
             Action::OpenSettings => self.settings_dialog.open = true,
             Action::EditCommand(i) => self.edit_command(i),
@@ -734,13 +751,13 @@ impl TemApp {
                 } else {
                     "変更はありません。".to_owned()
                 };
-                // 測長結果の JSON 出力（測長コマンドが無ければ何もしない）。
-                self.save_measure_results();
+                // 測定結果の JSON 出力（結果出力コマンドが無ければ何もしない）。
+                self.save_result_exports();
                 // アノテーション付き画像の書き出し（画像出力コマンドがあれば）。
                 self.save_image_exports();
                 ctx.request_repaint();
             }
-            Action::SaveMeasureResults => self.save_measure_results(),
+            Action::SaveResultExports => self.save_result_exports(),
             Action::ReloadSources => {
                 // 元ファイルを読み直したいときだけキャッシュを捨てる。
                 self.cache.clear();
@@ -765,6 +782,7 @@ impl TemApp {
         self.levels_dialog.open = false;
         self.filter_dialog.open = false;
         self.export_dialog.open = false;
+        self.export_result_dialog.open = false;
         // 測長モードも編集中のダイアログと同様に閉じる（コマンド構造の
         // 変更操作と競合しないように、破棄して終了する）。
         if self.measure_mode.open {
@@ -784,6 +802,7 @@ impl TemApp {
             || self.levels_dialog.open
             || self.filter_dialog.open
             || self.export_dialog.open
+            || self.export_result_dialog.open
             || self.measure_mode.open
     }
 
@@ -835,6 +854,7 @@ impl TemApp {
                 self.measure_mode.open_edit(doc, tab, index)
             }
             Command::ExportImage { .. } => self.export_dialog.open_edit(doc, index),
+            Command::ExportResult { .. } => self.export_result_dialog.open_edit(doc, index),
             Command::InsertImage { path } => {
                 // 画像挿入の「パラメータ」は読み込むファイルそのもの。
                 let mut dialog = rfd::FileDialog::new()
@@ -913,9 +933,9 @@ impl TemApp {
         self.active = self.active.min(self.docs.len() - 1);
     }
 
-    /// アクティブタブの測長コマンドの結果を、それぞれの出力先設定へ
-    /// JSON で保存する。保存が無ければステータスは変えない。
-    fn save_measure_results(&mut self) {
+    /// アクティブタブの結果出力コマンドを実行する。出力先は各コマンドの
+    /// テンプレート（`{dir}` / `{filename}` は画像パスから解決）。
+    fn save_result_exports(&mut self) {
         let doc = &self.docs[self.active];
         let mut saved = Vec::new();
         let mut error = None;
@@ -923,10 +943,10 @@ impl TemApp {
             let Some(item) = doc.commands.get(i) else {
                 continue;
             };
-            if !matches!(&item.command, Command::Measure { .. }) {
+            if !matches!(&item.command, Command::ExportResult { .. }) {
                 continue;
             }
-            match crate::measure_mode::save_measure_json(doc, i) {
+            match crate::export::save_result_json(doc, i) {
                 Ok(Some(path)) => saved.push(path),
                 Ok(None) => {}
                 Err(e) => {
@@ -978,7 +998,7 @@ impl TemApp {
                 error = Some("結果がまだ計算されていません".to_owned());
                 break;
             };
-            let path = crate::measure_mode::resolve_output_path(template, img_path);
+            let path = crate::export::resolve_output_path(template, img_path);
             if !crate::export::validate_extension(&path) {
                 error = Some(format!(
                     "{} は対応していない拡張子です（tif / png / jpg）",
@@ -1315,6 +1335,9 @@ impl eframe::App for TemApp {
         self.filter_dialog.show(&ctx, doc);
         if self.export_dialog.show(&ctx, doc) {
             actions.push(Action::SaveImageExports);
+        }
+        if self.export_result_dialog.show(&ctx, doc) {
+            actions.push(Action::SaveResultExports);
         }
         self.settings_dialog.show(&ctx, &mut self.settings);
         if self.measure_mode.open {

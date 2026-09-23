@@ -6,7 +6,7 @@
 //!
 //! このモジュールは egui に依存しない純粋ロジックのみ。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::{Add, Div, Mul, Sub};
 
 use serde::{Deserialize, Serialize};
@@ -124,13 +124,14 @@ pub enum AngleMode {
     Free,
 }
 
+/// 新しい測長・複製した測長のグループの扱い（「新規測長」「複製」設定で共用）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum NewMeasureMode {
-    /// 新しい二点間測長のたびにチェックを "new group" へ戻す。
+pub enum GroupMode {
+    /// 測長ごとに新しいグループを作る。
     #[default]
     NewGroup,
-    /// 前回測定したグループが有効なまま。
+    /// 前回（または複製元）のグループのまま。
     Keep,
 }
 
@@ -165,12 +166,21 @@ pub struct MeasureGroup {
     pub name: String,
 }
 
-/// 測長モードの設定。デフォルトはすべて左側の選択。
+/// 測長モードの設定。デフォルトはすべて左側の選択（複製のみ右側）。
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MeasurePreferences {
     pub angle: AngleMode,
     pub snap: bool,
-    pub new_measure: NewMeasureMode,
+    pub new_measure: GroupMode,
+    /// 複製（直線複製・Ctrl+ドラッグ）した測長の入れ先グループ。
+    /// 既定は「そのまま」（複製元のグループ）。
+    #[serde(default = "default_duplicate_mode")]
+    pub duplicate: GroupMode,
+}
+
+/// 複製設定の既定値（そのまま）。
+fn default_duplicate_mode() -> GroupMode {
+    GroupMode::Keep
 }
 
 impl Default for MeasurePreferences {
@@ -178,7 +188,8 @@ impl Default for MeasurePreferences {
         Self {
             angle: AngleMode::FourDir,
             snap: false,
-            new_measure: NewMeasureMode::NewGroup,
+            new_measure: GroupMode::NewGroup,
+            duplicate: GroupMode::Keep,
         }
     }
 }
@@ -246,16 +257,6 @@ pub struct MeasureData {
     /// 境界線のフィッティング設定（端点 1 のみ使用）。
     pub boundary_fit: FitSettings,
     pub tools: Vec<MeasureTool>,
-    /// 測定結果 JSON の出力先テンプレート。`{dir}` = 開いている画像の
-    /// フォルダ、`{filename}` = 拡張子なしのファイル名に保存時に置き換わる。
-    /// 空文字列は保存しない。
-    #[serde(default = "default_output_path")]
-    pub output_path: String,
-}
-
-/// 出力先テンプレートの既定値。
-pub fn default_output_path() -> String {
-    "{dir}/{filename}_result.json".to_owned()
 }
 
 impl Default for MeasureData {
@@ -269,7 +270,6 @@ impl Default for MeasureData {
             link_fit: true,
             boundary_fit: FitSettings::default(),
             tools: Vec::new(),
-            output_path: default_output_path(),
         }
     }
 }
@@ -302,8 +302,23 @@ impl MeasureData {
 
     /// 「新規測長: グループを追加」なら次回用にチェックを new group へ戻す。
     pub fn apply_new_measure_mode(&mut self) {
-        if self.prefs.new_measure == NewMeasureMode::NewGroup {
+        if self.prefs.new_measure == GroupMode::NewGroup {
             self.active_group = None;
+        }
+    }
+
+    /// 複製した測長の入れ先グループ。「そのまま」なら複製元のグループ、
+    /// 「グループを追加」なら測長ごとに新しいグループ（結果リストの
+    /// アクティブグループのラジオ選択は変えない）。
+    pub fn group_for_duplicate(&mut self, source_group: u64) -> u64 {
+        match self.prefs.duplicate {
+            GroupMode::Keep => source_group,
+            GroupMode::NewGroup => {
+                let id = self.next_group_id();
+                let name = next_group_name(&self.groups);
+                self.groups.push(MeasureGroup { id, name });
+                id
+            }
         }
     }
 
@@ -358,7 +373,17 @@ impl MeasureData {
                 tools.push(c);
             }
         }
-        ComputedMeasure { tools }
+        // 表示番号: 結果リストと同じ並び（グループ順 → グループ内のツール順）で
+        // #1 から通しに振る（グループごとに振り直さない）。対象は二点間測長のみ。
+        let mut numbers = HashMap::new();
+        let mut n = 0usize;
+        for g in &self.groups {
+            for id in self.group_tools(g.id) {
+                n += 1;
+                numbers.insert(id, n);
+            }
+        }
+        ComputedMeasure { tools, numbers }
     }
 
     fn compute_tool(
@@ -528,11 +553,19 @@ pub struct ComputedTool {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ComputedMeasure {
     pub tools: Vec<ComputedTool>,
+    /// 表示番号（結果リスト・画像ラベル共通）。二点間測長のみに
+    /// グループ順の通し番号が入る。補助線には番号が無い。
+    pub numbers: HashMap<u64, usize>,
 }
 
 impl ComputedMeasure {
     pub fn by_id(&self, id: u64) -> Option<&ComputedTool> {
         self.tools.iter().find(|t| t.id == id)
+    }
+
+    /// ツールの表示番号（結果リストの並びと同じ）。補助線は None。
+    pub fn number(&self, id: u64) -> Option<usize> {
+        self.numbers.get(&id).copied()
     }
 }
 
@@ -757,14 +790,75 @@ mod tests {
         let g2 = data.group_for_new_measurement();
         assert_ne!(g1, g2);
         // Keep モードではそのまま。
-        data.prefs.new_measure = NewMeasureMode::Keep;
+        data.prefs.new_measure = GroupMode::Keep;
         data.apply_new_measure_mode();
         assert_eq!(data.active_group, Some(g2));
     }
 
-    /// 旧形式のデータ（output_path なし）は既定のテンプレートで読めること。
+    /// 複製設定: 「そのまま」は複製元のグループ、「グループを追加」は
+    /// 測長ごとに新グループ（アクティブグループの選択は変えない）。
     #[test]
-    fn output_path_defaults_when_missing() {
+    fn duplicate_group_mode() {
+        let mut data = MeasureData::default();
+        let g = data.group_for_new_measurement();
+        data.active_group = None;
+        // 既定（そのまま）: 複製元のグループへ。
+        assert_eq!(data.group_for_duplicate(g), g);
+        assert_eq!(data.groups.len(), 1);
+        assert_eq!(data.active_group, None, "アクティブグループは変わらない");
+        // グループを追加: 測長ごとに新しいグループ。
+        data.prefs.duplicate = GroupMode::NewGroup;
+        let g2 = data.group_for_duplicate(g);
+        assert_ne!(g2, g);
+        let g3 = data.group_for_duplicate(g);
+        assert_ne!(g2, g3, "複製ごとに別のグループ");
+        assert_eq!(data.groups.len(), 3);
+        assert_eq!(data.active_group, None, "アクティブグループは変わらない");
+    }
+
+    /// 表示番号はグループごとに振り直さず、グループ順の通し番号になること。
+    #[test]
+    fn compute_numbers_increment_across_groups() {
+        let fit = FitSettings::default();
+        let mut data = MeasureData::default();
+        let g1 = data.group_for_new_measurement();
+        data.tools.push(MeasureTool::Distance {
+            id: 1,
+            p1: Pt2::new(0.0, 0.0),
+            p2: Pt2::new(10.0, 0.0),
+            group: g1,
+            fit1: fit,
+            fit2: fit,
+        });
+        data.tools.push(MeasureTool::Distance {
+            id: 2,
+            p1: Pt2::new(0.0, 10.0),
+            p2: Pt2::new(10.0, 10.0),
+            group: g1,
+            fit1: fit,
+            fit2: fit,
+        });
+        // 2 つ目のグループを作って測長を追加。
+        data.prefs.new_measure = GroupMode::NewGroup;
+        data.apply_new_measure_mode();
+        let g2 = data.group_for_new_measurement();
+        data.tools.push(MeasureTool::Distance {
+            id: 3,
+            p1: Pt2::new(0.0, 20.0),
+            p2: Pt2::new(10.0, 20.0),
+            group: g2,
+            fit1: fit,
+            fit2: fit,
+        });
+        let c = data.compute(&Gray16::black(100, 100), None);
+        assert_eq!(c.number(1), Some(1));
+        assert_eq!(c.number(2), Some(2));
+        assert_eq!(c.number(3), Some(3), "グループをまたいで通し番号");
+    }
+
+    /// 旧形式のデータ（output_path 付き）でも未知キーとして無視され読めること。
+    #[test]
+    fn measure_data_with_legacy_output_path_still_loads() {
         let json = r#"{
             "prefs": {"angle": "four_dir", "snap": false, "new_measure": "new_group"},
             "groups": [],
@@ -772,10 +866,11 @@ mod tests {
             "dist_fit1": {"mode": "off", "width_px": 11, "length_px": 31},
             "dist_fit2": {"mode": "off", "width_px": 11, "length_px": 31},
             "boundary_fit": {"mode": "off", "width_px": 11, "length_px": 31},
-            "tools": []
+            "tools": [],
+            "output_path": "{dir}/{filename}_result.json"
         }"#;
-        let data: MeasureData = serde_json::from_str(json).expect("output_path なしでも読める");
-        assert_eq!(data.output_path, "{dir}/{filename}_result.json");
+        let data: MeasureData = serde_json::from_str(json).expect("output_path 付きでも読める");
+        assert!(data.tools.is_empty());
     }
 
     #[test]

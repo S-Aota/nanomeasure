@@ -709,6 +709,128 @@ impl ExportDialog {
     }
 }
 
+// -------------------------------------------------------------- 結果出力
+
+/// 測定結果 JSON の出力先テンプレートを入力する（画像出力と同じ方式）。
+#[derive(Default)]
+pub struct ExportResultDialog {
+    pub open: bool,
+    index: Option<usize>,
+    created: bool,
+    original: Option<Command>,
+    output: String,
+}
+
+impl ExportResultDialog {
+    pub fn open_new(&mut self, doc: &mut Document) {
+        let index = doc.push_command(Command::ExportResult {
+            output: crate::export::DEFAULT_RESULT_PATH.to_owned(),
+        });
+        self.start(doc, index, true);
+    }
+
+    pub fn open_edit(&mut self, doc: &mut Document, index: usize) {
+        self.start(doc, index, false);
+    }
+
+    fn start(&mut self, doc: &Document, index: usize, created: bool) {
+        let original = doc.commands.get(index).map(|c| c.command.clone());
+        self.output = match &original {
+            Some(Command::ExportResult { output }) => output.clone(),
+            _ => crate::export::DEFAULT_RESULT_PATH.to_owned(),
+        };
+        self.index = Some(index);
+        self.created = created;
+        self.original = original;
+        self.open = true;
+    }
+
+    /// ウィンドウを表示する。戻り値は「決定」で保存が要求されたか。
+    pub fn show(&mut self, ctx: &Context, doc: &mut Document) -> bool {
+        if !self.open {
+            return false;
+        }
+        if self.index.is_some_and(|i| i >= doc.commands.len()) {
+            self.open = false;
+            return false;
+        }
+        let index = self.index.expect("open なら index あり");
+
+        let mut window_open = true;
+        let mut confirmed = false;
+        let mut cancelled = false;
+
+        egui::Window::new("結果出力")
+            .open(&mut window_open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(480.0)
+            .show(ctx, |ui| {
+                ui.label("測長の測定結果を JSON で保存します。");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label("出力先:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.output)
+                            .desired_width(330.0)
+                            .hint_text(crate::export::DEFAULT_RESULT_PATH),
+                    );
+                });
+                ui.label(
+                    "{dir} は開いている画像のフォルダ、{filename} は拡張子なしのファイル名に置き換わります。",
+                );
+                if self.output.trim().is_empty() {
+                    ui.colored_label(
+                        Color32::from_rgb(255, 140, 140),
+                        "出力先を入力してください。",
+                    );
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let valid = !self.output.trim().is_empty();
+                    if ui.add_enabled(valid, egui::Button::new("決定")).clicked() {
+                        confirmed = true;
+                    }
+                    if ui.button("キャンセル").clicked() {
+                        cancelled = true;
+                    }
+                });
+            });
+
+        // ライブ反映（他ダイアログと同じ方式。このコマンド自体にプレビューは無い）。
+        set_command(
+            doc,
+            index,
+            Command::ExportResult {
+                output: self.output.clone(),
+            },
+        );
+
+        if cancelled || !window_open {
+            self.revert(doc);
+            self.open = false;
+            return false;
+        }
+        if confirmed {
+            self.original = None;
+            self.open = false;
+            return true;
+        }
+        false
+    }
+
+    fn revert(&mut self, doc: &mut Document) {
+        let Some(index) = self.index else {
+            return;
+        };
+        if self.created {
+            doc.remove_command(index);
+        } else if let Some(original) = self.original.take() {
+            set_command(doc, index, original);
+        }
+    }
+}
+
 // -------------------------------------------------------------- フィルタ
 
 /// 前処理フィルタのパラメータ編集。処理が重いので、スライダーをドラッグ

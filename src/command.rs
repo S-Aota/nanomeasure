@@ -139,6 +139,12 @@ pub enum Command {
         #[serde(default)]
         color: bool,
     },
+    /// 測定結果 JSON の書き出し。画像は変えず、出力先テンプレートを保持する。
+    /// ファイル保存は適用のたびにアプリ側で行う（画像出力コマンドと同じ）。
+    ExportResult {
+        /// 出力先テンプレート。`{dir}` / `{filename}` は保存時に画像パスから解決。
+        output: String,
+    },
 }
 
 fn default_annotation_scale() -> f32 {
@@ -183,6 +189,7 @@ impl Command {
                 let mode = if *color { "（カラー）" } else { "" };
                 format!("画像出力: {output}{mode}")
             }
+            Self::ExportResult { output } => format!("結果出力: {output}"),
         }
     }
 
@@ -213,7 +220,7 @@ impl Command {
                 CommandCategory::Preprocess
             }
             Self::Measure { .. } => CommandCategory::Analysis,
-            Self::ExportImage { .. } => CommandCategory::Output,
+            Self::ExportImage { .. } | Self::ExportResult { .. } => CommandCategory::Output,
         }
     }
 
@@ -258,9 +265,12 @@ impl Command {
                     scale: frame.scale,
                 })
             }
-            // 測長と画像出力は画像を変えない素通しコマンド。オーバーレイと
-            // 測定値はアプリ側で MeasureData::compute により毎回再計算される。
-            Self::Measure { .. } | Self::ExportImage { .. } => Ok(require_input(input)?.clone()),
+            // 測長・画像出力・結果出力は画像を変えない素通しコマンド。
+            // オーバーレイと測定値はアプリ側で MeasureData::compute により
+            // 毎回再計算される。
+            Self::Measure { .. } | Self::ExportImage { .. } | Self::ExportResult { .. } => {
+                Ok(require_input(input)?.clone())
+            }
         }
     }
 }
@@ -394,6 +404,10 @@ mod tests {
             color: false,
         };
         assert_eq!(export.category(), CommandCategory::Output);
+        let result = Command::ExportResult {
+            output: "a.json".into(),
+        };
+        assert_eq!(result.category(), CommandCategory::Output);
         let filter = Command::Filter {
             filter: Filter::GaussianBlur { sigma: 1.0 },
         };
@@ -482,5 +496,16 @@ mod tests {
                 color: false,
             }
         );
+    }
+
+    /// 結果出力コマンドの JSON ラウンドトリップ。
+    #[test]
+    fn export_result_command_round_trips() {
+        let cmd = Command::ExportResult {
+            output: "{dir}/{filename}_result.json".to_owned(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let back: Command = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, cmd);
     }
 }
