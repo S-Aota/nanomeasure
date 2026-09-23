@@ -81,6 +81,9 @@ pub struct TemApp {
     auto_contrast: bool,
     help_open: bool,
     about_open: bool,
+    /// 編集中にタブ切り替えを試みたときの警告。編集中なら切り替えず、
+    /// ポップアップを出して操作を無効化する。
+    tab_switch_warning: Option<usize>,
     status: String,
     error: Option<String>,
     /// コマンドのコピー用。タブをまたいで貼り付けられるようにアプリ側で持つ。
@@ -108,6 +111,7 @@ impl TemApp {
             auto_contrast: true,
             help_open: false,
             about_open: false,
+            tab_switch_warning: None,
             status: "画像をドラッグ&ドロップするか、ファイル → 画像を挿入 で開いてください。"
                 .to_owned(),
             error: None,
@@ -326,7 +330,13 @@ impl TemApp {
                         let selected = i == self.active;
                         let title = self.docs[i].title.clone();
                         if ui.selectable_label(selected, title).clicked() && !selected {
-                            actions.push(Action::SwitchTab(i));
+                            // コマンド編集中（ダイアログ・測長モード）は切り替えない。
+                            // 警告を出して操作を無効化する。
+                            if self.dialog_open() {
+                                self.tab_switch_warning = Some(i);
+                            } else {
+                                actions.push(Action::SwitchTab(i));
+                            }
                         }
                         if ui
                             .add(egui::Button::new("×").small().frame(false))
@@ -1265,6 +1275,28 @@ impl eframe::App for TemApp {
                 self.measure_mode
                     .show_confirm_modal(&ctx, &mut self.docs[tab]);
                 self.measure_mode.show_fit_popup(&ctx, &mut self.docs[tab]);
+            }
+        }
+        // 編集中にタブ切り替えを試みたときの警告。編集が終わっていれば
+        // 警告は消す（ポップアップを出しっぱなしにしない）。
+        if self.tab_switch_warning.is_some() && !self.dialog_open() {
+            self.tab_switch_warning = None;
+        }
+        if self.tab_switch_warning.is_some() {
+            let mut close = false;
+            egui::Window::new("タブの切り替え")
+                .collapsible(false)
+                .resizable(false)
+                .show(&ctx, |ui| {
+                    ui.label("コマンド編集中はタブを切り替えられません。");
+                    ui.label("編集中の内容を完了するか、キャンセルしてから切り替えてください。");
+                    ui.add_space(8.0);
+                    if ui.button("閉じる").clicked() {
+                        close = true;
+                    }
+                });
+            if close {
+                self.tab_switch_warning = None;
             }
         }
         // このフレームでダイアログ・測長モードが閉じたら（決定・キャンセル
