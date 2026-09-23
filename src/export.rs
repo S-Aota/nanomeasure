@@ -341,7 +341,7 @@ fn draw_overlays<P>(
 /// 画像 1px = 画面 1px のときの見た目なので、出力では画像の解像度に
 /// 応じて自動で大きくし、どの解像度でも見た目の大きさが揃うようにする。
 fn base_scale(img: &Gray16) -> f32 {
-    (img.width.max(img.height) as f32 / 1024.0).clamp(1.0, 6.0)
+    (img.width.max(img.height) as f32 / 1024.0).clamp(0.5, 6.0)
 }
 
 /// ラベル描画用フォント。OS のシステムフォントから最初に見つかったもの。
@@ -486,7 +486,7 @@ fn draw_offset_link<P>(
     draw_arrow_head(img, om, (om - sm).normalize(), f, color);
 }
 
-/// 線の中点から少し浮かせて測定値を描く（画面の draw_value_label と同じ位置）。
+/// 線の中点から少し浮かせて測定値を描く（画面の draw_value_label より少し離す）。
 fn draw_value_label<P>(
     img: &mut ImageBuffer<P, Vec<P::Subpixel>>,
     font: Option<&FontArc>,
@@ -506,7 +506,7 @@ fn draw_value_label<P>(
     } else {
         Pt2::new(0.0, 1.0)
     };
-    let anchor = mid + n * 8.0 * f as f64;
+    let anchor = mid + n * 13.0 * f as f64;
     let Some(font) = font else {
         return;
     };

@@ -580,7 +580,7 @@ impl ExportDialog {
         let index = doc.push_command(Command::ExportImage {
             output: crate::export::DEFAULT_EXPORT_PATH.to_owned(),
             annotation_scale: 1.0,
-            color: false,
+            color: true,
         });
         self.start(doc, index, true);
     }
@@ -604,7 +604,7 @@ impl ExportDialog {
             _ => {
                 self.output = crate::export::DEFAULT_EXPORT_PATH.to_owned();
                 self.annotation_scale = 1.0;
-                self.color = false;
+                self.color = true;
             }
         }
         self.index = Some(index);
@@ -664,7 +664,7 @@ impl ExportDialog {
                     .on_hover_text(t!("dlg.export_color_hover").as_ref());
                 ui.add_space(8.0);
                 ui.add(
-                    egui::Slider::new(&mut self.annotation_scale, 0.5..=4.0)
+                    egui::Slider::new(&mut self.annotation_scale, 0.5..=8.0)
                         .text(t!("dlg.annotation_scale").as_ref()),
                 );
                 ui.label(t!("dlg.annotation_scale_hint").as_ref());
