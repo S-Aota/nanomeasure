@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 use egui::Ui;
 
+use rust_i18n::t;
+
 use crate::command::{
     Command, CommandCategory, CommandItem, Filter, FilterKind, HistoryFile, load_image,
 };
@@ -93,8 +95,13 @@ pub struct TemApp {
 impl TemApp {
     pub fn new(cc: &eframe::CreationContext<'_>, startup_files: Vec<PathBuf>) -> Self {
         crate::fonts::install_japanese_font(&cc.egui_ctx);
+        // 保存済みの言語設定を翻訳へ反映し、ウィンドウタイトルも言語に合わせる。
+        let settings = Settings::load(cc.storage);
+        rust_i18n::set_locale(settings.language.code());
+        cc.egui_ctx
+            .send_viewport_cmd(egui::ViewportCommand::Title(t!("app.title").into_owned()));
         let mut app = Self {
-            docs: vec![Document::new("(空)")],
+            docs: vec![Document::new(t!("tab.empty"))],
             active: 0,
             cache: SourceCache::new(),
             scale_dialog: ScaleDialog::default(),
@@ -104,13 +111,12 @@ impl TemApp {
             export_dialog: ExportDialog::default(),
             export_result_dialog: ExportResultDialog::default(),
             measure_mode: MeasureMode::default(),
-            settings: Settings::load(cc.storage),
+            settings,
             settings_dialog: SettingsDialog::default(),
             help_open: false,
             about_open: false,
             tab_switch_warning: None,
-            status: "画像をドラッグ&ドロップするか、ファイル → 画像を挿入 で開いてください。"
-                .to_owned(),
+            status: t!("status.initial").into_owned(),
             error: None,
             clipboard: Vec::new(),
             last_hover: ViewInfo::default(),
@@ -138,24 +144,24 @@ impl TemApp {
     fn ui_menu_bar(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
         egui::Panel::top("menu_bar").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
-                ui.menu_button("ファイル", |ui| {
-                    if ui.button("画像を挿入...").clicked() {
+                ui.menu_button(t!("menu.file").as_ref(), |ui| {
+                    if ui.button(t!("menu.insert_image").as_ref()).clicked() {
                         actions.push(Action::PickImage);
                         ui.close();
                     }
                     ui.separator();
-                    if ui.button("コマンド履歴を保存...").clicked() {
+                    if ui.button(t!("menu.save_history").as_ref()).clicked() {
                         actions.push(Action::SaveHistory);
                         ui.close();
                     }
-                    if ui.button("コマンド履歴を開く...").clicked() {
+                    if ui.button(t!("menu.open_history").as_ref()).clicked() {
                         actions.push(Action::OpenHistory);
                         ui.close();
                     }
                     if ui
                         .add_enabled(
                             self.has_image(),
-                            egui::Button::new("コマンド履歴を現在の画像に適用..."),
+                            egui::Button::new(t!("menu.apply_history").as_ref()),
                         )
                         .clicked()
                     {
@@ -164,61 +170,76 @@ impl TemApp {
                     }
                     ui.separator();
                     if ui
-                        .add_enabled(self.has_image(), egui::Button::new("画像を書き出し..."))
+                        .add_enabled(
+                            self.has_image(),
+                            egui::Button::new(t!("menu.export_image").as_ref()),
+                        )
                         .clicked()
                     {
                         actions.push(Action::ExportImage);
                         ui.close();
                     }
                     ui.separator();
-                    if ui.button("設定...").clicked() {
+                    if ui.button(t!("menu.settings").as_ref()).clicked() {
                         actions.push(Action::OpenSettings);
                         ui.close();
                     }
-                    if ui.button("タブを閉じる").clicked() {
+                    if ui.button(t!("menu.close_tab").as_ref()).clicked() {
                         actions.push(Action::CloseTab(self.active));
                         ui.close();
                     }
-                    if ui.button("終了").clicked() {
+                    if ui.button(t!("menu.quit").as_ref()).clicked() {
                         actions.push(Action::Quit);
                         ui.close();
                     }
                 });
 
-                ui.menu_button("コマンド", |ui| {
-                    ui.menu_button("入力", |ui| {
-                        if ui.button("画像を挿入...").clicked() {
+                ui.menu_button(t!("menu.command").as_ref(), |ui| {
+                    ui.menu_button(t!("menu.input").as_ref(), |ui| {
+                        if ui.button(t!("menu.insert_image").as_ref()).clicked() {
                             actions.push(Action::PickImage);
                             ui.close();
                         }
                         if ui
-                            .add_enabled(self.has_image(), egui::Button::new("スケール設定..."))
+                            .add_enabled(
+                                self.has_image(),
+                                egui::Button::new(t!("menu.scale_settings").as_ref()),
+                            )
                             .clicked()
                         {
                             actions.push(Action::NewScale);
                             ui.close();
                         }
                     });
-                    ui.menu_button("前処理", |ui| {
+                    ui.menu_button(t!("menu.preprocess").as_ref(), |ui| {
                         if ui
-                            .add_enabled(self.has_image(), egui::Button::new("画像の回転..."))
+                            .add_enabled(
+                                self.has_image(),
+                                egui::Button::new(t!("menu.rotate").as_ref()),
+                            )
                             .clicked()
                         {
                             actions.push(Action::NewRotate);
                             ui.close();
                         }
                         if ui
-                            .add_enabled(self.has_image(), egui::Button::new("レベル補正..."))
+                            .add_enabled(
+                                self.has_image(),
+                                egui::Button::new(t!("menu.levels").as_ref()),
+                            )
                             .clicked()
                         {
                             actions.push(Action::NewLevels);
                             ui.close();
                         }
-                        ui.menu_button("フィルタ", |ui| {
+                        ui.menu_button(t!("menu.filter").as_ref(), |ui| {
                             for (name, kind) in [
-                                ("ガウシアンぼかし...", FilterKind::GaussianBlur),
-                                ("メディアン...", FilterKind::Median),
-                                ("アンシャープマスク...", FilterKind::UnsharpMask),
+                                (
+                                    t!("menu.filter_gaussian").as_ref(),
+                                    FilterKind::GaussianBlur,
+                                ),
+                                (t!("menu.filter_median").as_ref(), FilterKind::Median),
+                                (t!("menu.filter_unsharp").as_ref(), FilterKind::UnsharpMask),
                             ] {
                                 if ui
                                     .add_enabled(self.has_image(), egui::Button::new(name))
@@ -230,25 +251,34 @@ impl TemApp {
                             }
                         });
                     });
-                    ui.menu_button("解析", |ui| {
+                    ui.menu_button(t!("menu.analysis").as_ref(), |ui| {
                         if ui
-                            .add_enabled(self.has_image(), egui::Button::new("測長..."))
+                            .add_enabled(
+                                self.has_image(),
+                                egui::Button::new(t!("menu.measure").as_ref()),
+                            )
                             .clicked()
                         {
                             actions.push(Action::NewMeasure);
                             ui.close();
                         }
                     });
-                    ui.menu_button("出力", |ui| {
+                    ui.menu_button(t!("menu.output").as_ref(), |ui| {
                         if ui
-                            .add_enabled(self.has_image(), egui::Button::new("画像出力..."))
+                            .add_enabled(
+                                self.has_image(),
+                                egui::Button::new(t!("menu.image_output").as_ref()),
+                            )
                             .clicked()
                         {
                             actions.push(Action::NewExport);
                             ui.close();
                         }
                         if ui
-                            .add_enabled(self.has_image(), egui::Button::new("結果出力..."))
+                            .add_enabled(
+                                self.has_image(),
+                                egui::Button::new(t!("menu.result_output").as_ref()),
+                            )
                             .clicked()
                         {
                             actions.push(Action::NewExportResult);
@@ -260,7 +290,7 @@ impl TemApp {
                     if ui
                         .add_enabled(
                             self.doc().has_selection(),
-                            egui::Button::new("コピー").shortcut_text("Ctrl+C"),
+                            egui::Button::new(t!("menu.copy").as_ref()).shortcut_text("Ctrl+C"),
                         )
                         .clicked()
                     {
@@ -270,16 +300,19 @@ impl TemApp {
                     if ui
                         .add_enabled(
                             !self.clipboard.is_empty(),
-                            egui::Button::new("貼り付け").shortcut_text("Ctrl+V"),
+                            egui::Button::new(t!("menu.paste").as_ref()).shortcut_text("Ctrl+V"),
                         )
-                        .on_hover_text("各カテゴリのリスト末尾に追加します")
+                        .on_hover_text(t!("menu.paste_hover").as_ref())
                         .clicked()
                     {
                         actions.push(Action::PasteCommands);
                         ui.close();
                     }
                     if ui
-                        .add_enabled(self.doc().has_selection(), egui::Button::new("選択を解除"))
+                        .add_enabled(
+                            self.doc().has_selection(),
+                            egui::Button::new(t!("menu.clear_selection").as_ref()),
+                        )
                         .clicked()
                     {
                         actions.push(Action::ClearSelection);
@@ -288,16 +321,16 @@ impl TemApp {
 
                     ui.separator();
                     if ui
-                        .add(egui::Button::new("再計算").shortcut_text("F5"))
-                        .on_hover_text("未反映の変更を実行して表示を更新します")
+                        .add(egui::Button::new(t!("menu.recompute").as_ref()).shortcut_text("F5"))
+                        .on_hover_text(t!("menu.recompute_hover").as_ref())
                         .clicked()
                     {
                         actions.push(Action::Recompute);
                         ui.close();
                     }
                     if ui
-                        .button("元ファイルを読み直して再計算")
-                        .on_hover_text("ディスク上の画像が更新されたときに使います")
+                        .button(t!("menu.reload_sources").as_ref())
+                        .on_hover_text(t!("menu.reload_hover").as_ref())
                         .clicked()
                     {
                         actions.push(Action::ReloadSources);
@@ -305,12 +338,12 @@ impl TemApp {
                     }
                 });
 
-                ui.menu_button("ヘルプ", |ui| {
-                    if ui.button("操作方法").clicked() {
+                ui.menu_button(t!("menu.help").as_ref(), |ui| {
+                    if ui.button(t!("menu.how_to").as_ref()).clicked() {
                         self.help_open = true;
                         ui.close();
                     }
-                    if ui.button("バージョン情報").clicked() {
+                    if ui.button(t!("menu.about").as_ref()).clicked() {
                         self.about_open = true;
                         ui.close();
                     }
@@ -337,14 +370,18 @@ impl TemApp {
                         }
                         if ui
                             .add(egui::Button::new("×").small().frame(false))
-                            .on_hover_text("タブを閉じる")
+                            .on_hover_text(t!("tab.close_hover").as_ref())
                             .clicked()
                         {
                             actions.push(Action::CloseTab(i));
                         }
                         ui.separator();
                     }
-                    if ui.button("＋").on_hover_text("画像を挿入").clicked() {
+                    if ui
+                        .button("＋")
+                        .on_hover_text(t!("tab.insert_hover").as_ref())
+                        .clicked()
+                    {
                         actions.push(Action::PickImage);
                     }
                 });
@@ -395,7 +432,7 @@ impl TemApp {
                     ui.label(format!("{:.0} %", doc.view.zoom * 100.0));
                     ui.separator();
                     ui.label(scale.describe(digits))
-                        .on_hover_text("スケール設定コマンドで変更できます");
+                        .on_hover_text(t!("status.scale_change_hover").as_ref());
                     ui.separator();
                     // カーソル位置は画素と実寸法の両方を出す。
                     let per_px = scale.per_px();
@@ -415,9 +452,8 @@ impl TemApp {
                     ui.separator();
                     ui.label(format!("{:.0} %", doc.view.zoom * 100.0));
                     ui.separator();
-                    ui.label("スケール未設定").on_hover_text(
-                        "メタデータから画素サイズを読み取れませんでした。スケール設定コマンドで設定すると実寸法を出せます。",
-                    );
+                    ui.label(t!("status.no_scale").as_ref())
+                        .on_hover_text(t!("status.no_scale_hover").as_ref());
                     ui.separator();
                     match (self.last_hover.hover_px, self.last_hover.hover_value) {
                         (Some((x, y)), Some(v)) => ui.monospace(format!("({x}, {y}) px  I={v}")),
@@ -453,44 +489,56 @@ impl TemApp {
                     // 未反映の変更があるときだけ、ボタンを目立つ色にする。
                     let button = if dirty {
                         egui::Button::new(
-                            egui::RichText::new("再計算")
+                            egui::RichText::new(t!("menu.recompute"))
                                 .strong()
                                 .color(egui::Color32::BLACK),
                         )
                         .fill(egui::Color32::from_rgb(235, 165, 60))
                     } else {
-                        egui::Button::new("再計算")
+                        egui::Button::new(t!("menu.recompute").as_ref())
                     };
                     let hint = if dirty {
-                        "未反映の変更があります。押すとコマンドを実行して表示を更新します"
+                        t!("panel.dirty_hint")
                     } else {
-                        "表示は最新です"
+                        t!("panel.up_to_date")
                     };
-                    if ui.add(button).on_hover_text(hint).clicked() {
+                    if ui.add(button).on_hover_text(hint.as_ref()).clicked() {
                         actions.push(Action::Recompute);
                     }
-                    ui.label("処理（コマンド）");
+                    ui.label(t!("panel.processes").as_ref());
                     if dirty {
-                        ui.colored_label(egui::Color32::from_rgb(235, 165, 60), "未反映");
+                        ui.colored_label(
+                            egui::Color32::from_rgb(235, 165, 60),
+                            t!("panel.not_applied").as_ref(),
+                        );
                     }
                 });
                 ui.horizontal(|ui| {
                     if ui
-                        .add_enabled(has_selection, egui::Button::new("コピー").small())
-                        .on_hover_text("選択した処理をコピーします (Ctrl+C)")
+                        .add_enabled(
+                            has_selection,
+                            egui::Button::new(t!("menu.copy").as_ref()).small(),
+                        )
+                        .on_hover_text(t!("panel.copy_hover").as_ref())
                         .clicked()
                     {
                         actions.push(Action::CopyCommands);
                     }
                     if ui
-                        .add_enabled(can_paste, egui::Button::new("貼り付け").small())
-                        .on_hover_text("各カテゴリのリスト末尾に追加します (Ctrl+V)")
+                        .add_enabled(
+                            can_paste,
+                            egui::Button::new(t!("menu.paste").as_ref()).small(),
+                        )
+                        .on_hover_text(t!("panel.paste_hover").as_ref())
                         .clicked()
                     {
                         actions.push(Action::PasteCommands);
                     }
                     if ui
-                        .add_enabled(has_selection, egui::Button::new("選択解除").small())
+                        .add_enabled(
+                            has_selection,
+                            egui::Button::new(t!("panel.clear_selection").as_ref()).small(),
+                        )
                         .clicked()
                     {
                         actions.push(Action::ClearSelection);
@@ -501,7 +549,7 @@ impl TemApp {
                 let doc = &mut self.docs[self.active];
                 if doc.commands.is_empty() {
                     ui.add_space(8.0);
-                    ui.weak("まだ処理はありません。");
+                    ui.weak(t!("panel.no_commands").as_ref());
                     return;
                 }
 
@@ -534,7 +582,7 @@ impl TemApp {
                                         let item = doc.commands.get_mut(i).expect("行は範囲内");
                                         let toggled = ui
                                             .checkbox(&mut item.enabled, "")
-                                            .on_hover_text("外すとこの処理を一時的に無効化します")
+                                            .on_hover_text(t!("panel.disable_hover").as_ref())
                                             .changed();
 
                                         let label = item.command.label(self.settings.length_digits);
@@ -549,22 +597,29 @@ impl TemApp {
                                                     .truncate()
                                                     .sense(egui::Sense::click()),
                                             )
-                                            .on_hover_text(
-                                                "クリックで選択（Ctrl / Shift で複数選択）\n\
-                                                 ダブルクリックでパラメータを再編集",
-                                            );
+                                            .on_hover_text(t!("panel.row_hover").as_ref());
                                         (toggled, resp)
                                     },
                                     |ui| {
                                         let mut moved = None;
-                                        if ui.small_button("×").on_hover_text("削除").clicked() {
+                                        if ui
+                                            .small_button("×")
+                                            .on_hover_text(t!("panel.delete").as_ref())
+                                            .clicked()
+                                        {
                                             moved = Some(Action::DeleteCommand(i));
                                         }
-                                        if ui.small_button("▼").on_hover_text("下へ").clicked()
+                                        if ui
+                                            .small_button("▼")
+                                            .on_hover_text(t!("panel.move_down").as_ref())
+                                            .clicked()
                                         {
                                             moved = Some(Action::MoveCommand(i, 1));
                                         }
-                                        if ui.small_button("▲").on_hover_text("上へ").clicked()
+                                        if ui
+                                            .small_button("▲")
+                                            .on_hover_text(t!("panel.move_up").as_ref())
+                                            .clicked()
                                         {
                                             moved = Some(Action::MoveCommand(i, -1));
                                         }
@@ -617,59 +672,57 @@ impl TemApp {
 
     fn ui_help_windows(&mut self, ctx: &egui::Context) {
         let mut help_open = self.help_open;
-        egui::Window::new("操作方法")
+        egui::Window::new(t!("help.title").as_ref())
             .open(&mut help_open)
             .resizable(false)
             .show(ctx, |ui| {
-                ui.label("・画像表示領域にファイルをドラッグ&ドロップすると画像を挿入します。");
-                ui.label("・マウスホイールで拡大縮小（カーソル位置を中心）。");
-                ui.label("・右ドラッグでパン。");
-                ui.label(
-                    "・右のリストの行をダブルクリックすると、その処理のパラメータを再編集できます。",
-                );
-                ui.label("・チェックを外すと、その処理だけを一時的に無効化できます。");
-                ui.label("・行をクリックすると選択されます。Ctrl クリックで追加・解除、Shift クリックで範囲選択。");
-                ui.label("・選択した処理は Ctrl+C でコピー、Ctrl+V で貼り付けできます。別のタブへも貼り付けられます。");
-                ui.label("・貼り付けは各カテゴリのリスト末尾に追加されます。");
-                ui.label("・処理は 入力 → 前処理 → 解析 → 出力 のカテゴリ順に実行されます。追加した処理はそのカテゴリの末尾に入り、▲▼ でカテゴリ内の順序だけを入れ替えられます。");
+                ui.label(t!("help.drag_drop").as_ref());
+                ui.label(t!("help.zoom").as_ref());
+                ui.label(t!("help.pan").as_ref());
+                ui.label(t!("help.reopen_params").as_ref());
+                ui.label(t!("help.disable_item").as_ref());
+                ui.label(t!("help.select_rows").as_ref());
+                ui.label(t!("help.copy_paste").as_ref());
+                ui.label(t!("help.paste_position").as_ref());
+                ui.label(t!("help.category_order").as_ref());
                 ui.separator();
-                ui.label("・並べ替え・有効無効の切り替え・削除・貼り付けは、すぐには計算されません。「再計算」(F5) を押すまで表示（測長の結果を含む）は変わらず、その間ボタンが橙色になります。");
-                ui.label("・パラメータ調整ダイアログ・測長モードを開いている間は、結果をその場で見られるように自動で計算します。閉じたとき（キャンセル時は元の値に戻して）にも計算し直します。");
-                ui.label("・画像挿入の行をダブルクリックして読み込むファイルを変えると、すぐに計算し直します。");
-                ui.label("・画像出力・結果出力のファイル保存は「再計算」(F5) を押したときだけ行います（ダイアログの「決定」では保存しません）。");
-                ui.label("・ディスク上の画像が更新されたときは、コマンド → 元ファイルを読み直して再計算 を使ってください。");
+                ui.label(t!("help.recompute_note").as_ref());
+                ui.label(t!("help.preview_note").as_ref());
+                ui.label(t!("help.change_insert_file").as_ref());
+                ui.label(t!("help.export_on_recompute").as_ref());
+                ui.label(t!("help.reload_sources").as_ref());
                 ui.separator();
-                ui.label("・TIFF の FEI / Thermo Fisher タグ、または ImageJ の単位情報から画素の実寸法が読めた場合、画像挿入の直後に「スケール設定」コマンドが自動で追加されます。");
-                ui.label("・読めなかった場合はスケール未設定となり、実寸法は出せません（画素単位のまま）。コマンド → 入力 → スケール設定 で、スケールバーから読み取った値を手で入れられます。");
+                ui.label(t!("help.auto_scale").as_ref());
+                ui.label(t!("help.manual_scale").as_ref());
                 ui.separator();
-                ui.label("・フィルタ（ガウシアンぼかし・メディアン・アンシャープマスク）: コマンド → 前処理 → フィルタ から追加できます。");
+                ui.label(t!("help.filters").as_ref());
                 ui.separator();
-                ui.label("・測長: コマンド → 解析 → 測長... で右パネルが測長ツールに切り替わります。");
-                ui.label("・二点間測長・境界線は、画像上を 2 回クリックして作成します（Esc または右クリックで作成途中をキャンセル）。");
-                ui.label("・測長モード中は Ctrl+Z / Ctrl+Shift+Z でツール操作の取り消し・やり直しができます。");
-                ui.label("・スナップ on のとき、二点間測長の端点は既存の境界線・オフセット線に吸い付きます。");
-                ui.label("・非選択状態では測長・境界線をクリックして選択し、ドラッグで移動できます（端点付近のクリックは端点だけ、線の上は全体が動きます）。");
-                ui.label("・範囲選択: ツールの「範囲選択」でドラッグすると、中心位置が枠内の測長をまとめて選択します。枠の中のドラッグで一括移動、枠の辺・角のドラッグで測長ごと拡大縮小します（反対側の辺が基準）。フィッティングの再計算はドラッグを終えてから行います。");
-                ui.label("・フィッティングはピーク（正ピーク固定・負ピーク固定あり）とステップ（正ステップ固定・負ステップ固定あり）を選べます。枠の辺の明暗が方向を示します。");
-                ui.label("・ツール非選択時にフィッティング領域をダブルクリックすると、その測長だけのフィッティング設定を再編集できます（下部に輝度プロファイルとフィット曲線のプロットが出ます。フィッティングなしのモードはクリック位置に縦線）。");
-                ui.label("・直線複製: 測長・境界線をクリックで選択し、マウス移動で方向と距離を指定して、もう一度クリックで確定。ホイールで複製数 (1-20) を調整し、距離を等分した位置に複製します。");
-                ui.label("・複製した測長は、設定の「複製」が「そのまま」なら複製元のグループへ、「グループを追加」なら測長ごとに新しいグループへ入ります。");
-                ui.label("・範囲選択の枠の中を Ctrl キーを押しながらドラッグすると、選択中の測長を複製します（設定の「複製」に従います）。");
-                ui.label("・削除: ツールの「削除」で、測長・補助線をクリックで削除、ドラッグで矩形内のものを一括削除します。");
-                ui.label("・画像出力: コマンド → 出力 → 画像出力... でアノテーション付き画像の保存先を設定します（tif / png / jpg）。「再計算」(F5) で保存されます。");
-                ui.label("・結果出力: コマンド → 出力 → 結果出力... で測定結果 JSON の保存先を設定します。「再計算」(F5) で保存されます。");
-                ui.label("・右ドラッグでパン、ホイールでズームできます（測長モード中も同じ）。");
+                ui.label(t!("help.measure_intro").as_ref());
+                ui.label(t!("help.measure_create").as_ref());
+                ui.label(t!("help.measure_undo").as_ref());
+                ui.label(t!("help.measure_snap").as_ref());
+                ui.label(t!("help.measure_select_move").as_ref());
+                ui.label(t!("help.measure_range_select").as_ref());
+                ui.label(t!("help.measure_fitting").as_ref());
+                ui.label(t!("help.measure_fit_edit").as_ref());
+                ui.label(t!("help.measure_duplicate").as_ref());
+                ui.label(t!("help.measure_duplicate_group").as_ref());
+                ui.label(t!("help.measure_duplicate_ctrl").as_ref());
+                ui.label(t!("help.measure_delete").as_ref());
+                ui.label(t!("help.export_image_note").as_ref());
+                ui.label(t!("help.export_result_note").as_ref());
+                ui.label(t!("help.pan_zoom_again").as_ref());
             });
         self.help_open = help_open;
 
         let mut about_open = self.about_open;
-        egui::Window::new("バージョン情報")
+        egui::Window::new(t!("about.title").as_ref())
             .open(&mut about_open)
             .resizable(false)
             .show(ctx, |ui| {
                 ui.label(format!("tem_measure {}", env!("CARGO_PKG_VERSION")));
-                ui.label("TEM 画像の解析用ツール");
-                ui.label("内部処理は 16bit グレースケールで行います。");
+                ui.label(t!("about.description").as_ref());
+                ui.label(t!("about.bit_depth").as_ref());
             });
         self.about_open = about_open;
     }
@@ -680,8 +733,8 @@ impl TemApp {
         match action {
             Action::PickImage => {
                 if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("画像", IMAGE_EXTENSIONS)
-                    .set_title("画像を挿入")
+                    .add_filter(t!("dialogs.filter_image").as_ref(), IMAGE_EXTENSIONS)
+                    .set_title(t!("dialogs.title_insert").as_ref())
                     .pick_file()
                 {
                     self.insert_image(path);
@@ -746,9 +799,9 @@ impl TemApp {
                 let dirty = self.docs[active].is_dirty();
                 self.docs[active].recompute(&mut self.cache);
                 self.status = if dirty {
-                    "コマンドを実行しました。".to_owned()
+                    t!("status.executed").into_owned()
                 } else {
-                    "変更はありません。".to_owned()
+                    t!("status.no_changes").into_owned()
                 };
                 // ファイル出力は副作用なので、このボタン（F5）を押したときだけ行う。
                 self.run_exports();
@@ -760,7 +813,7 @@ impl TemApp {
                 let active = self.active;
                 self.docs[active].invalidate_all();
                 self.docs[active].recompute(&mut self.cache);
-                self.status = "元ファイルを読み直して再計算しました。".to_owned();
+                self.status = t!("status.reloaded").into_owned();
                 ctx.request_repaint();
             }
             Action::SaveHistory => self.save_history(),
@@ -772,7 +825,7 @@ impl TemApp {
                 // 切り替える前に（元のタブで）破棄して閉じる。
                 if self.dialog_open() {
                     self.close_dialogs();
-                    self.status = "タブが切り替わったため、編集中の処理を破棄しました。".to_owned();
+                    self.status = t!("status.tab_switched_discard").into_owned();
                 }
                 self.active = i.min(self.docs.len() - 1);
             }
@@ -836,7 +889,7 @@ impl TemApp {
         if picked.is_empty() {
             return;
         }
-        self.status = format!("{} 件の処理をコピーしました。", picked.len());
+        self.status = t!("status.copied_count", count = picked.len()).into_owned();
         self.clipboard = picked;
     }
 
@@ -853,9 +906,7 @@ impl TemApp {
         let indices = doc.extend_commands(items);
         // 貼り付けた行を選択し直しておくと、続けて貼っても位置が分かりやすい。
         doc.select_indices(indices);
-        self.status = format!(
-            "{count} 件の処理を各カテゴリの末尾に貼り付けました（「再計算」で反映されます）。"
-        );
+        self.status = t!("status.pasted_count", count = count).into_owned();
     }
 
     fn edit_command(&mut self, index: usize) {
@@ -878,8 +929,8 @@ impl TemApp {
             Command::InsertImage { path } => {
                 // 画像挿入の「パラメータ」は読み込むファイルそのもの。
                 let mut dialog = rfd::FileDialog::new()
-                    .add_filter("画像", IMAGE_EXTENSIONS)
-                    .set_title("読み込むファイルを変更");
+                    .add_filter(t!("dialogs.filter_image").as_ref(), IMAGE_EXTENSIONS)
+                    .set_title(t!("dialogs.title_change_file").as_ref());
                 if let Some(parent) = path.parent() {
                     dialog = dialog.set_directory(parent);
                 }
@@ -936,11 +987,12 @@ impl TemApp {
         doc.view.request_fit();
 
         self.status = match auto_scale {
-            Some(scale) => format!(
-                "画像を挿入しました（メタデータからスケールを取得: {}）。",
-                scale.describe(self.settings.length_digits)
-            ),
-            None => "画像を挿入しました（スケール情報なし）。".to_owned(),
+            Some(scale) => t!(
+                "status.inserted_with_scale",
+                scale = scale.describe(self.settings.length_digits)
+            )
+            .into_owned(),
+            None => t!("status.inserted_no_scale").into_owned(),
         };
     }
 
@@ -952,7 +1004,7 @@ impl TemApp {
         self.docs.remove(index);
         prune_source_cache(&mut self.cache);
         if self.docs.is_empty() {
-            self.docs.push(Document::new("(空)"));
+            self.docs.push(Document::new(t!("tab.empty")));
         }
         self.active = self.active.min(self.docs.len() - 1);
     }
@@ -986,14 +1038,14 @@ impl TemApp {
         }
         self.error = None;
         let names: Vec<String> = saved.iter().map(|p| file_label(p)).collect();
-        self.status = format!("保存しました: {}", names.join(", "));
+        self.status = t!("status.saved_files", names = names.join(", ")).into_owned();
     }
 
     fn save_history(&mut self) {
         let Some(path) = rfd::FileDialog::new()
-            .add_filter("コマンド履歴 (JSON)", &["json"])
+            .add_filter(t!("dialogs.filter_history").as_ref(), &["json"])
             .set_file_name("history.json")
-            .set_title("コマンド履歴を保存")
+            .set_title(t!("dialogs.title_save_history").as_ref())
             .save_file()
         else {
             return;
@@ -1002,7 +1054,7 @@ impl TemApp {
         match file.save(&path) {
             Ok(()) => {
                 self.error = None;
-                self.status = format!("{} に保存しました。", file_label(&path));
+                self.status = t!("status.saved_to", path = file_label(&path)).into_owned();
             }
             Err(e) => self.error = Some(e),
         }
@@ -1010,8 +1062,8 @@ impl TemApp {
 
     fn open_history(&mut self) {
         let Some(path) = rfd::FileDialog::new()
-            .add_filter("コマンド履歴 (JSON)", &["json"])
-            .set_title("コマンド履歴を開く")
+            .add_filter(t!("dialogs.filter_history").as_ref(), &["json"])
+            .set_title(t!("dialogs.title_open_history").as_ref())
             .pick_file()
         else {
             return;
@@ -1050,13 +1102,13 @@ impl TemApp {
             self.active = self.docs.len() - 1;
         }
         self.error = None;
-        self.status = "コマンド履歴を開きました。".to_owned();
+        self.status = t!("status.history_opened").into_owned();
     }
 
     fn apply_history(&mut self) {
         let Some(path) = rfd::FileDialog::new()
-            .add_filter("コマンド履歴 (JSON)", &["json"])
-            .set_title("コマンド履歴を現在の画像に適用")
+            .add_filter(t!("dialogs.filter_history").as_ref(), &["json"])
+            .set_title(t!("dialogs.title_apply_history").as_ref())
             .pick_file()
         else {
             return;
@@ -1074,7 +1126,7 @@ impl TemApp {
         let count = items.len();
         self.doc_mut().extend_commands(items);
         self.error = None;
-        self.status = format!("{count} 件の処理を追加しました。");
+        self.status = t!("status.added_count", count = count).into_owned();
     }
 
     fn export_image(&mut self) {
@@ -1085,7 +1137,7 @@ impl TemApp {
             .add_filter("PNG", &["png"])
             .add_filter("TIFF", &["tif", "tiff"])
             .set_file_name("export.png")
-            .set_title("画像を書き出し")
+            .set_title(t!("dialogs.title_export_image").as_ref())
             .save_file()
         else {
             return;
@@ -1094,9 +1146,11 @@ impl TemApp {
         match img.to_luma16_buffer().save(&path) {
             Ok(()) => {
                 self.error = None;
-                self.status = format!("{} に書き出しました。", file_label(&path));
+                self.status = t!("status.exported_to", path = file_label(&path)).into_owned();
             }
-            Err(e) => self.error = Some(format!("書き出しに失敗しました: {e}")),
+            Err(e) => {
+                self.error = Some(t!("status.export_failed", error = format!("{e}")).into_owned())
+            }
         }
     }
 
@@ -1146,7 +1200,7 @@ impl TemApp {
             painter.text(
                 screen.center(),
                 egui::Align2::CENTER_CENTER,
-                "ドロップして画像を挿入",
+                t!("status.drop_here").as_ref(),
                 egui::FontId::proportional(24.0),
                 egui::Color32::WHITE,
             );
@@ -1173,7 +1227,7 @@ impl eframe::App for TemApp {
         // 測長モード中にタブが切り替わったら、編集を破棄して終了する。
         if self.measure_mode.open && self.measure_mode.tab != self.active {
             self.close_dialogs();
-            self.status = "タブが切り替わったため、測長モードを終了しました。".to_owned();
+            self.status = t!("status.measure_mode_ended").into_owned();
         }
 
         // 自動で計算するのは次の 2 つの場合だけ。それ以外の変更（並べ替え・
@@ -1275,14 +1329,14 @@ impl eframe::App for TemApp {
         }
         if self.tab_switch_warning.is_some() {
             let mut close = false;
-            egui::Window::new("タブの切り替え")
+            egui::Window::new(t!("tabswitch.title").as_ref())
                 .collapsible(false)
                 .resizable(false)
                 .show(&ctx, |ui| {
-                    ui.label("コマンド編集中はタブを切り替えられません。");
-                    ui.label("編集中の内容を完了するか、キャンセルしてから切り替えてください。");
+                    ui.label(t!("tabswitch.body1").as_ref());
+                    ui.label(t!("tabswitch.body2").as_ref());
                     ui.add_space(8.0);
-                    if ui.button("閉じる").clicked() {
+                    if ui.button(t!("tabswitch.close").as_ref()).clicked() {
                         close = true;
                     }
                 });
@@ -1307,4 +1361,39 @@ fn file_label(path: &std::path::Path) -> String {
     path.file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
+#[cfg(test)]
+mod i18n_tests {
+    use rust_i18n::t;
+
+    /// キーが欠けているとキー名そのものが表示されるので、全ロケールで
+    /// 主要なキーが翻訳されていることを確かめる。
+    #[test]
+    fn keys_resolve_in_all_locales() {
+        for locale in ["en", "ja", "kr", "cn", "tw"] {
+            rust_i18n::set_locale(locale);
+            for key in [
+                "menu.file",
+                "panel.row_hover",
+                "help.measure_duplicate",
+                "cmd.category.input",
+                "cmd.measure",
+                "dlg.ok",
+                "dlg.levels_histogram",
+                "mm.tool.distance",
+                "mm.fit_off",
+                "mm.csv_stats_header",
+                "exp.no_image",
+                "view.drop_hint",
+                "fonts.not_found",
+            ] {
+                assert_ne!(t!(key).as_ref(), key, "locale {locale}: missing {key}");
+            }
+            let copied = t!("status.copied_count", count = 3).into_owned();
+            assert!(!copied.contains("status.copied_count"));
+        }
+        // 他のテストに影響しないよう、既定の言語へ戻す。
+        rust_i18n::set_locale(crate::settings::Language::default().code());
+    }
 }

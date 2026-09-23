@@ -49,7 +49,7 @@ pub fn install_japanese_font(ctx: &Context) {
         ctx.set_fonts(fonts);
         return;
     }
-    eprintln!("日本語フォントが見つかりませんでした。日本語が表示されない場合があります。");
+    eprintln!("{}", rust_i18n::t!("fonts.not_found"));
 }
 
 /// 書き出し画像のラベル描画用に、最初に見つかったフォントのバイト列と

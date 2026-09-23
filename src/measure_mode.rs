@@ -5,12 +5,15 @@
 //! 同じ方式）。決定で確定、キャンセルは確認を経て破棄。ツール操作は
 //! Ctrl+Z / Ctrl+Shift+Z で undo / redo できる。
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::sync::Arc;
 
 use egui::{
     Align2, Color32, Context, CursorIcon, FontId, Painter, Pos2, Rect, Sense, Stroke, Ui, Vec2,
 };
+
+use rust_i18n::t;
 
 use crate::command::Command;
 use crate::dialogs::set_command;
@@ -113,14 +116,14 @@ pub enum ToolButton {
 }
 
 impl ToolButton {
-    pub fn label(self) -> &'static str {
+    pub fn label(self) -> Cow<'static, str> {
         match self {
-            Self::Distance => "二点間測長",
-            Self::Boundary => "境界線",
-            Self::Offset => "オフセット線",
-            Self::LinearDuplicate => "直線複製",
-            Self::RangeSelect => "範囲選択",
-            Self::Delete => "削除",
+            Self::Distance => t!("mm.tool.distance"),
+            Self::Boundary => t!("mm.tool.boundary"),
+            Self::Offset => t!("mm.tool.offset"),
+            Self::LinearDuplicate => t!("mm.tool.duplicate"),
+            Self::RangeSelect => t!("mm.tool.range_select"),
+            Self::Delete => t!("mm.tool.delete"),
         }
     }
 }
@@ -541,7 +544,7 @@ impl MeasureMode {
             .min_size(220.0)
             .show(ui, |ui| {
                 ui.add_space(4.0);
-                ui.strong("測長");
+                ui.strong(t!("mm.panel_title").as_ref());
                 ui.separator();
 
                 self.settings_ui(ui, doc);
@@ -553,10 +556,10 @@ impl MeasureMode {
                 egui::Panel::bottom("measure_confirm_buttons").show(ui, |ui| {
                     ui.add_space(2.0);
                     ui.horizontal(|ui| {
-                        if ui.button("決定").clicked() {
+                        if ui.button(t!("dlg.ok").as_ref()).clicked() {
                             confirmed = true;
                         }
-                        if ui.button("キャンセル").clicked() {
+                        if ui.button(t!("dlg.cancel").as_ref()).clicked() {
                             cancel_requested = true;
                         }
                     });
@@ -591,12 +594,12 @@ impl MeasureMode {
         let mut open = true;
         let mut outcome = FitUiOutcome::default();
         let mut target_gone = false;
-        egui::Window::new("端点のフィッティング設定")
+        egui::Window::new(t!("mm.fit_title").as_ref())
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
-                ui.label("この端点のフィッティング方法と検出領域を変更できます。");
+                ui.label(t!("mm.fit_intro").as_ref());
                 ui.add_space(4.0);
                 // ツールごとの設定を直接編集する（この測長だけに効く）。
                 let fit = match target {
@@ -679,18 +682,18 @@ impl MeasureMode {
         }
         let mut close = false;
         let mut confirmed = false;
-        egui::Window::new("キャンセルの確認")
+        egui::Window::new(t!("mm.cancel_title").as_ref())
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
-                ui.label("編集内容を保存せずに測長モードを終了しますか？");
+                ui.label(t!("mm.cancel_confirm").as_ref());
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.button("はい").clicked() {
+                    if ui.button(t!("mm.yes").as_ref()).clicked() {
                         confirmed = true;
                         close = true;
                     }
-                    if ui.button("いいえ").clicked() {
+                    if ui.button(t!("mm.no").as_ref()).clicked() {
                         close = true;
                     }
                 });
@@ -705,21 +708,29 @@ impl MeasureMode {
 
     /// 設定 UI。
     fn settings_ui(&mut self, ui: &mut Ui, doc: &mut Document) {
-        ui.strong("設定");
+        ui.strong(t!("mm.settings").as_ref());
         ui.horizontal(|ui| {
-            ui.label("角度:");
+            ui.label(t!("mm.angle_label").as_ref());
             if ui
-                .radio_value(&mut self.data.prefs.angle, AngleMode::FourDir, "4方向")
+                .radio_value(
+                    &mut self.data.prefs.angle,
+                    AngleMode::FourDir,
+                    t!("mm.angle_four").as_ref(),
+                )
                 .changed()
                 || ui
-                    .radio_value(&mut self.data.prefs.angle, AngleMode::Free, "自由")
+                    .radio_value(
+                        &mut self.data.prefs.angle,
+                        AngleMode::Free,
+                        t!("mm.angle_free").as_ref(),
+                    )
                     .changed()
             {
                 self.change_once(doc);
             }
         });
         ui.horizontal(|ui| {
-            ui.label("スナップ:");
+            ui.label(t!("mm.snap_label").as_ref());
             if ui
                 .radio_value(&mut self.data.prefs.snap, true, "on")
                 .changed()
@@ -731,19 +742,19 @@ impl MeasureMode {
             }
         });
         ui.horizontal(|ui| {
-            ui.label("新規測長:");
+            ui.label(t!("mm.new_measure_label").as_ref());
             if ui
                 .radio_value(
                     &mut self.data.prefs.new_measure,
                     GroupMode::NewGroup,
-                    "グループを追加",
+                    t!("mm.group_add").as_ref(),
                 )
                 .changed()
                 || ui
                     .radio_value(
                         &mut self.data.prefs.new_measure,
                         GroupMode::Keep,
-                        "そのまま",
+                        t!("mm.group_keep").as_ref(),
                     )
                     .changed()
             {
@@ -751,16 +762,20 @@ impl MeasureMode {
             }
         });
         ui.horizontal(|ui| {
-            ui.label("複製:");
+            ui.label(t!("mm.duplicate_label").as_ref());
             if ui
                 .radio_value(
                     &mut self.data.prefs.duplicate,
                     GroupMode::NewGroup,
-                    "グループを追加",
+                    t!("mm.group_add").as_ref(),
                 )
                 .changed()
                 || ui
-                    .radio_value(&mut self.data.prefs.duplicate, GroupMode::Keep, "そのまま")
+                    .radio_value(
+                        &mut self.data.prefs.duplicate,
+                        GroupMode::Keep,
+                        t!("mm.group_keep").as_ref(),
+                    )
                     .changed()
             {
                 self.change_once(doc);
@@ -769,26 +784,42 @@ impl MeasureMode {
     }
 
     fn tools_ui(&mut self, ui: &mut Ui, doc: &mut Document, digits: u8) {
-        ui.strong("ツール");
+        ui.strong(t!("mm.tools").as_ref());
         ui.add_space(2.0);
         // 章ごとに分けて配置する。
-        ui.label(egui::RichText::new("測長").small().weak());
+        ui.label(
+            egui::RichText::new(t!("mm.section_measure").as_ref())
+                .small()
+                .weak(),
+        );
         ui.horizontal(|ui| {
             ui.add_space(12.0);
             self.tool_button(ui, ToolButton::Distance);
         });
-        ui.label(egui::RichText::new("補助線").small().weak());
+        ui.label(
+            egui::RichText::new(t!("mm.section_helper").as_ref())
+                .small()
+                .weak(),
+        );
         ui.horizontal(|ui| {
             ui.add_space(12.0);
             self.tool_button(ui, ToolButton::Boundary);
             self.tool_button(ui, ToolButton::Offset);
         });
-        ui.label(egui::RichText::new("複製").small().weak());
+        ui.label(
+            egui::RichText::new(t!("mm.section_duplicate").as_ref())
+                .small()
+                .weak(),
+        );
         ui.horizontal(|ui| {
             ui.add_space(12.0);
             self.tool_button(ui, ToolButton::LinearDuplicate);
         });
-        ui.label(egui::RichText::new("選択").small().weak());
+        ui.label(
+            egui::RichText::new(t!("mm.section_select").as_ref())
+                .small()
+                .weak(),
+        );
         ui.horizontal(|ui| {
             ui.add_space(12.0);
             self.tool_button(ui, ToolButton::RangeSelect);
@@ -799,9 +830,9 @@ impl MeasureMode {
         // フィッティング設定（二点間測長と境界線のみ）。
         match self.tool {
             Some(ToolButton::Distance) => {
-                ui.weak("新しく作る測長の既定値。個別の変更は画像上の領域をダブルクリック");
+                ui.weak(t!("mm.hint_distance").as_ref());
                 ui.horizontal(|ui| {
-                    ui.label("端点:");
+                    ui.label(t!("mm.endpoint_label").as_ref());
                     if ui.selectable_label(!self.ep_tab, "1").clicked() {
                         self.ep_tab = false;
                     }
@@ -828,32 +859,35 @@ impl MeasureMode {
                 self.handle_fit_outcome(doc, outcome);
             }
             Some(ToolButton::Boundary) => {
-                ui.weak("新しく作る境界線の既定値。個別の変更は画像上の領域をダブルクリック");
+                ui.weak(t!("mm.hint_boundary").as_ref());
                 let outcome = fit_settings_ui(ui, &mut self.data.boundary_fit);
                 self.handle_fit_outcome(doc, outcome);
             }
             Some(ToolButton::Offset) => {
-                ui.weak("画像上の境界線をクリック → クリックで距離を決定");
+                ui.weak(t!("mm.hint_offset").as_ref());
                 self.offset_fine_tune_ui(ui, doc, digits);
             }
             Some(ToolButton::LinearDuplicate) => {
-                ui.weak("測長・境界線をクリック → マウス移動で方向と距離を指定 → クリックで確定。ホイールで複製数 (1-20)");
+                ui.weak(t!("mm.hint_duplicate").as_ref());
             }
             Some(ToolButton::RangeSelect) => {
-                ui.weak("ドラッグで四角形を作ると、中心が枠内の測長をまとめて選択。枠の中のドラッグで一括移動、枠の辺・角のドラッグで測長ごと拡大縮小。Ctrl+ドラッグで選択測長を複製");
+                ui.weak(t!("mm.hint_range").as_ref());
             }
             Some(ToolButton::Delete) => {
-                ui.weak("測長・補助線をクリックで削除。ドラッグで四角形を作ると、中心が枠内のものをまとめて削除");
+                ui.weak(t!("mm.hint_delete").as_ref());
             }
             None => {
-                ui.weak("画像上の測長・境界線を直接ドラッグで移動（Esc で解除）");
+                ui.weak(t!("mm.hint_none").as_ref());
             }
         }
     }
 
     fn tool_button(&mut self, ui: &mut Ui, tool: ToolButton) {
         let selected = self.tool == Some(tool);
-        if ui.selectable_label(selected, tool.label()).clicked() {
+        if ui
+            .selectable_label(selected, tool.label().as_ref())
+            .clicked()
+        {
             // もう一度押すと選択解除（Esc と同じ）。
             self.tool = if selected { None } else { Some(tool) };
             self.in_progress = None;
@@ -887,7 +921,7 @@ impl MeasureMode {
         };
         let scale = doc.input_to(self.index).and_then(|f| f.scale);
         ui.horizontal(|ui| {
-            ui.label("オフセット:");
+            ui.label(t!("mm.offset_label").as_ref());
             let resp = match scale {
                 // スケールあり: 実寸で編集する（ドラッグ感度も実寸換算）。
                 Some(s) => {
@@ -920,7 +954,7 @@ impl MeasureMode {
     }
 
     fn results_ui(&mut self, ui: &mut Ui, doc: &mut Document, digits: u8) {
-        ui.strong("測定結果");
+        ui.strong(t!("mm.results").as_ref());
         let (img, scale) = match doc.input_to(self.index) {
             Some(frame) => (frame.image.clone(), frame.scale),
             None => return,
@@ -962,34 +996,40 @@ impl MeasureMode {
                             }
                         } else {
                             let name = if g.name.is_empty() {
-                                "(名前なし)".to_owned()
+                                t!("mm.unnamed").into_owned()
                             } else {
                                 g.name.clone()
                             };
                             let resp = ui
                                 .add(egui::Label::new(name).sense(egui::Sense::click()))
-                                .on_hover_text("ダブルクリックで名前を変更。右クリックでコピー");
+                                .on_hover_text(t!("mm.rename_hover").as_ref());
                             if resp.double_clicked() {
                                 actions.push(ResultAction::BeginRename(gid));
                             }
                             // 右クリックメニュー: クリップボードへのコピー。
                             resp.context_menu(|ui| {
-                                if ui.button("統計データをコピー").clicked() {
+                                if ui.button(t!("mm.copy_stats").as_ref()).clicked() {
                                     ui.close();
                                     actions.push(ResultAction::CopyStats);
                                 }
                                 let has_data = !self.data.group_tools(gid).is_empty();
                                 if ui
-                                    .add_enabled(has_data, egui::Button::new("データ一覧をコピー"))
-                                    .on_disabled_hover_text("このグループに測長結果はありません")
+                                    .add_enabled(
+                                        has_data,
+                                        egui::Button::new(t!("mm.copy_data").as_ref()),
+                                    )
+                                    .on_disabled_hover_text(t!("mm.no_data_hover").as_ref())
                                     .clicked()
                                 {
                                     ui.close();
                                     actions.push(ResultAction::CopyGroupData(gid));
                                 }
                                 if ui
-                                    .add_enabled(has_data, egui::Button::new("x 座標でソート"))
-                                    .on_disabled_hover_text("このグループに測長結果はありません")
+                                    .add_enabled(
+                                        has_data,
+                                        egui::Button::new(t!("mm.sort_x").as_ref()),
+                                    )
+                                    .on_disabled_hover_text(t!("mm.no_data_hover").as_ref())
                                     .clicked()
                                 {
                                     ui.close();
@@ -999,8 +1039,11 @@ impl MeasureMode {
                                     });
                                 }
                                 if ui
-                                    .add_enabled(has_data, egui::Button::new("y 座標でソート"))
-                                    .on_disabled_hover_text("このグループに測長結果はありません")
+                                    .add_enabled(
+                                        has_data,
+                                        egui::Button::new(t!("mm.sort_y").as_ref()),
+                                    )
+                                    .on_disabled_hover_text(t!("mm.no_data_hover").as_ref())
                                     .clicked()
                                 {
                                     ui.close();
@@ -1014,7 +1057,7 @@ impl MeasureMode {
                         // グループごとの一括削除。
                         if ui
                             .small_button("×")
-                            .on_hover_text("グループとその測長結果をすべて削除")
+                            .on_hover_text(t!("mm.delete_group_hover").as_ref())
                             .clicked()
                         {
                             actions.push(ResultAction::DeleteGroup(gid));
@@ -1046,14 +1089,14 @@ impl MeasureMode {
                             }
                             if ui
                                 .small_button("×")
-                                .on_hover_text("この測定を削除")
+                                .on_hover_text(t!("mm.delete_tool_hover").as_ref())
                                 .clicked()
                             {
                                 actions.push(ResultAction::DeleteTool(*tid));
                             }
                             if ui
                                 .add_enabled(n > 0, egui::Button::new("▲").small())
-                                .on_hover_text("グループ内で上へ")
+                                .on_hover_text(t!("mm.move_up_hover").as_ref())
                                 .clicked()
                             {
                                 actions.push(ResultAction::MoveTool {
@@ -1064,7 +1107,7 @@ impl MeasureMode {
                             }
                             if ui
                                 .add_enabled(n + 1 < ids.len(), egui::Button::new("▼").small())
-                                .on_hover_text("グループ内で下へ")
+                                .on_hover_text(t!("mm.move_down_hover").as_ref())
                                 .clicked()
                             {
                                 actions.push(ResultAction::MoveTool {
@@ -1252,9 +1295,9 @@ fn fit_settings_ui(ui: &mut Ui, settings: &mut FitSettings) -> FitUiOutcome {
     // モード選択。符号はモード 2/3 共通（同時に有効になるのは 1 つなので、
     // 有効なツールの符号をそのまま使う）。両方の行のボタンで同じ値を選ぶ。
     for (label, mode) in [
-        ("1. フィッティングなし", FitMode::Off),
-        ("2. ピーク", FitMode::Gaussian),
-        ("3. ステップ", FitMode::DerivativeGaussian),
+        (t!("mm.fit_off").as_ref(), FitMode::Off),
+        (t!("mm.fit_peak").as_ref(), FitMode::Gaussian),
+        (t!("mm.fit_step").as_ref(), FitMode::DerivativeGaussian),
     ] {
         ui.horizontal(|ui| {
             if ui.radio_value(&mut settings.mode, mode, label).changed() {
@@ -1265,14 +1308,18 @@ fn fit_settings_ui(ui: &mut Ui, settings: &mut FitSettings) -> FitUiOutcome {
             }
         });
     }
-    let w = ui.add(egui::Slider::new(&mut settings.width_px, 1..=20).text("検出領域の横"));
+    let w = ui.add(
+        egui::Slider::new(&mut settings.width_px, 1..=20).text(t!("mm.region_width").as_ref()),
+    );
     if w.drag_started() {
         outcome.began_change = true;
     }
     if w.changed() {
         outcome.changed = true;
     }
-    let l = ui.add(egui::Slider::new(&mut settings.length_px, 1..=50).text("検出領域の縦"));
+    let l = ui.add(
+        egui::Slider::new(&mut settings.length_px, 1..=50).text(t!("mm.region_height").as_ref()),
+    );
     if l.drag_started() {
         outcome.began_change = true;
     }
@@ -1287,9 +1334,9 @@ fn fit_settings_ui(ui: &mut Ui, settings: &mut FitSettings) -> FitUiOutcome {
 fn draw_profile_plot(ui: &mut Ui, profile: &[f64], fit: Option<GaussFit>, region: &FitRegion) {
     let n = profile.len();
     let label = if region.mode == FitMode::DerivativeGaussian {
-        "輝度の微分"
+        t!("mm.plot_derivative")
     } else {
-        "輝度"
+        t!("mm.plot_intensity")
     };
     ui.label(egui::RichText::new(label).small().weak());
     let (rect, _) = ui.allocate_exact_size(Vec2::new(360.0, 100.0), Sense::hover());
@@ -1382,7 +1429,8 @@ fn stats_csv(
     scale: Option<Scale>,
     digits: u8,
 ) -> String {
-    let mut out = String::from("グループ名, サンプル数, 平均, 標準偏差\n");
+    let mut out = t!("mm.csv_stats_header").into_owned();
+    out.push('\n');
     for g in &data.groups {
         let values: Vec<f64> = computed
             .tools
@@ -1422,7 +1470,8 @@ fn group_data_csv(
     scale: Option<Scale>,
     digits: u8,
 ) -> String {
-    let mut out = String::from("番号, 値\n");
+    let mut out = t!("mm.csv_data_header").into_owned();
+    out.push('\n');
     for tid in data.group_tools(gid) {
         if let Some(t) = computed.by_id(tid)
             && let Some(len) = t.length_px
@@ -1458,7 +1507,7 @@ fn group_stat(
     }
     let var = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n - 1) as f64;
     let sigma = format_measurement(var.sqrt(), scale, digits);
-    Some(format!("平均 {avg}  σ {sigma} (n={n})"))
+    Some(t!("mm.stat_format", avg = avg, sigma = sigma, n = n).into_owned())
 }
 
 // ------------------------------------------------------ オーバーレイ描画

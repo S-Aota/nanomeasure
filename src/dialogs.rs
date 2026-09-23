@@ -8,11 +8,13 @@ use std::sync::Arc;
 
 use egui::{Color32, Context, Sense, Vec2};
 
+use rust_i18n::t;
+
 use crate::command::{Command, Filter, FilterKind};
 use crate::document::Document;
 use crate::frame::LengthUnit;
 use crate::gray::Gray16;
-use crate::settings::Settings;
+use crate::settings::{Language, Settings};
 
 /// 編集対象のコマンドを差し替え、必要な範囲だけ再計算対象にする。
 pub(crate) fn set_command(doc: &mut Document, index: usize, cmd: Command) {
@@ -98,13 +100,13 @@ impl ScaleDialog {
         let mut confirmed = false;
         let mut cancelled = false;
 
-        egui::Window::new("スケール設定")
+        egui::Window::new(t!("dlg.scale_title").as_ref())
             .open(&mut window_open)
             .collapsible(false)
             .resizable(false)
             .default_width(430.0)
             .show(ctx, |ui| {
-                ui.label("画素数と実寸法の対応を入力してください（スケールバーから読み取った値をそのまま入れられます）。");
+                ui.label(t!("dlg.scale_intro").as_ref());
                 ui.add_space(8.0);
 
                 ui.horizontal(|ui| {
@@ -130,14 +132,14 @@ impl ScaleDialog {
                         None => {
                             ui.colored_label(
                                 Color32::from_rgb(255, 140, 140),
-                                "画素数と実寸法には正の値を入れてください。",
+                                t!("dlg.scale_positive").as_ref(),
                             );
                         }
                     },
                     None => {
                         ui.colored_label(
                             Color32::from_rgb(255, 140, 140),
-                            "数値として読めない入力があります。",
+                            t!("dlg.scale_not_number").as_ref(),
                         );
                     }
                 }
@@ -146,12 +148,12 @@ impl ScaleDialog {
                 ui.horizontal(|ui| {
                     let valid = self.pending().and_then(|c| c.scale()).is_some();
                     if ui
-                        .add_enabled(valid, egui::Button::new("決定"))
+                        .add_enabled(valid, egui::Button::new(t!("dlg.ok").as_ref()))
                         .clicked()
                     {
                         confirmed = true;
                     }
-                    if ui.button("キャンセル").clicked() {
+                    if ui.button(t!("dlg.cancel").as_ref()).clicked() {
                         cancelled = true;
                     }
                 });
@@ -265,18 +267,18 @@ impl RotateDialog {
         let mut confirmed = false;
         let mut cancelled = false;
 
-        egui::Window::new("画像の回転")
+        egui::Window::new(t!("dlg.rotate_title").as_ref())
             .open(&mut window_open)
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
-                ui.label("画像サイズを保ったまま中心まわりに回転します（時計回り）。");
-                ui.label("はみ出た部分は失われ、埋まらない部分は黒になります。");
+                ui.label(t!("dlg.rotate_keep_size").as_ref());
+                ui.label(t!("dlg.rotate_clip").as_ref());
                 ui.add_space(8.0);
                 ui.add(
                     egui::Slider::new(&mut self.angle, 0.0..=360.0)
                         .suffix(" °")
-                        .text("角度"),
+                        .text(t!("dlg.angle").as_ref()),
                 );
                 ui.horizontal(|ui| {
                     for preset in [0.0, 90.0, 180.0, 270.0] {
@@ -287,10 +289,10 @@ impl RotateDialog {
                 });
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.button("決定").clicked() {
+                    if ui.button(t!("dlg.ok").as_ref()).clicked() {
                         confirmed = true;
                     }
-                    if ui.button("キャンセル").clicked() {
+                    if ui.button(t!("dlg.cancel").as_ref()).clicked() {
                         cancelled = true;
                     }
                 });
@@ -400,44 +402,41 @@ impl LevelsDialog {
         let mut auto = false;
         let mut reset = false;
 
-        egui::Window::new("レベル補正")
+        egui::Window::new(t!("dlg.levels_title").as_ref())
             .open(&mut window_open)
             .collapsible(false)
             .resizable(false)
             .default_width(420.0)
             .show(ctx, |ui| {
-                ui.label(format!(
-                    "横軸=輝度のヒストグラムです。最小・最大を決めると、その間の輝度が 0〜{} へ線形に引き伸ばされます。",
-                    self.max_value
-                ));
+                ui.label(t!("dlg.levels_histogram", max = self.max_value).as_ref());
                 ui.add_space(6.0);
                 self.draw_histogram(ui);
                 ui.add_space(6.0);
                 ui.add(
                     egui::Slider::new(&mut self.in_min, 0..=self.max_value)
-                        .text("最小輝度")
+                        .text(t!("dlg.min_brightness").as_ref())
                         .clamping(egui::SliderClamping::Always),
                 );
                 ui.add(
                     egui::Slider::new(&mut self.in_max, 0..=self.max_value)
-                        .text("最大輝度")
+                        .text(t!("dlg.max_brightness").as_ref())
                         .clamping(egui::SliderClamping::Always),
                 );
                 ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.log_scale, "対数目盛");
-                    if ui.button("自動 (0.1%)").clicked() {
+                    ui.checkbox(&mut self.log_scale, t!("dlg.log_scale").as_ref());
+                    if ui.button(t!("dlg.auto_01").as_ref()).clicked() {
                         auto = true;
                     }
-                    if ui.button("全域").clicked() {
+                    if ui.button(t!("dlg.full_range").as_ref()).clicked() {
                         reset = true;
                     }
                 });
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.button("決定").clicked() {
+                    if ui.button(t!("dlg.ok").as_ref()).clicked() {
                         confirmed = true;
                     }
-                    if ui.button("キャンセル").clicked() {
+                    if ui.button(t!("dlg.cancel").as_ref()).clicked() {
                         cancelled = true;
                     }
                 });
@@ -630,60 +629,56 @@ impl ExportDialog {
         let mut confirmed = false;
         let mut cancelled = false;
 
-        egui::Window::new("画像出力")
+        egui::Window::new(t!("dlg.export_title").as_ref())
             .open(&mut window_open)
             .collapsible(false)
             .resizable(false)
             .default_width(480.0)
             .show(ctx, |ui| {
-                ui.label("アノテーション（寸法・矢印など）付きの画像を保存します。");
-                ui.label("拡張子で形式を指定します（tif / png / jpg）。");
+                ui.label(t!("dlg.export_intro").as_ref());
+                ui.label(t!("dlg.export_ext").as_ref());
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    ui.label("出力先:");
+                    ui.label(t!("dlg.output_path").as_ref());
                     ui.add(
                         egui::TextEdit::singleline(&mut self.output)
                             .desired_width(330.0)
                             .hint_text(crate::export::DEFAULT_EXPORT_PATH),
                     );
                 });
-                ui.label(
-                    "{dir} は開いている画像のフォルダ、{filename} は拡張子なしのファイル名に置き換わります。",
-                );
+                ui.label(t!("dlg.template_hint").as_ref());
                 let path = std::path::Path::new(self.output.trim());
                 if self.output.trim().is_empty() {
                     ui.colored_label(
                         Color32::from_rgb(255, 140, 140),
-                        "出力先を入力してください。",
+                        t!("dlg.enter_output").as_ref(),
                     );
                 } else if !crate::export::validate_extension(path) {
                     ui.colored_label(
                         Color32::from_rgb(255, 140, 140),
-                        "対応していない拡張子です（tif / png / jpg）。",
+                        t!("dlg.unsupported_ext").as_ref(),
                     );
                 }
                 ui.add_space(8.0);
-                ui.checkbox(&mut self.color, "カラー（RGB）で保存")
-                    .on_hover_text(
-                        "アノテーションの色を残します。画像の階調は 8bit になります。\n\
-                         オフのときは元のビット深度のグレースケールのまま、色は輝度へ落ちます。",
-                    );
+                ui.checkbox(&mut self.color, t!("dlg.export_color").as_ref())
+                    .on_hover_text(t!("dlg.export_color_hover").as_ref());
                 ui.add_space(8.0);
                 ui.add(
                     egui::Slider::new(&mut self.annotation_scale, 0.5..=4.0)
-                        .text("アノテーション倍率"),
+                        .text(t!("dlg.annotation_scale").as_ref()),
                 );
-                ui.label(
-                    "線の太さや文字の大きさは画像の解像度に合わせて自動調整されます。この値はそれに掛ける係数です。",
-                );
+                ui.label(t!("dlg.annotation_scale_hint").as_ref());
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    let valid = !self.output.trim().is_empty()
-                        && crate::export::validate_extension(path);
-                    if ui.add_enabled(valid, egui::Button::new("決定")).clicked() {
+                    let valid =
+                        !self.output.trim().is_empty() && crate::export::validate_extension(path);
+                    if ui
+                        .add_enabled(valid, egui::Button::new(t!("dlg.ok").as_ref()))
+                        .clicked()
+                    {
                         confirmed = true;
                     }
-                    if ui.button("キャンセル").clicked() {
+                    if ui.button(t!("dlg.cancel").as_ref()).clicked() {
                         cancelled = true;
                     }
                 });
@@ -773,38 +768,39 @@ impl ExportResultDialog {
         let mut confirmed = false;
         let mut cancelled = false;
 
-        egui::Window::new("結果出力")
+        egui::Window::new(t!("dlg.result_title").as_ref())
             .open(&mut window_open)
             .collapsible(false)
             .resizable(false)
             .default_width(480.0)
             .show(ctx, |ui| {
-                ui.label("測長の測定結果を JSON で保存します。");
+                ui.label(t!("dlg.result_intro").as_ref());
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    ui.label("出力先:");
+                    ui.label(t!("dlg.output_path").as_ref());
                     ui.add(
                         egui::TextEdit::singleline(&mut self.output)
                             .desired_width(330.0)
                             .hint_text(crate::export::DEFAULT_RESULT_PATH),
                     );
                 });
-                ui.label(
-                    "{dir} は開いている画像のフォルダ、{filename} は拡張子なしのファイル名に置き換わります。",
-                );
+                ui.label(t!("dlg.template_hint").as_ref());
                 if self.output.trim().is_empty() {
                     ui.colored_label(
                         Color32::from_rgb(255, 140, 140),
-                        "出力先を入力してください。",
+                        t!("dlg.enter_output").as_ref(),
                     );
                 }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     let valid = !self.output.trim().is_empty();
-                    if ui.add_enabled(valid, egui::Button::new("決定")).clicked() {
+                    if ui
+                        .add_enabled(valid, egui::Button::new(t!("dlg.ok").as_ref()))
+                        .clicked()
+                    {
                         confirmed = true;
                     }
-                    if ui.button("キャンセル").clicked() {
+                    if ui.button(t!("dlg.cancel").as_ref()).clicked() {
                         cancelled = true;
                     }
                 });
@@ -893,19 +889,31 @@ impl FilterDialog {
         let mut cancelled = false;
         let mut apply = false;
 
-        egui::Window::new("フィルタ")
+        egui::Window::new(t!("dlg.filter_title").as_ref())
             .open(&mut window_open)
             .collapsible(false)
             .resizable(false)
             .default_width(430.0)
             .show(ctx, |ui| {
-                ui.label("画像を整える前処理フィルタです。端は最外周の画素値で埋めて計算します。");
+                ui.label(t!("dlg.filter_intro").as_ref());
                 ui.add_space(8.0);
                 let mut kind = self.filter.kind();
                 ui.horizontal(|ui| {
-                    ui.radio_value(&mut kind, FilterKind::GaussianBlur, "ガウシアンぼかし");
-                    ui.radio_value(&mut kind, FilterKind::Median, "メディアン");
-                    ui.radio_value(&mut kind, FilterKind::UnsharpMask, "アンシャープマスク");
+                    ui.radio_value(
+                        &mut kind,
+                        FilterKind::GaussianBlur,
+                        t!("dlg.filter_gaussian").as_ref(),
+                    );
+                    ui.radio_value(
+                        &mut kind,
+                        FilterKind::Median,
+                        t!("dlg.filter_median").as_ref(),
+                    );
+                    ui.radio_value(
+                        &mut kind,
+                        FilterKind::UnsharpMask,
+                        t!("dlg.filter_unsharp").as_ref(),
+                    );
                 });
                 if kind != self.filter.kind() {
                     self.filter = Filter::default_of(kind);
@@ -918,7 +926,7 @@ impl FilterDialog {
                         let resp = ui.add(
                             egui::Slider::new(sigma, 0.1..=20.0)
                                 .suffix(" px")
-                                .text("σ（標準偏差）"),
+                                .text(t!("dlg.sigma_stddev").as_ref()),
                         );
                         apply |= resp.drag_stopped() || (resp.changed() && !resp.dragged());
                     }
@@ -926,30 +934,30 @@ impl FilterDialog {
                         let resp = ui.add(
                             egui::Slider::new(radius, 1..=3)
                                 .suffix(" px")
-                                .text("半径"),
+                                .text(t!("dlg.radius").as_ref()),
                         );
-                        ui.label("一辺 2r+1 の正方形窓の中央値を取ります。半径が大きいと計算が重くなります。");
+                        ui.label(t!("dlg.median_hint").as_ref());
                         apply |= resp.drag_stopped() || (resp.changed() && !resp.dragged());
                     }
                     Filter::UnsharpMask { sigma, amount } => {
                         let resp = ui.add(
                             egui::Slider::new(sigma, 0.1..=20.0)
                                 .suffix(" px")
-                                .text("σ（ぼかしの標準偏差）"),
+                                .text(t!("dlg.sigma_blur").as_ref()),
                         );
                         apply |= resp.drag_stopped() || (resp.changed() && !resp.dragged());
                         let resp = ui.add(
-                            egui::Slider::new(amount, 0.0..=5.0).text("強さ"),
+                            egui::Slider::new(amount, 0.0..=5.0).text(t!("dlg.strength").as_ref()),
                         );
                         apply |= resp.drag_stopped() || (resp.changed() && !resp.dragged());
                     }
                 }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.button("決定").clicked() {
+                    if ui.button(t!("dlg.ok").as_ref()).clicked() {
                         confirmed = true;
                     }
-                    if ui.button("キャンセル").clicked() {
+                    if ui.button(t!("dlg.cancel").as_ref()).clicked() {
                         cancelled = true;
                     }
                 });
@@ -1009,18 +1017,30 @@ impl SettingsDialog {
             return;
         }
         let mut window_open = true;
-        egui::Window::new("設定")
+        egui::Window::new(t!("settings.title").as_ref())
             .open(&mut window_open)
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
                 ui.add(
                     egui::Slider::new(&mut settings.length_digits, 1..=5)
-                        .text("小数点以下の表示桁数"),
+                        .text(t!("settings.length_digits").as_ref()),
                 );
-                ui.label(
-                    "長さ表示（ステータスバー・測定結果・画像アノテーション）の小数点以下桁数です。\nJSON 保存データは常に元の精度で保存されます。",
-                );
+                ui.label(t!("settings.length_digits_hint").as_ref());
+                ui.add_space(8.0);
+                // 言語選択。選んだ瞬間から反映し、次回起動後も設定が引き継がれる。
+                ui.label(t!("settings.language").as_ref());
+                let before = settings.language;
+                egui::ComboBox::from_id_salt("language")
+                    .selected_text(settings.language.label())
+                    .show_ui(ui, |ui| {
+                        for lang in Language::ALL {
+                            ui.selectable_value(&mut settings.language, lang, lang.label());
+                        }
+                    });
+                if settings.language != before {
+                    rust_i18n::set_locale(settings.language.code());
+                }
             });
         self.open = window_open;
     }

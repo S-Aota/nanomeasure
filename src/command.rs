@@ -1,10 +1,13 @@
 //! 画像に対する処理（コマンド）の定義と、その履歴の JSON 表現。
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+
+use rust_i18n::t;
 
 use crate::frame::{Frame, LengthUnit, Scale};
 use crate::gray::Gray16;
@@ -29,12 +32,12 @@ impl CommandCategory {
     pub const ALL: [Self; 4] = [Self::Input, Self::Preprocess, Self::Analysis, Self::Output];
 
     /// コマンドリストの見出し。
-    pub fn label(self) -> &'static str {
+    pub fn label(self) -> Cow<'static, str> {
         match self {
-            Self::Input => "入力",
-            Self::Preprocess => "前処理",
-            Self::Analysis => "解析",
-            Self::Output => "出力",
+            Self::Input => t!("cmd.category.input"),
+            Self::Preprocess => t!("cmd.category.preprocess"),
+            Self::Analysis => t!("cmd.category.analysis"),
+            Self::Output => t!("cmd.category.output"),
         }
     }
 }
@@ -89,11 +92,16 @@ impl Filter {
 
     pub fn label(&self) -> String {
         match self {
-            Self::GaussianBlur { sigma } => format!("ガウシアンぼかし: σ = {sigma:.2}"),
-            Self::Median { radius } => format!("メディアン: 半径 {radius}"),
-            Self::UnsharpMask { sigma, amount } => {
-                format!("アンシャープマスク: σ = {sigma:.2}, 強さ = {amount:.2}")
+            Self::GaussianBlur { sigma } => {
+                t!("cmd.filter_gaussian", sigma = format!("{sigma:.2}")).into_owned()
             }
+            Self::Median { radius } => t!("cmd.filter_median", radius = radius).into_owned(),
+            Self::UnsharpMask { sigma, amount } => t!(
+                "cmd.filter_unsharp",
+                sigma = format!("{sigma:.2}"),
+                amount = format!("{amount:.2}")
+            )
+            .into_owned(),
         }
     }
 
@@ -168,28 +176,39 @@ impl Command {
                     .file_name()
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_else(|| path.to_string_lossy().into_owned());
-                format!("画像挿入: {name}")
+                t!("cmd.insert_image", name = name).into_owned()
             }
             Self::SetScale { .. } => match self.scale() {
-                Some(scale) => format!("スケール設定: {}", scale.describe(digits)),
-                None => "スケール設定: (値が不正)".to_owned(),
+                Some(scale) => {
+                    t!("cmd.scale_settings", scale = scale.describe(digits)).into_owned()
+                }
+                None => t!("cmd.scale_invalid").into_owned(),
             },
-            Self::Rotate { angle_deg } => format!("回転: {angle_deg:.2}°"),
-            Self::Levels { in_min, in_max } => format!("レベル補正: {in_min} → {in_max}"),
-            Self::Filter { filter } => format!("フィルタ: {}", filter.label()),
+            Self::Rotate { angle_deg } => {
+                t!("cmd.rotate", angle = format!("{angle_deg:.2}")).into_owned()
+            }
+            Self::Levels { in_min, in_max } => {
+                t!("cmd.levels", min = in_min, max = in_max).into_owned()
+            }
+            Self::Filter { filter } => t!("cmd.filter", name = filter.label()).into_owned(),
             Self::Measure { data } => {
                 let measurements = data.tools.iter().filter(|t| t.is_measurement()).count();
-                format!(
-                    "測長: グループ {} 件 / 測定 {} 件",
-                    data.groups.len(),
-                    measurements
+                t!(
+                    "cmd.measure",
+                    groups = data.groups.len(),
+                    count = measurements
                 )
+                .into_owned()
             }
             Self::ExportImage { output, color, .. } => {
-                let mode = if *color { "（カラー）" } else { "" };
-                format!("画像出力: {output}{mode}")
+                let mode = if *color {
+                    t!("cmd.color_suffix")
+                } else {
+                    Cow::Borrowed("")
+                };
+                t!("cmd.export_image", output = output, mode = mode).into_owned()
             }
-            Self::ExportResult { output } => format!("結果出力: {output}"),
+            Self::ExportResult { output } => t!("cmd.export_result", output = output).into_owned(),
         }
     }
 
@@ -241,7 +260,7 @@ impl Command {
                 let frame = require_input(input)?;
                 let scale = self
                     .scale()
-                    .ok_or_else(|| "画素数と実寸法には正の値を入れてください".to_owned())?;
+                    .ok_or_else(|| t!("cmd.scale_positive").into_owned())?;
                 Ok(frame.with_scale(scale))
             }
             Self::Rotate { angle_deg } => {
@@ -262,7 +281,7 @@ impl Command {
 }
 
 fn require_input(input: Option<&Frame>) -> Result<&Frame, String> {
-    input.ok_or_else(|| "入力画像がありません（先に画像を挿入してください）".to_owned())
+    input.ok_or_else(|| t!("cmd.no_input").into_owned())
 }
 
 pub fn load_image(
@@ -272,8 +291,14 @@ pub fn load_image(
     if let Some(img) = cache.get(path) {
         return Ok(img.clone());
     }
-    let dynamic = image::open(path)
-        .map_err(|e| format!("{} を読み込めません: {e}", path.to_string_lossy()))?;
+    let dynamic = image::open(path).map_err(|e| {
+        t!(
+            "cmd.cannot_read",
+            path = path.to_string_lossy(),
+            error = format!("{e}")
+        )
+        .into_owned()
+    })?;
     let img = Arc::new(Gray16::from_dynamic(&dynamic));
     cache.insert(path.to_path_buf(), img.clone());
     Ok(img)
@@ -312,15 +337,33 @@ impl HistoryFile {
 
     pub fn save(&self, path: &Path) -> Result<(), String> {
         let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(path, json)
-            .map_err(|e| format!("{} に保存できません: {e}", path.to_string_lossy()))
+        std::fs::write(path, json).map_err(|e| {
+            t!(
+                "cmd.cannot_save",
+                path = path.to_string_lossy(),
+                error = format!("{e}")
+            )
+            .into_owned()
+        })
     }
 
     pub fn load(path: &Path) -> Result<Self, String> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| format!("{} を読み込めません: {e}", path.to_string_lossy()))?;
-        let file: Self = serde_json::from_str(&text)
-            .map_err(|e| format!("{} の解析に失敗しました: {e}", path.to_string_lossy()))?;
+        let text = std::fs::read_to_string(path).map_err(|e| {
+            t!(
+                "cmd.cannot_read",
+                path = path.to_string_lossy(),
+                error = format!("{e}")
+            )
+            .into_owned()
+        })?;
+        let file: Self = serde_json::from_str(&text).map_err(|e| {
+            t!(
+                "cmd.parse_failed",
+                path = path.to_string_lossy(),
+                error = format!("{e}")
+            )
+            .into_owned()
+        })?;
         Ok(file)
     }
 
@@ -425,7 +468,8 @@ mod tests {
         let cmd = Command::scale_from(scale);
         let back = cmd.scale().expect("換算できること");
         assert!((back.nm_per_px - scale.nm_per_px).abs() < 1e-12);
-        assert_eq!(cmd.label(5), "スケール設定: 1 px = 0.09352 nm");
+        // ラベルはロケールで変わるので、単位の部分だけ見る。
+        assert!(cmd.label(5).contains("1 px = 0.09352 nm"));
     }
 
     /// 測長コマンドの無い古い履歴はそのまま読めること。version キーは

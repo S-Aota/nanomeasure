@@ -11,6 +11,8 @@ use std::sync::Arc;
 
 use egui::{Color32, Rect, Sense, TextureHandle, TextureOptions, Ui, Vec2};
 
+use rust_i18n::t;
+
 use crate::gray::Gray16;
 
 const MIN_ZOOM: f32 = 0.01;
@@ -122,7 +124,7 @@ impl ImageView {
             painter.text(
                 vp.center(),
                 egui::Align2::CENTER_CENTER,
-                "ここに画像をドラッグ&ドロップ\n（ファイル → 画像を挿入 でも開けます）",
+                t!("view.drop_hint").as_ref(),
                 egui::FontId::proportional(16.0),
                 Color32::from_gray(140),
             );

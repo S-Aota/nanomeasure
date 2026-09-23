@@ -18,6 +18,8 @@ use imageproc::definitions::Clamp;
 use imageproc::drawing::{draw_polygon_mut, draw_text_mut, text_size};
 use imageproc::point::Point;
 
+use rust_i18n::t;
+
 use crate::command::Command;
 use crate::document::Document;
 use crate::frame::Scale;
@@ -137,19 +139,38 @@ pub fn save(buf: ImageBuffer<Luma<u16>, Vec<u16>>, path: &Path) -> Result<(), St
     } else {
         buf.save(path)
     };
-    result.map_err(|e| format!("{} に保存できません: {e}", path.to_string_lossy()))
+    result.map_err(|e| {
+        t!(
+            "cmd.cannot_save",
+            path = path.to_string_lossy(),
+            error = format!("{e}")
+        )
+        .into_owned()
+    })
 }
 
 /// 書き出した 8bit グレースケール画像を保存する（8bit 画像用）。
 pub fn save8(buf: ImageBuffer<Luma<u8>, Vec<u8>>, path: &Path) -> Result<(), String> {
-    buf.save(path)
-        .map_err(|e| format!("{} に保存できません: {e}", path.to_string_lossy()))
+    buf.save(path).map_err(|e| {
+        t!(
+            "cmd.cannot_save",
+            path = path.to_string_lossy(),
+            error = format!("{e}")
+        )
+        .into_owned()
+    })
 }
 
 /// 書き出した RGB 8bit 画像を保存する。
 pub fn save_rgb(buf: &ImageBuffer<Rgb<u8>, Vec<u8>>, path: &Path) -> Result<(), String> {
-    buf.save(path)
-        .map_err(|e| format!("{} に保存できません: {e}", path.to_string_lossy()))
+    buf.save(path).map_err(|e| {
+        t!(
+            "cmd.cannot_save",
+            path = path.to_string_lossy(),
+            error = format!("{e}")
+        )
+        .into_owned()
+    })
 }
 
 /// 画像出力コマンドを実行する。`index` は画像出力コマンドの位置。
@@ -168,7 +189,7 @@ pub fn save_image_export(
         color,
     }) = doc.commands.get(index).map(|c| &c.command)
     else {
-        return Err("画像出力コマンドではありません".to_owned());
+        return Err(t!("exp.not_image_command").into_owned());
     };
     let template = output.trim();
     if template.is_empty() {
@@ -176,16 +197,13 @@ pub fn save_image_export(
     }
     let img_path = doc
         .image_path_at(index)
-        .ok_or_else(|| "画像がありません（画像を挿入してから保存してください）".to_owned())?;
+        .ok_or_else(|| t!("exp.no_image").into_owned())?;
     let Some(frame) = doc.input_to(index) else {
-        return Err("結果がまだ計算されていません".to_owned());
+        return Err(t!("exp.no_result").into_owned());
     };
     let path = resolve_output_path(template, img_path);
     if !validate_extension(&path) {
-        return Err(format!(
-            "{} は対応していない拡張子です（tif / png / jpg）",
-            path.to_string_lossy()
-        ));
+        return Err(t!("exp.unsupported_ext", path = path.to_string_lossy()).into_owned());
     }
     let measures = doc.measure_overlays(&frame.image, skip);
     let overlays: Vec<(&ComputedMeasure, Option<Scale>)> = measures
@@ -218,10 +236,10 @@ pub fn save_image_export(
 /// 解決）。空文字列のときは保存しない（Ok(None)）。戻り値は実際に保存したパス。
 pub fn save_result_json(doc: &Document, index: usize) -> Result<Option<PathBuf>, String> {
     let Some(item) = doc.commands.get(index) else {
-        return Err("結果出力コマンドではありません".to_owned());
+        return Err(t!("exp.not_result_command").into_owned());
     };
     let Command::ExportResult { output } = &item.command else {
-        return Err("結果出力コマンドではありません".to_owned());
+        return Err(t!("exp.not_result_command").into_owned());
     };
     let template = output.trim();
     if template.is_empty() {
@@ -229,10 +247,10 @@ pub fn save_result_json(doc: &Document, index: usize) -> Result<Option<PathBuf>,
     }
     let img_path = doc
         .image_path_at(index)
-        .ok_or_else(|| "画像がありません（画像を挿入してから保存してください）".to_owned())?
+        .ok_or_else(|| t!("exp.no_image").into_owned())?
         .to_path_buf();
     let Some(frame) = doc.input_to(index) else {
-        return Err("結果がまだ計算されていません".to_owned());
+        return Err(t!("exp.no_result").into_owned());
     };
     let path = resolve_output_path(template, &img_path);
     // JSON の先頭にはファイル名を出す。
@@ -270,7 +288,14 @@ pub fn save_result_json(doc: &Document, index: usize) -> Result<Option<PathBuf>,
         &path,
         serde_json::to_string_pretty(&json).map_err(|e| e.to_string())?,
     )
-    .map_err(|e| format!("{} に保存できません: {e}", path.to_string_lossy()))?;
+    .map_err(|e| {
+        t!(
+            "cmd.cannot_save",
+            path = path.to_string_lossy(),
+            error = format!("{e}")
+        )
+        .into_owned()
+    })?;
     Ok(Some(path))
 }
 

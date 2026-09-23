@@ -1,6 +1,10 @@
 // リリースビルドでは Windows でコンソールウィンドウを出さない。
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+// 翻訳ファイルを読み込む。ロケール名は locales/ 以下のファイル名。
+// 言語の切り替えは保存済み設定を読める TemApp::new で行う。
+rust_i18n::i18n!("locales", fallback = "ja");
+
 mod app;
 mod command;
 mod dialogs;
@@ -26,7 +30,8 @@ fn main() -> eframe::Result<()> {
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([800.0, 500.0])
             .with_drag_and_drop(true)
-            .with_title("tem_measure - TEM 画像解析"),
+            // タイトルは言語設定を反映して TemApp::new で差し替える。
+            .with_title("tem_measure"),
         ..Default::default()
     };
     eframe::run_native(
