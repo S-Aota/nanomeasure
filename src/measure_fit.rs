@@ -640,6 +640,7 @@ mod tests {
         let img = Gray16 {
             width: 20,
             height: 20,
+            depth: 16,
             data: vec![700; 400],
         };
         let region = region(

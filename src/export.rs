@@ -60,6 +60,14 @@ impl AnnotationPixel for Luma<u16> {
     }
 }
 
+impl AnnotationPixel for Luma<u8> {
+    /// 色は輝度へ落とす（グレースケール出力では色を保持できない）。
+    fn from_screen(color: Color32) -> Self {
+        let lum = (color.r() as u32 * 299 + color.g() as u32 * 587 + color.b() as u32 * 114) / 1000;
+        Luma([lum as u8])
+    }
+}
+
 impl AnnotationPixel for Rgb<u8> {
     /// 画面表示の色をそのまま使う。
     fn from_screen(color: Color32) -> Self {
@@ -84,8 +92,21 @@ pub fn render(
     out
 }
 
+/// アノテーション付き 8bit グレースケール画像を作る（8bit 画像用。
+/// 16bit 画像に呼ぶと下位 8bit へ落ちるので呼び分けること）。
+pub fn render8(
+    img: &Gray16,
+    overlays: &[(&ComputedMeasure, Option<Scale>)],
+    annotation_scale: f32,
+    digits: u8,
+) -> ImageBuffer<Luma<u8>, Vec<u8>> {
+    let mut out = img.to_luma8_buffer();
+    draw_overlays(&mut out, img, overlays, annotation_scale, digits);
+    out
+}
+
 /// アノテーション付き RGB 8bit 画像を作る（アノテーションの色を残す）。
-/// 下地は 16bit グレーの上位 8bit をそのまま使う。
+/// 下地は画素値を 8bit へ落とす（16bit は上位 8bit、8bit はそのまま）。
 pub fn render_rgb(
     img: &Gray16,
     overlays: &[(&ComputedMeasure, Option<Scale>)],
@@ -93,7 +114,11 @@ pub fn render_rgb(
     digits: u8,
 ) -> ImageBuffer<Rgb<u8>, Vec<u8>> {
     let mut out = ImageBuffer::from_fn(img.width, img.height, |x, y| {
-        let v = (img.at(x, y) >> 8) as u8;
+        let v = if img.depth == 8 {
+            img.at(x, y) as u8
+        } else {
+            (img.at(x, y) >> 8) as u8
+        };
         Rgb([v, v, v])
     });
     draw_overlays(&mut out, img, overlays, annotation_scale, digits);
@@ -113,6 +138,12 @@ pub fn save(buf: ImageBuffer<Luma<u16>, Vec<u16>>, path: &Path) -> Result<(), St
         buf.save(path)
     };
     result.map_err(|e| format!("{} に保存できません: {e}", path.to_string_lossy()))
+}
+
+/// 書き出した 8bit グレースケール画像を保存する（8bit 画像用）。
+pub fn save8(buf: ImageBuffer<Luma<u8>, Vec<u8>>, path: &Path) -> Result<(), String> {
+    buf.save(path)
+        .map_err(|e| format!("{} に保存できません: {e}", path.to_string_lossy()))
 }
 
 /// 書き出した RGB 8bit 画像を保存する。
@@ -164,6 +195,11 @@ pub fn save_image_export(
     if *color {
         save_rgb(
             &render_rgb(&frame.image, &overlays, *annotation_scale, digits),
+            &path,
+        )?;
+    } else if frame.image.depth == 8 {
+        save8(
+            render8(&frame.image, &overlays, *annotation_scale, digits),
             &path,
         )?;
     } else {
@@ -644,6 +680,29 @@ mod tests {
         assert!(validate_extension(Path::new("a.png")));
         assert!(!validate_extension(Path::new("a.bmp")));
         assert!(!validate_extension(Path::new("noext")));
+    }
+
+    /// 8bit 画像はグレースケール出力でも 8bit のまま保存されること。
+    #[test]
+    fn save8_keeps_8bit_output() {
+        let img = Gray16 {
+            width: 2,
+            height: 2,
+            depth: 8,
+            data: vec![0, 100, 200, 255],
+        };
+        let out = render8(&img, &[], 1.0, 5);
+        let dir = std::env::temp_dir().join(format!("tem_measure_8bit_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.png");
+        save8(out, &path).expect("保存できる");
+        let read = image::open(&path).expect("保存したファイルが読める");
+        assert!(
+            matches!(read, image::DynamicImage::ImageLuma8(_)),
+            "8bit のまま保存される"
+        );
+        assert_eq!(read.to_luma8().get_pixel(0, 0).0[0], 0);
+        assert_eq!(read.to_luma8().get_pixel(1, 1).0[0], 255);
     }
 
     /// 実画像への描画と tif / png / jpg の保存をまとめて確かめる。

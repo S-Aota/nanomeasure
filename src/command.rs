@@ -494,4 +494,14 @@ mod tests {
         let back: Command = serde_json::from_str(&json).unwrap();
         assert_eq!(back, cmd);
     }
+
+    /// 8bit の入力画像は 16bit へ拡張されず、8bit のまま読み込まれること。
+    #[test]
+    fn load_image_keeps_8bit_depth() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/carbon_support_8bit.tif");
+        let mut cache = HashMap::new();
+        let img = load_image(&path, &mut cache).expect("testdata が読める");
+        assert_eq!(img.depth, 8);
+        assert!(img.data.iter().all(|&v| v <= 255));
+    }
 }

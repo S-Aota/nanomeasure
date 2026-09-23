@@ -77,8 +77,6 @@ pub struct TemApp {
     /// アプリ全体の設定（表示桁数など）。eframe の persistence で保存される。
     settings: Settings,
     settings_dialog: SettingsDialog,
-    /// データは変えずに、表示だけ min/max へ引き伸ばす。
-    auto_contrast: bool,
     help_open: bool,
     about_open: bool,
     /// 編集中にタブ切り替えを試みたときの警告。編集中なら切り替えず、
@@ -108,7 +106,6 @@ impl TemApp {
             measure_mode: MeasureMode::default(),
             settings: Settings::load(cc.storage),
             settings_dialog: SettingsDialog::default(),
-            auto_contrast: true,
             help_open: false,
             about_open: false,
             tab_switch_warning: None,
@@ -430,10 +427,6 @@ impl TemApp {
             }
             ui.separator();
         }
-        ui.checkbox(&mut self.auto_contrast, "自動コントラスト")
-            .on_hover_text(
-                "表示だけを min/max に合わせて引き伸ばします（画像データは変わりません）",
-            );
     }
 
     fn ui_command_panel(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
@@ -1204,11 +1197,9 @@ impl eframe::App for TemApp {
         self.ui_status_bar(ui);
         self.ui_command_panel(ui, &mut actions);
 
-        // レベル補正の調整中は、表示の自動コントラストを切って
-        // 補正結果そのものが見えるようにする。
-        let auto = self.auto_contrast && !self.levels_dialog.open;
+        // 表示は読み込んだ画像の輝度のまま（自動コントラストはしない）。
         let index = self.active;
-        let range = self.docs[index].display_range(auto);
+        let range = self.docs[index].display_range();
         let generation = self.docs[index].generation;
         // 測長モード中は画像上の入力（左ドラッグの移動、右ドラッグのパン、
         // ズーム）をすべて measure_mode 側で処理する。

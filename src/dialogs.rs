@@ -335,6 +335,9 @@ pub struct LevelsDialog {
     original: Option<Command>,
     in_min: u16,
     in_max: u16,
+    /// 入力画像の画素値の最大値（8bit なら 255、16bit なら 65535）。
+    /// スライダーの範囲とヒストグラムの目盛りに使う。
+    max_value: u16,
     log_scale: bool,
     /// ヒストグラムは入力画像が変わったときだけ計算し直す。
     hist_source: Option<Arc<Gray16>>,
@@ -360,14 +363,18 @@ impl LevelsDialog {
 
     fn start(&mut self, doc: &Document, index: usize, created: bool) {
         let original = doc.commands.get(index).map(|c| c.command.clone());
+        // 入力画像の深度に合わせてスライダーの上限を決める。
+        // 画像が無いうちは 16bit の範囲としておく（履歴から開いた場合も
+        // ここで入力の範囲へ収める）。
+        self.max_value = doc.image().map_or(u16::MAX, |img| img.max_value());
         match original {
             Some(Command::Levels { in_min, in_max }) => {
-                self.in_min = in_min;
-                self.in_max = in_max;
+                self.in_min = in_min.min(self.max_value);
+                self.in_max = in_max.min(self.max_value);
             }
             _ => {
                 self.in_min = 0;
-                self.in_max = u16::MAX;
+                self.in_max = self.max_value;
             }
         }
         self.index = index;
@@ -399,17 +406,20 @@ impl LevelsDialog {
             .resizable(false)
             .default_width(420.0)
             .show(ctx, |ui| {
-                ui.label("横軸=輝度のヒストグラムです。最小・最大を決めると、その間の輝度が 0〜65535 へ線形に引き伸ばされます。");
+                ui.label(format!(
+                    "横軸=輝度のヒストグラムです。最小・最大を決めると、その間の輝度が 0〜{} へ線形に引き伸ばされます。",
+                    self.max_value
+                ));
                 ui.add_space(6.0);
                 self.draw_histogram(ui);
                 ui.add_space(6.0);
                 ui.add(
-                    egui::Slider::new(&mut self.in_min, 0..=u16::MAX)
+                    egui::Slider::new(&mut self.in_min, 0..=self.max_value)
                         .text("最小輝度")
                         .clamping(egui::SliderClamping::Always),
                 );
                 ui.add(
-                    egui::Slider::new(&mut self.in_max, 0..=u16::MAX)
+                    egui::Slider::new(&mut self.in_max, 0..=self.max_value)
                         .text("最大輝度")
                         .clamping(egui::SliderClamping::Always),
                 );
@@ -440,7 +450,7 @@ impl LevelsDialog {
         }
         if reset {
             self.in_min = 0;
-            self.in_max = u16::MAX;
+            self.in_max = self.max_value;
         }
         if self.in_min > self.in_max {
             self.in_max = self.in_min;
@@ -478,6 +488,11 @@ impl LevelsDialog {
         self.hist = source
             .as_ref()
             .map_or_else(Vec::new, |img| img.histogram(HIST_BINS));
+        // スライダー・目盛りの上限も実際の入力画像の深度に合わせる。
+        self.max_value = source.as_ref().map_or(u16::MAX, |img| img.max_value());
+        // 上限が下がったら（画像が出て 8bit と分かった等）値も範囲へ収める。
+        self.in_min = self.in_min.min(self.max_value);
+        self.in_max = self.in_max.min(self.max_value);
         self.hist_source = source;
     }
 
@@ -516,7 +531,7 @@ impl LevelsDialog {
             (self.in_min, Color32::from_rgb(90, 170, 255), "min"),
             (self.in_max, Color32::from_rgb(255, 140, 90), "max"),
         ] {
-            let x = rect.left() + rect.width() * (value as f32 / 65535.0);
+            let x = rect.left() + rect.width() * (value as f32 / self.max_value as f32);
             painter.line_segment(
                 [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
                 egui::Stroke::new(1.5, color),
@@ -651,7 +666,7 @@ impl ExportDialog {
                 ui.checkbox(&mut self.color, "カラー（RGB）で保存")
                     .on_hover_text(
                         "アノテーションの色を残します。画像の階調は 8bit になります。\n\
-                         オフのときは 16bit グレースケールのまま、色は輝度へ落ちます。",
+                         オフのときは元のビット深度のグレースケールのまま、色は輝度へ落ちます。",
                     );
                 ui.add_space(8.0);
                 ui.add(

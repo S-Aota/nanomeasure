@@ -1,7 +1,9 @@
-//! 16bit グレースケール画像と、その上で動く画素処理。
+//! グレースケール画像と、その上で動く画素処理。
 //!
-//! アプリ内の画像は常にこの型で持ち回す。8bit 画像は読み込み時に 16bit へ
-//! 拡張し、8bit へ落とすのは画面表示用テクスチャを作るときだけ。
+//! アプリ内の画像は常にこの型で持ち回す。ビット深度（8bit か 16bit）は
+//! 読み込み時のまま保持し、処理も同じ深度のまま行う（8bit 画像を 16bit へ
+//! 拡張しない）。画素値はどちらの深度でも 0..max_value に収め、
+//! 8bit へ落とすのは画面表示用テクスチャを作るときだけ。
 //!
 //! 画素処理は行単位で rayon により並列化する。各行の計算順序は逐次版と
 //! 同じなので、結果はスレッド数によらず一致する。
@@ -13,16 +15,37 @@ use rayon::prelude::*;
 pub struct Gray16 {
     pub width: u32,
     pub height: u32,
+    /// 1 画素のビット深度（8 か 16）。8bit 画像は値 0..255 のまま保持し、
+    /// 16bit へ拡張しない。画像処理は入力の深度を保つ。
+    pub depth: u8,
     /// 左上から行優先。長さは width * height。
     pub data: Vec<u16>,
 }
 
 impl Gray16 {
+    /// 16bit の黒画像（テスト用の仮画像）。
+    #[cfg(test)]
     pub fn black(width: u32, height: u32) -> Self {
+        Self::black_with_depth(width, height, 16)
+    }
+
+    /// 指定したビット深度の黒画像（処理結果の出力先として、入力と同じ
+    /// 深度の画像を作るために使う）。
+    fn black_with_depth(width: u32, height: u32, depth: u8) -> Self {
         Self {
             width,
             height,
+            depth,
             data: vec![0; (width as usize) * (height as usize)],
+        }
+    }
+
+    /// 画素値の最大値（8bit なら 255、16bit なら 65535）。
+    pub fn max_value(&self) -> u16 {
+        if self.depth == 8 {
+            u8::MAX as u16
+        } else {
+            u16::MAX
         }
     }
 
@@ -33,11 +56,28 @@ impl Gray16 {
 
     pub fn from_dynamic(img: &image::DynamicImage) -> Self {
         // カラー画像はここでグレースケールへ落とす（輝度加重平均）。
-        let buf = img.to_luma16();
-        Self {
-            width: buf.width(),
-            height: buf.height(),
-            data: buf.into_raw(),
+        // 元のビット深度は保つ（8bit 画像を 16bit へ拡張しない）。
+        use image::DynamicImage as D;
+        let is_8bit = matches!(
+            img,
+            D::ImageLuma8(_) | D::ImageLumaA8(_) | D::ImageRgb8(_) | D::ImageRgba8(_)
+        );
+        if is_8bit {
+            let buf = img.to_luma8();
+            Self {
+                width: buf.width(),
+                height: buf.height(),
+                depth: 8,
+                data: buf.into_raw().into_iter().map(u16::from).collect(),
+            }
+        } else {
+            let buf = img.to_luma16();
+            Self {
+                width: buf.width(),
+                height: buf.height(),
+                depth: 16,
+                data: buf.into_raw(),
+            }
         }
     }
 
@@ -46,25 +86,19 @@ impl Gray16 {
             .expect("data length always matches width * height")
     }
 
-    pub fn min_max(&self) -> (u16, u16) {
-        if self.data.is_empty() {
-            return (0, u16::MAX);
-        }
-        self.data
-            .par_iter()
-            .fold(
-                || (u16::MAX, u16::MIN),
-                |(lo, hi), &v| (lo.min(v), hi.max(v)),
-            )
-            .reduce(
-                || (u16::MAX, u16::MIN),
-                |(a, b), (c, d)| (a.min(c), b.max(d)),
-            )
+    /// 8bit 画像用（`depth == 8` のときだけ呼ぶこと。16bit だと下位へ落ちる）。
+    pub fn to_luma8_buffer(&self) -> image::ImageBuffer<image::Luma<u8>, Vec<u8>> {
+        image::ImageBuffer::from_raw(
+            self.width,
+            self.height,
+            self.data.iter().map(|&v| v as u8).collect(),
+        )
+        .expect("data length always matches width * height")
     }
 
     /// `bins` 個のビンに均等分割した輝度ヒストグラム。
     pub fn histogram(&self, bins: usize) -> Vec<u32> {
-        let scale = bins as f32 / 65536.0;
+        let scale = bins as f32 / (self.max_value() as f32 + 1.0);
         // 大きめの塊ごとに部分ヒストグラムを作って足し合わせる
         // （塊が小さいとビン配列の確保と合算が勝ってしまう）。
         self.data
@@ -90,7 +124,8 @@ impl Gray16 {
 
     /// 累積ヒストグラムから下側/上側 `frac` を切り捨てた輝度を返す（オートレベル用）。
     pub fn percentiles(&self, frac: f64) -> (u16, u16) {
-        let hist = self.histogram(65536);
+        // 8bit 画像は 256 ビン（値そのもの）で数える。
+        let hist = self.histogram(self.max_value() as usize + 1);
         let total: u64 = self.data.len() as u64;
         if total == 0 {
             return (0, u16::MAX);
@@ -129,7 +164,7 @@ impl Gray16 {
         let cx = (w as f32 - 1.0) * 0.5;
         let cy = (h as f32 - 1.0) * 0.5;
 
-        let mut out = Self::black(w, h);
+        let mut out = Self::black_with_depth(w, h, self.depth);
         out.data
             .par_chunks_mut(w as usize)
             .enumerate()
@@ -166,7 +201,9 @@ impl Gray16 {
         };
         let top = get(x0, y0) * (1.0 - fx) + get(x0 + 1, y0) * fx;
         let bot = get(x0, y0 + 1) * (1.0 - fx) + get(x0 + 1, y0 + 1) * fx;
-        (top * (1.0 - fy) + bot * fy).round().clamp(0.0, 65535.0) as u16
+        (top * (1.0 - fy) + bot * fy)
+            .round()
+            .clamp(0.0, self.max_value() as f32) as u16
     }
 
     /// 範囲外を最外周の画素値で padding する双一次補間サンプリング。
@@ -210,7 +247,7 @@ impl Gray16 {
             .for_each(|(dst, src)| convolve_row(src, dst, &kernel));
 
         // 縦方向は行単位で積算する（列方向に飛ぶアクセスを避ける）。
-        let mut out = Self::black(self.width, self.height);
+        let mut out = Self::black_with_depth(self.width, self.height, self.depth);
         out.data.par_chunks_mut(w).enumerate().for_each_init(
             || vec![0f32; w],
             |acc, (y, row)| {
@@ -222,7 +259,7 @@ impl Gray16 {
                     }
                 }
                 for (o, &a) in row.iter_mut().zip(acc.iter()) {
-                    *o = a.round().clamp(0.0, 65535.0) as u16;
+                    *o = a.round().clamp(0.0, self.max_value() as f32) as u16;
                 }
             },
         );
@@ -238,7 +275,7 @@ impl Gray16 {
             return self.clone();
         }
         let r = radius as usize;
-        let mut out = Self::black(self.width, self.height);
+        let mut out = Self::black_with_depth(self.width, self.height, self.depth);
         out.data.par_chunks_mut(w).enumerate().for_each_init(
             || Vec::with_capacity((2 * r + 1) * (2 * r + 1)),
             |window, (y, row)| {
@@ -270,31 +307,34 @@ impl Gray16 {
             .zip(self.data.par_iter())
             .for_each(|(o, &v)| {
                 let s = v as f32 + amount * (v as f32 - *o as f32);
-                *o = s.round().clamp(0.0, 65535.0) as u16;
+                *o = s.round().clamp(0.0, self.max_value() as f32) as u16;
             });
         out
     }
 
-    /// `in_min`..`in_max` の輝度を 0..65535 へ線形に引き伸ばす。
+    /// `in_min`..`in_max` の輝度を 0..max_value へ線形に引き伸ばす。
+    /// 入力のビット深度は保たれる（8bit 画像は 8bit のまま引き伸ばす）。
     pub fn apply_levels(&self, in_min: u16, in_max: u16) -> Self {
         let lo = in_min.min(in_max);
         let hi = in_min.max(in_max);
-        let mut lut = vec![0u16; 65536];
+        let max = self.max_value();
+        let mut lut = vec![0u16; max as usize + 1];
         if hi == lo {
             // 幅ゼロは二値化として扱う。
             for (v, out) in lut.iter_mut().enumerate() {
-                *out = if v as u16 >= hi { u16::MAX } else { 0 };
+                *out = if v as u16 >= hi { max } else { 0 };
             }
         } else {
             let span = (hi - lo) as f32;
             for (v, out) in lut.iter_mut().enumerate() {
                 let t = ((v as f32 - lo as f32) / span).clamp(0.0, 1.0);
-                *out = (t * 65535.0).round() as u16;
+                *out = (t * max as f32).round() as u16;
             }
         }
         Self {
             width: self.width,
             height: self.height,
+            depth: self.depth,
             data: self.data.par_iter().map(|&v| lut[v as usize]).collect(),
         }
     }
@@ -306,6 +346,7 @@ impl Gray16 {
         Self {
             width,
             height,
+            depth: self.depth,
             data,
         }
     }
@@ -314,7 +355,7 @@ impl Gray16 {
     /// 縮小しつつ、表示レンジ `lo`..`hi` を 0..255 に写す。縮小画像を
     /// 中間に作らず 1 パスで変換する（等倍でも元画像の複製を作らない）。
     pub fn to_display_image(&self, factor: u32, lo: u16, hi: u16) -> ColorImage {
-        let lut = display_lut(lo, hi);
+        let lut = display_lut(lo, hi, self.max_value());
         let (w, h, pixels) = self.reduce_map(factor, |v| Color32::from_gray(lut[v as usize]));
         ColorImage::new([w as usize, h as usize], pixels)
     }
@@ -405,8 +446,10 @@ fn convolve_row(src: &[u16], dst: &mut [f32], kernel: &[f32]) {
 }
 
 /// 表示レンジ `lo`..`hi` を 0..255 に写す 16bit → 8bit の変換表。
-fn display_lut(lo: u16, hi: u16) -> Vec<u8> {
-    let (lo, hi) = if hi > lo { (lo, hi) } else { (0, u16::MAX) };
+/// `max` は画素値の最大値（8bit 画像は 255、16bit 画像は 65535）。
+/// レンジが幅ゼロ（一様画像など）のときは全域 0..max として扱う。
+fn display_lut(lo: u16, hi: u16, max: u16) -> Vec<u8> {
+    let (lo, hi) = if hi > lo { (lo, hi) } else { (0, max) };
     let span = (hi - lo) as f32;
     (0..=u16::MAX)
         .map(|v| {
@@ -443,6 +486,7 @@ mod tests {
         let img = Gray16 {
             width: 16,
             height: 16,
+            depth: 16,
             data: vec![u16::MAX; 256],
         };
         let out = img.rotate(45.0);
@@ -456,6 +500,7 @@ mod tests {
         let img = Gray16 {
             width: 5,
             height: 1,
+            depth: 16,
             data: vec![0, 1000, 2000, 3000, 4000],
         };
         let out = img.apply_levels(1000, 3000);
@@ -466,12 +511,73 @@ mod tests {
         assert_eq!(out.data[4], u16::MAX, "上限より明るい画素は最大値");
     }
 
+    /// 8bit 画像は 16bit へ拡張されず、値もそのまま（×257 しない）であること。
+    #[test]
+    fn from_dynamic_keeps_8bit_values() {
+        let img = image::DynamicImage::ImageLuma8(
+            image::ImageBuffer::from_raw(2, 1, vec![0u8, 255]).unwrap(),
+        );
+        let gray = Gray16::from_dynamic(&img);
+        assert_eq!(gray.depth, 8);
+        assert_eq!(gray.max_value(), 255);
+        assert_eq!(gray.data, vec![0, 255]);
+    }
+
+    /// レベル補正は入力のビット深度を保ち、8bit 画像は 0..255 へ引き伸ばす。
+    #[test]
+    fn levels_keeps_8bit_depth_and_stretches_to_255() {
+        let img = Gray16 {
+            width: 4,
+            height: 1,
+            depth: 8,
+            data: vec![0, 100, 125, 255],
+        };
+        let out = img.apply_levels(100, 150);
+        assert_eq!(out.depth, 8);
+        assert_eq!(out.data[0], 0, "下限より暗い画素は 0");
+        assert_eq!(out.data[1], 0);
+        assert_eq!(out.data[2], 128, "中点は中間輝度 (255 の半分)");
+        assert_eq!(out.data[3], 255, "上限より明るい画素は最大値");
+    }
+
+    /// 一様な 8bit 画像は、レンジ幅ゼロでも値がそのまま表示されること
+    /// （0..65535 前提だと黒へ落ちてしまう）。
+    #[test]
+    fn flat_8bit_image_displays_as_its_value() {
+        let img = Gray16 {
+            width: 1,
+            height: 1,
+            depth: 8,
+            data: vec![200],
+        };
+        let disp = img.to_display_image(1, 0, 0);
+        assert_eq!(disp.pixels[0], Color32::from_gray(200));
+    }
+
+    /// 回転・ぼかしも入力のビット深度を保つ。
+    #[test]
+    fn rotate_and_blur_keep_8bit_depth() {
+        let img = Gray16 {
+            width: 16,
+            height: 16,
+            depth: 8,
+            data: vec![100; 256],
+        };
+        let out = img.rotate(30.0);
+        assert_eq!(out.depth, 8);
+        assert!(out.data.iter().all(|&v| v <= 255), "8bit の範囲に収まる");
+        let out = img.gaussian_blur(1.0);
+        assert_eq!(out.depth, 8);
+        assert_eq!(out.data, vec![100; 256], "一様画像はぼかしても変わらない");
+    }
+
     /// 等倍の表示画像は LUT 変換だけで、縮小版はブロック平均を通すこと。
     #[test]
     fn display_image_maps_range_and_reduces() {
         let img = Gray16 {
             width: 2,
             height: 2,
+            depth: 16,
             data: vec![0, 100, 200, 300],
         };
         let full = img.to_display_image(1, 0, 300);
@@ -527,6 +633,7 @@ mod tests {
         let img = Gray16 {
             width: 2,
             height: 2,
+            depth: 16,
             data: vec![0, 100, 200, 300],
         };
         let out = img.downsample_box(2);
@@ -539,6 +646,7 @@ mod tests {
         let img = Gray16 {
             width: 4,
             height: 1,
+            depth: 16,
             data: vec![0, 0, u16::MAX, 32768],
         };
         let hist = img.histogram(4);
@@ -552,6 +660,7 @@ mod tests {
         let img = Gray16 {
             width: 4,
             height: 4,
+            depth: 16,
             data: vec![100; 16],
         };
         assert_eq!(img.sample_bilinear_clamp(1.5, 1.5), 100.0);
@@ -576,6 +685,7 @@ mod tests {
         let img = Gray16 {
             width: 8,
             height: 8,
+            depth: 16,
             data: vec![1000; 64],
         };
         let out = img.gaussian_blur(2.0);

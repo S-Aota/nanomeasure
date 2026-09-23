@@ -171,8 +171,6 @@ pub struct Document {
     pub error: Option<String>,
     /// 表示テクスチャの作り直し判定に使う、結果画像の世代番号。
     pub generation: u64,
-    /// 結果画像の実測レンジ（表示の自動コントラスト用）。
-    cached_min_max: Option<(u16, u16)>,
     /// リストで選択されている行。コピー元と貼り付け位置に使う。
     selection: BTreeSet<usize>,
     /// Shift クリックの範囲選択の起点。
@@ -189,7 +187,6 @@ impl Document {
             dirty_from: None,
             error: None,
             generation: 0,
-            cached_min_max: None,
             selection: BTreeSet::new(),
             anchor: None,
             view: ImageView::default(),
@@ -479,7 +476,6 @@ impl Document {
         let after = self.result_image_ptr();
         if before != after {
             self.generation = self.generation.wrapping_add(1);
-            self.cached_min_max = None;
         }
     }
 
@@ -488,16 +484,11 @@ impl Document {
         self.result().map(|f| Arc::as_ptr(&f.image))
     }
 
-    /// 表示に使う輝度レンジ。`auto` なら結果画像の実測 min/max に合わせる。
-    pub fn display_range(&mut self, auto: bool) -> (u16, u16) {
-        if !auto {
-            return (0, u16::MAX);
-        }
-        if self.cached_min_max.is_none() {
-            self.cached_min_max = Some(self.image().map_or((0, u16::MAX), |img| img.min_max()));
-        }
-        let (lo, hi) = self.cached_min_max.unwrap();
-        if hi > lo { (lo, hi) } else { (0, u16::MAX) }
+    /// 表示に使う輝度レンジ。画像のビット深度の全域（8bit なら 0..255、
+    /// 16bit なら 0..65535）をそのまま使う。読み込んだ画像の輝度のまま
+    /// 表示するため、min/max への自動引き伸ばしはしない。
+    pub fn display_range(&self) -> (u16, u16) {
+        (0, self.image().map_or(u16::MAX, |img| img.max_value()))
     }
 }
 
