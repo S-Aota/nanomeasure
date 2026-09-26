@@ -38,6 +38,7 @@ menu:
   how_to: "操作方法"
   association: "文件关联..."
   about: "版本信息"
+  license: "License"
 
 tab:
   close_hover: "关闭标签页"
@@ -132,6 +133,10 @@ about:
   title: "版本信息"
   description: "TEM 图像分析工具"
   bit_depth: "内部处理以 16bit 灰度进行。"
+  license: "License: Apache License 2.0"
+
+license:
+  title: "License"
 
 assoc:
   title: "文件关联"

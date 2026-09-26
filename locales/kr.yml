@@ -38,6 +38,7 @@ menu:
   how_to: "사용 방법"
   association: "파일 연결..."
   about: "버전 정보"
+  license: "License"
 
 tab:
   close_hover: "탭 닫기"
@@ -132,6 +133,10 @@ about:
   title: "버전 정보"
   description: "TEM 이미지 해석용 도구"
   bit_depth: "내부 처리는 16bit 그레이스케일로 수행합니다."
+  license: "License: Apache License 2.0"
+
+license:
+  title: "License"
 
 assoc:
   title: "파일 연결"

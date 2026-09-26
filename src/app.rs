@@ -82,6 +82,8 @@ pub struct TemApp {
     settings_dialog: SettingsDialog,
     help_open: bool,
     about_open: bool,
+    /// ライセンス全文の表示。
+    license_open: bool,
     /// .tmrjson ファイル関連付けの案内ダイアログ。
     assoc_open: bool,
     /// 編集中にタブ切り替えを試みたときの警告。編集中なら切り替えず、
@@ -118,6 +120,7 @@ impl TemApp {
             settings_dialog: SettingsDialog::default(),
             help_open: false,
             about_open: false,
+            license_open: false,
             assoc_open: false,
             tab_switch_warning: None,
             status: t!("status.initial").into_owned(),
@@ -353,6 +356,10 @@ impl TemApp {
                     }
                     if ui.button(t!("menu.about").as_ref()).clicked() {
                         self.about_open = true;
+                        ui.close();
+                    }
+                    if ui.button(t!("menu.license").as_ref()).clicked() {
+                        self.license_open = true;
                         ui.close();
                     }
                 });
@@ -733,8 +740,22 @@ impl TemApp {
                 ui.label(format!("tem_measurer {}", env!("CARGO_PKG_VERSION")));
                 ui.label(t!("about.description").as_ref());
                 ui.label(t!("about.bit_depth").as_ref());
+                ui.label(t!("about.license").as_ref());
             });
         self.about_open = about_open;
+
+        let mut license_open = self.license_open;
+        egui::Window::new(t!("license.title").as_ref())
+            .open(&mut license_open)
+            .resizable(true)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(400.0)
+                    .show(ui, |ui| {
+                        ui.monospace(include_str!("../LICENSE"));
+                    });
+            });
+        self.license_open = license_open;
 
         let mut assoc_open = self.assoc_open;
         let mut save_requested = false;

@@ -38,6 +38,7 @@ menu:
   how_to: "How to Use"
   association: "File Association..."
   about: "About"
+  license: "License"
 
 tab:
   close_hover: "Close tab"
@@ -132,6 +133,10 @@ about:
   title: "About"
   description: "Tool for TEM image analysis"
   bit_depth: "Internal processing is done in 16-bit grayscale."
+  license: "License: Apache License 2.0"
+
+license:
+  title: "License"
 
 assoc:
   title: "File Association"

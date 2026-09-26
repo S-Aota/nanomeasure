@@ -38,6 +38,7 @@ menu:
   how_to: "操作方法"
   association: "ファイル関連付け..."
   about: "バージョン情報"
+  license: "License"
 
 tab:
   close_hover: "タブを閉じる"
@@ -132,6 +133,10 @@ about:
   title: "バージョン情報"
   description: "TEM 画像の解析用ツール"
   bit_depth: "内部処理は 16bit グレースケールで行います。"
+  license: "License: Apache License 2.0"
+
+license:
+  title: "License"
 
 assoc:
   title: "ファイルの関連付け"

@@ -38,6 +38,7 @@ menu:
   how_to: "操作方法"
   association: "檔案關聯..."
   about: "版本資訊"
+  license: "License"
 
 tab:
   close_hover: "關閉分頁"
@@ -132,6 +133,10 @@ about:
   title: "版本資訊"
   description: "TEM 影像分析工具"
   bit_depth: "內部處理以 16bit 灰階進行。"
+  license: "License: Apache License 2.0"
+
+license:
+  title: "License"
 
 assoc:
   title: "檔案關聯"
