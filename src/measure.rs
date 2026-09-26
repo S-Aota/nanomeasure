@@ -270,6 +270,16 @@ impl MeasureTool {
             Self::Offset { .. } => None,
         }
     }
+
+    /// 所属グループを書き換える（グループ結合用）。補助線は何もしない。
+    pub fn set_group(&mut self, gid: u64) {
+        match self {
+            Self::Distance { group, .. }
+            | Self::Boundary { group, .. }
+            | Self::Angle { group, .. } => *group = gid,
+            Self::Offset { .. } => {}
+        }
+    }
 }
 
 /// 測長コマンドのデータ全体。
@@ -366,6 +376,60 @@ impl MeasureData {
                 });
                 id
             }
+        }
+    }
+
+    /// グループを結果リストの並びで上下に動かす。
+    pub fn move_group(&mut self, gid: u64, delta: isize) {
+        let Some(i) = self.groups.iter().position(|g| g.id == gid) else {
+            return;
+        };
+        let j = i as isize + delta.signum();
+        if j >= 0 && (j as usize) < self.groups.len() {
+            self.groups.swap(i, j as usize);
+        }
+    }
+
+    /// src グループのツールを dst グループの末尾（最後の dst ツールの直後）
+    /// へ元の順のまま移し、src グループを削除する。同種グループ間のみ
+    /// （UI 側でも同種だけを候補に出すが、データ層でも不変条件を守る）。
+    pub fn merge_group(&mut self, src: u64, dst: u64) {
+        if src == dst || !self.has_group(src) || !self.has_group(dst) {
+            return;
+        }
+        let (Some(s), Some(d)) = (
+            self.groups.iter().find(|g| g.id == src),
+            self.groups.iter().find(|g| g.id == dst),
+        ) else {
+            return;
+        };
+        if s.kind() != d.kind() {
+            return;
+        }
+        // src のツールを取り出す。
+        let mut src_tools: Vec<MeasureTool> = Vec::new();
+        self.tools.retain(|t| {
+            if t.group() == Some(src) {
+                src_tools.push(t.clone());
+                false
+            } else {
+                true
+            }
+        });
+        // dst の最後のツールの直後に挿入し、グループを書き換える。
+        let pos = self
+            .tools
+            .iter()
+            .rposition(|t| t.group() == Some(dst))
+            .map(|i| i + 1)
+            .unwrap_or(self.tools.len());
+        for (k, mut t) in src_tools.into_iter().enumerate() {
+            t.set_group(dst);
+            self.tools.insert(pos + k, t);
+        }
+        self.groups.retain(|g| g.id != src);
+        if self.active_group == Some(src) {
+            self.active_group = Some(dst);
         }
     }
 
@@ -1222,5 +1286,75 @@ mod tests {
         assert_eq!(format_angle(45.0, 1), "45°");
         assert_eq!(format_angle(45.5, 2), "45.5°");
         assert_eq!(format_angle(45.678, 3), "45.678°");
+    }
+
+    #[test]
+    fn move_group_swaps_order() {
+        fn ids(data: &MeasureData) -> Vec<u64> {
+            data.groups.iter().map(|g| g.id).collect()
+        }
+        let mut data = MeasureData::default();
+        let g1 = data.group_for_new_measurement(ToolKind::Distance);
+        data.apply_new_measure_mode();
+        let g2 = data.group_for_new_measurement(ToolKind::Distance);
+        data.move_group(g2, -1);
+        assert_eq!(ids(&data), vec![g2, g1]);
+        // 端では動かない。
+        data.move_group(g2, -1);
+        assert_eq!(ids(&data), vec![g2, g1]);
+        data.move_group(g2, 1);
+        assert_eq!(ids(&data), vec![g1, g2]);
+    }
+
+    #[test]
+    fn merge_group_moves_tools_and_removes_source() {
+        let mut data = MeasureData::default();
+        let fit = FitSettings::default();
+        let d1 = data.group_for_new_measurement(ToolKind::Distance);
+        data.tools.push(MeasureTool::Distance {
+            id: 1,
+            p1: pt(0.0, 0.0),
+            p2: pt(10.0, 0.0),
+            group: d1,
+            fit1: fit,
+            fit2: fit,
+        });
+        data.apply_new_measure_mode();
+        let d2 = data.group_for_new_measurement(ToolKind::Distance);
+        for id in [2, 3] {
+            data.tools.push(MeasureTool::Distance {
+                id,
+                p1: pt(0.0, 0.0),
+                p2: pt(10.0, 0.0),
+                group: d2,
+                fit1: fit,
+                fit2: fit,
+            });
+        }
+        // active が結合元なら結合先へ追従する。
+        data.active_group = Some(d1);
+        data.merge_group(d1, d2);
+        assert_eq!(
+            data.group_tools(d2),
+            vec![2, 3, 1],
+            "結合元のツールは末尾へ"
+        );
+        assert!(!data.has_group(d1));
+        assert_eq!(data.active_group, Some(d2));
+    }
+
+    #[test]
+    fn merge_group_rejects_different_kind() {
+        let mut data = MeasureData::default();
+        let d = data.group_for_new_measurement(ToolKind::Distance);
+        let a = data.group_for_new_measurement(ToolKind::Angle);
+        // 異種の結合は無視される（UI 側でも候補に出さない）。
+        data.merge_group(d, a);
+        assert!(data.has_group(d));
+        assert!(data.has_group(a));
+        // 同種ならツールが空でもグループごと消える。
+        let d2 = data.group_for_new_measurement(ToolKind::Distance);
+        data.merge_group(d2, d);
+        assert!(!data.has_group(d2));
     }
 }

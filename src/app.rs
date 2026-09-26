@@ -1386,6 +1386,7 @@ mod i18n_tests {
                 "mm.tool.angle",
                 "mm.hint_angle",
                 "mm.shift_angle_hint",
+                "mm.merge_group",
                 "mm.fit_off",
                 "mm.csv_stats_header",
                 "exp.no_image",

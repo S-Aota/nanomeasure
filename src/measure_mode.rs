@@ -258,6 +258,16 @@ enum ResultAction {
         gid: u64,
         key: SortKey,
     },
+    /// グループを結果リストの並びで上下に動かす。
+    MoveGroup {
+        gid: u64,
+        delta: isize,
+    },
+    /// src グループを dst グループへ結合する（src は削除される）。
+    MergeGroup {
+        src: u64,
+        dst: u64,
+    },
     /// 全グループの統計データをクリップボードへコピー。
     CopyStats,
     /// 1 グループの測長結果一覧をクリップボードへコピー。
@@ -988,7 +998,7 @@ impl MeasureMode {
                     actions.push(ResultAction::SelectNewGroup);
                 }
 
-                for g in &self.data.groups {
+                for (gi, g) in self.data.groups.iter().enumerate() {
                     let gid = g.id;
                     let selected = self.data.active_group == Some(gid);
                     ui.horizontal(|ui| {
@@ -1027,6 +1037,24 @@ impl MeasureMode {
                                 _ => t!("mm.tool.distance"),
                             };
                             ui.label(egui::RichText::new(kind_label.as_ref()).small().weak());
+                            // グループの並びを上下に動かす。
+                            if ui
+                                .add_enabled(gi > 0, egui::Button::new("▲").small())
+                                .on_hover_text(t!("mm.move_group_up_hover").as_ref())
+                                .clicked()
+                            {
+                                actions.push(ResultAction::MoveGroup { gid, delta: -1 });
+                            }
+                            if ui
+                                .add_enabled(
+                                    gi + 1 < self.data.groups.len(),
+                                    egui::Button::new("▼").small(),
+                                )
+                                .on_hover_text(t!("mm.move_group_down_hover").as_ref())
+                                .clicked()
+                            {
+                                actions.push(ResultAction::MoveGroup { gid, delta: 1 });
+                            }
                             // 右クリックメニュー: クリップボードへのコピー。
                             resp.context_menu(|ui| {
                                 if ui.button(t!("mm.copy_stats").as_ref()).clicked() {
@@ -1073,6 +1101,31 @@ impl MeasureMode {
                                         key: SortKey::Y,
                                     });
                                 }
+                                // 結合: 同種グループの名前を候補に出す。
+                                ui.menu_button(t!("mm.merge_group").as_ref(), |ui| {
+                                    let mut has_target = false;
+                                    for other in &self.data.groups {
+                                        if other.id == gid || other.kind() != g.kind() {
+                                            continue;
+                                        }
+                                        has_target = true;
+                                        let name = if other.name.is_empty() {
+                                            t!("mm.unnamed").into_owned()
+                                        } else {
+                                            other.name.clone()
+                                        };
+                                        if ui.button(name).clicked() {
+                                            ui.close();
+                                            actions.push(ResultAction::MergeGroup {
+                                                src: gid,
+                                                dst: other.id,
+                                            });
+                                        }
+                                    }
+                                    if !has_target {
+                                        ui.weak(t!("mm.merge_no_target").as_ref());
+                                    }
+                                });
                             });
                         }
                         // グループごとの一括削除。
@@ -1210,6 +1263,7 @@ impl MeasureMode {
                                 t,
                                 MeasureTool::Distance { group, .. }
                                     | MeasureTool::Boundary { group, .. }
+                                    | MeasureTool::Angle { group, .. }
                                     if *group == gid
                             )
                         })
@@ -1231,6 +1285,15 @@ impl MeasureMode {
                 }
                 ResultAction::SortGroup { gid, key } => {
                     self.mutate(doc, |data| sort_group(data, &computed, gid, key));
+                }
+                ResultAction::MoveGroup { gid, delta } => {
+                    self.mutate(doc, |data| data.move_group(gid, delta));
+                }
+                ResultAction::MergeGroup { src, dst } => {
+                    if self.rename == Some(src) {
+                        self.rename = None;
+                    }
+                    self.mutate(doc, |data| data.merge_group(src, dst));
                 }
                 ResultAction::CopyStats => {
                     ui.ctx()
@@ -1285,10 +1348,11 @@ fn sort_group(data: &mut MeasureData, computed: &ComputedMeasure, gid: u64, key:
         .collect();
     let mut it = members.into_iter();
     for t in &mut data.tools {
-        if t.is_measurement() && t.group() == Some(gid) {
-            if let Some(m) = it.next() {
-                *t = m;
-            }
+        if t.is_measurement()
+            && t.group() == Some(gid)
+            && let Some(m) = it.next()
+        {
+            *t = m;
         }
     }
 }
@@ -2472,12 +2536,14 @@ impl MeasureMode {
             self.handle_delete_input(doc, &resp, cursor, press, &img);
         }
 
-        // 直線複製: カーソル追従（4 方向固定を適用）。確定はクリック側。
+        // 直線複製: カーソル追従（4 方向固定を適用。Shift で一時反転）。
         if let Some(InProgress::LinearDuplicate { start, current, .. }) = &mut self.in_progress
             && let Some(cursor) = cursor
         {
-            *current = if self.data.prefs.angle == AngleMode::FourDir {
-                snap_angle_four(*start, cursor)
+            let start = *start;
+            let shift = ui.input(|i| i.modifiers.shift);
+            *current = if four_dir_enabled(self.data.prefs.angle, shift) {
+                snap_angle_four(start, cursor)
             } else {
                 cursor
             };
@@ -3150,12 +3216,9 @@ impl MeasureMode {
                 Some(InProgress::LinearDuplicate {
                     src, start, count, ..
                 }) => {
-                    // クリックで確定。方向は 4 方向固定を適用した位置を使う。
-                    let current = if self.data.prefs.angle == AngleMode::FourDir {
-                        snap_angle_four(start, pos)
-                    } else {
-                        pos
-                    };
+                    // クリックで確定。方向は 4 方向固定を適用した位置を使う
+                    // （Shift で一時反転）。
+                    let current = self.resolve_angle(start, pos, false, shift);
                     let delta = current - start;
                     if delta.length() >= 0.5 {
                         // 複製元と同じグループに、距離を分割した位置へ配置する。
@@ -3280,7 +3343,7 @@ impl MeasureMode {
             }
             for (which, p) in pts {
                 let d = (pos - p).length();
-                if d <= threshold && best.map_or(true, |(_, _, bd)| d < bd) {
+                if d <= threshold && best.is_none_or(|(_, _, bd)| d < bd) {
                     best = Some((t.id, which, d));
                 }
             }
@@ -3336,15 +3399,19 @@ impl MeasureMode {
     /// 名前は「角度ツール」の計算（`measure::angle_deg_between`）と
     /// 似ているが無関係（こちらは 4 方向固定用）。
     fn resolve_angle(&self, p1: Pt2, p2: Pt2, snapped: bool, shift: bool) -> Pt2 {
-        let four_dir = match (self.data.prefs.angle, shift) {
-            (AngleMode::FourDir, false) | (AngleMode::Free, true) => true,
-            _ => false,
-        };
-        if !snapped && four_dir {
+        if !snapped && four_dir_enabled(self.data.prefs.angle, shift) {
             return snap_angle_four(p1, p2);
         }
         p2
     }
+}
+
+/// 4 方向固定が有効か。Shift 押下中は設定を一時的に反転する（4 方向 ⇔ 自由）。
+fn four_dir_enabled(mode: AngleMode, shift: bool) -> bool {
+    matches!(
+        (mode, shift),
+        (AngleMode::FourDir, false) | (AngleMode::Free, true)
+    )
 }
 
 /// `pos` に最も近い、条件を満たすツール（線分距離がしきい値以下）。
