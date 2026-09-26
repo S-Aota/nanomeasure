@@ -43,6 +43,10 @@ const PICK_PX: f32 = 20.0;
 /// 範囲選択枠の辺の判定幅（画面 px）。
 const RANGE_EDGE_PX: f32 = 6.0;
 
+/// 範囲複製で「開始位置と同じクリック」とみなす距離（画面 px）。
+/// これ未満の移動では複製せず、複製状態を維持する。
+const RANGE_DUP_MIN_PX: f64 = 3.0;
+
 /// 二点間測長（赤）。
 pub(crate) const COLOR_DISTANCE: Color32 = Color32::from_rgb(235, 70, 70);
 /// 境界線・オフセット線（紫）。
@@ -53,6 +57,8 @@ pub(crate) const COLOR_REGION_GAUSSIAN: Color32 = Color32::from_rgb(90, 180, 240
 pub(crate) const COLOR_REGION_DERIV: Color32 = Color32::from_rgb(150, 220, 90); // 3: 黄緑
 /// 作成中・選択中の一時表示（橙）。
 const COLOR_IN_PROGRESS: Color32 = Color32::from_rgb(255, 150, 60);
+/// 範囲選択の枠線（水色）。
+const COLOR_RANGE_FRAME: Color32 = Color32::from_rgb(110, 195, 255);
 
 pub(crate) fn region_color(mode: FitMode) -> Color32 {
     match mode {
@@ -132,6 +138,19 @@ impl ToolButton {
             Self::Delete => t!("mm.tool.delete"),
         }
     }
+
+    /// ツールボタンに表示するショートカットキー（単キー）。
+    pub fn key_hint(self) -> &'static str {
+        match self {
+            Self::Distance => "D",
+            Self::Angle => "A",
+            Self::Boundary => "B",
+            Self::Offset => "O",
+            Self::LinearDuplicate => "L",
+            Self::RangeSelect => "R",
+            Self::Delete => "X",
+        }
+    }
 }
 
 /// 範囲選択で選ばれた測長と選択枠（画像座標の軸平行矩形）。
@@ -156,23 +175,25 @@ enum RangeState {
     /// 枠を作成中（対角をドラッグ）。
     Drawing { start: Pt2, current: Pt2 },
     /// 枠の中をドラッグして選択測長をまとめて平行移動中。
-    /// `orig` はドラッグ開始時の各測長の p1/p2。
+    /// `orig` はドラッグ開始時の各測長の端点（角度は 3 点目も持つ）。
     Moving {
         start: Pt2,
         orig_min: Pt2,
         orig_max: Pt2,
-        orig: Vec<(u64, Pt2, Pt2)>,
+        orig: Vec<(u64, Pt2, Pt2, Option<Pt2>)>,
     },
-    /// Ctrl+ドラッグで選択測長を複製中（プレビューはドラッグ位置に描き、
-    /// データへはドラッグ終了時にまとめて反映する）。
+    /// Ctrl+クリックで選択測長の複製中（プレビューはカーソル位置に描く）。
+    /// 2 回目のクリックで位置を決定し、`count`（ホイールで 1..=20 に調整）
+    /// に分割した位置へコピーをまとめて配置する。
     Duplicating {
         start: Pt2,
         current: Pt2,
-        orig: Vec<(u64, Pt2, Pt2)>,
+        count: usize,
+        orig: Vec<(u64, Pt2, Pt2, Option<Pt2>)>,
     },
     /// 枠の辺・角をドラッグして拡大縮小中。反対側の辺を基準に、選択された
-    /// 測長の p1/p2 も枠と同じ線形写像で動かす。`orig` はドラッグ開始時の
-    /// 各測長の p1/p2。
+    /// 測長の端点も枠と同じ線形写像で動かす。`orig` はドラッグ開始時の
+    /// 各測長の端点（角度は 3 点目も持つ）。
     Resizing {
         orig_min: Pt2,
         orig_max: Pt2,
@@ -181,7 +202,7 @@ enum RangeState {
         max_x: bool,
         min_y: bool,
         max_y: bool,
-        orig: Vec<(u64, Pt2, Pt2)>,
+        orig: Vec<(u64, Pt2, Pt2, Option<Pt2>)>,
     },
 }
 
@@ -508,6 +529,38 @@ impl MeasureMode {
         if ctx.input_mut(|i| i.consume_shortcut(&redo)) {
             self.redo(doc);
         }
+        // ツール選択の単キーショートカット（ツール名の頭文字）。
+        // 同じキーを再び押すと選択解除（Esc と同じ）。
+        const TOOL_KEYS: &[(egui::Key, ToolButton)] = &[
+            (egui::Key::D, ToolButton::Distance),
+            (egui::Key::A, ToolButton::Angle),
+            (egui::Key::B, ToolButton::Boundary),
+            (egui::Key::O, ToolButton::Offset),
+            (egui::Key::L, ToolButton::LinearDuplicate),
+            (egui::Key::R, ToolButton::RangeSelect),
+            (egui::Key::X, ToolButton::Delete),
+        ];
+        for (key, tool) in TOOL_KEYS {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, *key)) {
+                self.select_tool(*tool);
+            }
+        }
+    }
+
+    /// ツールを選択する。同じツールが選択中なら解除（Esc と同じ）。
+    /// 作成中のツール・選択・範囲選択はツール切替でクリアする。
+    fn select_tool(&mut self, tool: ToolButton) {
+        self.tool = if self.tool == Some(tool) {
+            None
+        } else {
+            Some(tool)
+        };
+        self.in_progress = None;
+        self.selected = None;
+        self.drag = None;
+        self.drag_fitted = None;
+        self.range_selection = None;
+        self.range_state = None;
     }
 
     fn undo(&mut self, doc: &mut Document) {
@@ -909,18 +962,10 @@ impl MeasureMode {
 
     fn tool_button(&mut self, ui: &mut Ui, tool: ToolButton) {
         let selected = self.tool == Some(tool);
-        if ui
-            .selectable_label(selected, tool.label().as_ref())
-            .clicked()
-        {
-            // もう一度押すと選択解除（Esc と同じ）。
-            self.tool = if selected { None } else { Some(tool) };
-            self.in_progress = None;
-            self.selected = None;
-            self.drag = None;
-            self.drag_fitted = None;
-            self.range_selection = None;
-            self.range_state = None;
+        // ラベルにショートカットキーを添える（言語によらず同じキー）。
+        let text = format!("{} ({})", tool.label(), tool.key_hint());
+        if ui.selectable_label(selected, text).clicked() {
+            self.select_tool(tool);
         }
     }
 
@@ -2071,6 +2116,15 @@ impl MeasureMode {
                             ToolKind::Distance => {
                                 draw_line_and_arrows(painter, a, b, color);
                             }
+                            ToolKind::Angle => {
+                                painter.line_segment([a, b], Stroke::new(1.5, color));
+                                if let Some(p3) = t.p3 {
+                                    painter.line_segment(
+                                        [b, to_screen(info, p3 + off)],
+                                        Stroke::new(1.5, color),
+                                    );
+                                }
+                            }
                             _ => {
                                 painter.line_segment([a, b], Stroke::new(1.5, color));
                             }
@@ -2117,20 +2171,30 @@ impl MeasureMode {
         };
         for id in &ids {
             if let Some(t) = computed.by_id(*id) {
+                let stroke = Stroke::new(4.0, COLOR_IN_PROGRESS.gamma_multiply(0.65));
                 painter.line_segment(
                     [to_screen(info, t.p1), to_screen(info, t.p2)],
-                    Stroke::new(4.0, COLOR_IN_PROGRESS.gamma_multiply(0.65)),
+                    stroke,
                 );
+                // 角度は頂点を共有する 2 線分ともハイライトする。
+                if let Some(p3) = t.p3 {
+                    painter.line_segment([to_screen(info, t.p2), to_screen(info, p3)], stroke);
+                }
             }
         }
         if let Some((min, max)) = rect {
+            // 水色の破線で枠を描く（四辺それぞれに dashed_line を使う）。
             let rect = Rect::from_two_pos(to_screen(info, min), to_screen(info, max));
-            painter.rect_stroke(
-                rect,
-                0.0,
-                Stroke::new(1.5, COLOR_IN_PROGRESS),
-                egui::StrokeKind::Inside,
-            );
+            let stroke = Stroke::new(1.5, COLOR_RANGE_FRAME);
+            let pts = [
+                (rect.left_top(), rect.right_top()),
+                (rect.right_top(), rect.right_bottom()),
+                (rect.right_bottom(), rect.left_bottom()),
+                (rect.left_bottom(), rect.left_top()),
+            ];
+            for (a, b) in pts {
+                painter.add(egui::Shape::dashed_line(&[a, b], stroke, 6.0, 4.0));
+            }
             // リサイズできることを示す四隅のハンドル。
             for corner in [
                 rect.left_top(),
@@ -2146,25 +2210,52 @@ impl MeasureMode {
             }
         }
 
-        // Ctrl+ドラッグの複製プレビュー（オフセット位置のコピー）。
+        // Ctrl+クリック複製のプレビュー。offset を複製数で分割した位置へ
+        // コピーを描く（角度は 2 線分とも）。
         if let Some(RangeState::Duplicating {
             start,
             current,
+            count,
             orig,
         }) = &self.range_state
         {
             let off = *current - *start;
-            for (_, p1, p2) in orig {
-                painter.line_segment(
-                    [to_screen(info, *p1 + off), to_screen(info, *p2 + off)],
-                    Stroke::new(3.0, COLOR_IN_PROGRESS.gamma_multiply(0.7)),
+            let color = COLOR_IN_PROGRESS.gamma_multiply(0.7);
+            for k in 1..=*count {
+                let o = off * (k as f64 / *count as f64);
+                for (_, p1, p2, p3) in orig {
+                    painter.line_segment(
+                        [to_screen(info, *p1 + o), to_screen(info, *p2 + o)],
+                        Stroke::new(3.0, color),
+                    );
+                    if let Some(p3) = p3 {
+                        painter.line_segment(
+                            [to_screen(info, *p2 + o), to_screen(info, *p3 + o)],
+                            Stroke::new(3.0, color),
+                        );
+                    }
+                }
+            }
+            // 複製数の表示（直線複製と同じくカーソル付近）。
+            if let Some(c) = painter
+                .ctx()
+                .input(|i| i.pointer.hover_pos())
+                .and_then(|p| to_image(info, p))
+            {
+                painter.text(
+                    to_screen(info, c) + Vec2::new(10.0, -8.0),
+                    Align2::LEFT_BOTTOM,
+                    format!("×{count}"),
+                    FontId::proportional(14.0),
+                    COLOR_IN_PROGRESS,
                 );
             }
         }
     }
 
-    /// 中心位置（p1/p2 の中点）が枠内の二点間測長の ID。枠は作成中の
-    /// 生の矩形でも、確定済みの min/max でもよい。
+    /// 枠内の測長の ID。枠は作成中の生の矩形でも、確定済みの min/max でも
+    /// よい。二点間測長は p1/p2 の中点、角度は 2 点目（頂点）が枠内かで
+    /// 判定する。
     fn distance_ids_in(&self, a: Pt2, b: Pt2) -> Vec<u64> {
         let (min_x, max_x) = (a.x.min(b.x), a.x.max(b.x));
         let (min_y, max_y) = (a.y.min(b.y), a.y.max(b.y));
@@ -2176,13 +2267,17 @@ impl MeasureMode {
                     let c = (*p1 + *p2) * 0.5;
                     (c.x >= min_x && c.x <= max_x && c.y >= min_y && c.y <= max_y).then_some(*id)
                 }
+                MeasureTool::Angle { id, p2, .. } => {
+                    (p2.x >= min_x && p2.x <= max_x && p2.y >= min_y && p2.y <= max_y)
+                        .then_some(*id)
+                }
                 _ => None,
             })
             .collect()
     }
 
-    /// 選択中測長のドラッグ開始時の p1/p2 スナップショット。
-    fn range_orig(&self) -> Vec<(u64, Pt2, Pt2)> {
+    /// 選択中測長のドラッグ開始時の端点スナップショット（角度は 3 点目も持つ）。
+    fn range_orig(&self) -> Vec<(u64, Pt2, Pt2, Option<Pt2>)> {
         let Some(sel) = &self.range_selection else {
             return Vec::new();
         };
@@ -2191,7 +2286,10 @@ impl MeasureMode {
             .iter()
             .filter_map(|t| match t {
                 MeasureTool::Distance { id, p1, p2, .. } if sel.ids.contains(id) => {
-                    Some((*id, *p1, *p2))
+                    Some((*id, *p1, *p2, None))
+                }
+                MeasureTool::Angle { id, p1, p2, p3, .. } if sel.ids.contains(id) => {
+                    Some((*id, *p1, *p2, Some(*p3)))
                 }
                 _ => None,
             })
@@ -2443,14 +2541,29 @@ impl MeasureMode {
             doc.view.pan_by(resp.drag_delta());
         }
 
-        // 直線複製中はホイールを複製数の調整だけに使い、ズームは止める。
-        // smooth_scroll_delta は 1 ノッチが複数フレームに分散するため、
-        // 累積して 20.0 たまるごとに 1 ずつ増減させる（速すぎないように）。
+        // 直線複製・範囲複製中はホイールを複製数の調整だけに使い、ズームは
+        // 止める。smooth_scroll_delta は 1 ノッチが複数フレームに分散する
+        // ため、累積して 20.0 たまるごとに 1 ずつ増減させる（速すぎないように）。
         const SCROLL_STEP: f32 = 20.0;
         let linear_duplicate_active =
             matches!(self.in_progress, Some(InProgress::LinearDuplicate { .. }));
+        let range_duplicate_active =
+            matches!(self.range_state, Some(RangeState::Duplicating { .. }));
         if linear_duplicate_active {
             if let Some(InProgress::LinearDuplicate { count, .. }) = &mut self.in_progress {
+                let scroll = resp.ctx.input(|i| i.smooth_scroll_delta.y);
+                self.scroll_accum += scroll;
+                while self.scroll_accum >= SCROLL_STEP {
+                    *count = (*count + 1).min(20);
+                    self.scroll_accum -= SCROLL_STEP;
+                }
+                while self.scroll_accum <= -SCROLL_STEP {
+                    *count = (*count).saturating_sub(1).max(1);
+                    self.scroll_accum += SCROLL_STEP;
+                }
+            }
+        } else if range_duplicate_active {
+            if let Some(RangeState::Duplicating { count, .. }) = &mut self.range_state {
                 let scroll = resp.ctx.input(|i| i.smooth_scroll_delta.y);
                 self.scroll_accum += scroll;
                 while self.scroll_accum >= SCROLL_STEP {
@@ -2663,8 +2776,9 @@ impl MeasureMode {
 
     /// 範囲選択ツールの画像上入力。ドラッグ開始位置（押した位置）で
     /// 「枠の作成・一括移動・拡大縮小」を決め、ドラッグ中は状態を更新する。
-    /// 移動・変形中の測長は生の位置で描き、フィッティングの再計算は
-    /// ドラッグ終了後の通常描画に任せる。
+    /// Ctrl+クリックで選択測長の複製を開始し、2 回目のクリックで位置を
+    /// 決定する。移動・変形中の測長は生の位置で描き、フィッティングの
+    /// 再計算はドラッグ終了後の通常描画に任せる。
     fn handle_range_input(
         &mut self,
         doc: &mut Document,
@@ -2676,8 +2790,11 @@ impl MeasureMode {
     ) {
         let edge = RANGE_EDGE_PX as f64 / zoom as f64;
 
+        // 複製中はドラッグ開始で状態を切り替えない（プレビュー位置の
+        // 追従だけにして、位置決定はクリックで行う）。
         if resp.drag_started()
             && let Some(press) = press
+            && !matches!(self.range_state, Some(RangeState::Duplicating { .. }))
         {
             match &self.range_selection {
                 Some(sel) => match Self::range_hit(sel, press, edge) {
@@ -2704,29 +2821,18 @@ impl MeasureMode {
                         self.begin_change();
                     }
                     RangeHit::Move => {
-                        // Ctrl+ドラッグ: 選択測長の複製（プレビュー →
-                        // ドラッグ終了で確定）。
-                        let ctrl = resp.ctx.input(|i| i.modifiers.command);
-                        if ctrl {
-                            self.range_state = Some(RangeState::Duplicating {
-                                start: press,
-                                current: press,
-                                orig: self.range_orig(),
-                            });
-                        } else {
-                            // ドラッグ中は生の位置で描く（フィッティング再計算を止める）。
-                            if let Some(img) = img {
-                                let scale = doc.input_to(self.index).and_then(|f| f.scale);
-                                self.drag_fitted = Some(self.computed(img, scale));
-                            }
-                            self.range_state = Some(RangeState::Moving {
-                                start: press,
-                                orig_min: sel.min,
-                                orig_max: sel.max,
-                                orig: self.range_orig(),
-                            });
-                            self.begin_change();
+                        // ドラッグ中は生の位置で描く（フィッティング再計算を止める）。
+                        if let Some(img) = img {
+                            let scale = doc.input_to(self.index).and_then(|f| f.scale);
+                            self.drag_fitted = Some(self.computed(img, scale));
                         }
+                        self.range_state = Some(RangeState::Moving {
+                            start: press,
+                            orig_min: sel.min,
+                            orig_max: sel.max,
+                            orig: self.range_orig(),
+                        });
+                        self.begin_change();
                     }
                     RangeHit::None => {
                         // 枠の外: 新しい枠の作成を始める。
@@ -2762,12 +2868,15 @@ impl MeasureMode {
                     orig,
                 }) => {
                     let d = cursor - start;
-                    for (id, p1, p2) in &orig {
+                    for (id, p1, p2, p3) in &orig {
                         set_endpoint(&mut self.data, *id, EndpointWhich::P1, *p1 + d);
                         set_endpoint(&mut self.data, *id, EndpointWhich::P2, *p2 + d);
+                        if let Some(p3) = p3 {
+                            set_endpoint(&mut self.data, *id, EndpointWhich::P3, *p3 + d);
+                        }
                     }
                     self.range_selection = Some(RangeSelection {
-                        ids: orig.iter().map(|(id, _, _)| *id).collect(),
+                        ids: orig.iter().map(|(id, _, _, _)| *id).collect(),
                         min: orig_min + d,
                         max: orig_max + d,
                     });
@@ -2782,7 +2891,7 @@ impl MeasureMode {
                     max_y,
                     orig,
                 }) => {
-                    // 追従する辺だけを動かし、測長の p1/p2 も枠と同じ線形写像で
+                    // 追従する辺だけを動かし、測長の端点も枠と同じ線形写像で
                     // 動かす（反対側の辺が基準になる）。枠は 1 px 未満に
                     // つぶれないよう制限する。
                     let (mut nmin, mut nmax) = (orig_min, orig_max);
@@ -2798,7 +2907,7 @@ impl MeasureMode {
                     if max_y {
                         nmax.y = cursor.y.max(orig_min.y + 1.0);
                     }
-                    for (id, p1, p2) in &orig {
+                    for (id, p1, p2, p3) in &orig {
                         set_endpoint(
                             &mut self.data,
                             *id,
@@ -2811,31 +2920,56 @@ impl MeasureMode {
                             EndpointWhich::P2,
                             resize_map(orig_min, orig_max, nmin, nmax, *p2),
                         );
+                        if let Some(p3) = p3 {
+                            set_endpoint(
+                                &mut self.data,
+                                *id,
+                                EndpointWhich::P3,
+                                resize_map(orig_min, orig_max, nmin, nmax, *p3),
+                            );
+                        }
                     }
                     self.range_selection = Some(RangeSelection {
-                        ids: orig.iter().map(|(id, _, _)| *id).collect(),
+                        ids: orig.iter().map(|(id, _, _, _)| *id).collect(),
                         min: nmin,
                         max: nmax,
                     });
                     self.apply_change(doc);
                 }
-                Some(RangeState::Duplicating { start, orig, .. }) => {
-                    // データは動かさず、プレビュー位置だけ更新する。
+                Some(RangeState::Duplicating { start, count, orig, .. }) => {
+                    // データは動かさず、プレビュー位置だけ更新する
+                    // （直線複製と同じく 4 方向固定を適用）。
+                    let shift = resp.ctx.input(|i| i.modifiers.shift);
+                    let current = self.resolve_angle(start, cursor, false, shift);
                     self.range_state = Some(RangeState::Duplicating {
                         start,
-                        current: cursor,
+                        current,
+                        count,
                         orig,
                     });
                 }
                 None => {}
             }
+        } else if let (Some(cursor), Some(RangeState::Duplicating { start, count, orig, .. })) =
+            (cursor, &self.range_state)
+        {
+            // 複製中はドラッグなしでもカーソルに追従する（位置はクリックで決める）。
+            let shift = resp.ctx.input(|i| i.modifiers.shift);
+            let current = self.resolve_angle(*start, cursor, false, shift);
+            self.range_state = Some(RangeState::Duplicating {
+                start: *start,
+                current,
+                count: *count,
+                orig: orig.clone(),
+            });
         }
 
         if resp.drag_stopped() {
             match self.range_state.take() {
                 Some(RangeState::Drawing { start, current }) => {
-                    // 中心位置が枠内の測長を選ぶ。空なら選択なし
-                    // （極小のドラッグも実質クリックで、空になる）。
+                    // 枠内の測長を選ぶ（二点間測長は中心、角度は 2 点目が
+                    // 基準）。空なら選択なし（極小のドラッグも実質クリックで、
+                    // 空になる）。
                     let ids = self.distance_ids_in(start, current);
                     self.range_selection = if ids.is_empty() {
                         None
@@ -2851,60 +2985,133 @@ impl MeasureMode {
                 Some(RangeState::Moving { .. }) | Some(RangeState::Resizing { .. }) => {
                     self.drag_fitted = None;
                 }
+                // 複製の位置決定はクリックで行うので、状態を維持する。
                 Some(RangeState::Duplicating {
                     start,
                     current,
+                    count,
                     orig,
                 }) => {
-                    // ドラッグ終了でまとめて複製する。
-                    let offset = current - start;
-                    if offset.length() >= 0.5 {
-                        let sources: Vec<MeasureTool> = orig
-                            .iter()
-                            .filter_map(|(id, _, _)| self.data.tool_by_id(*id).cloned())
-                            .filter(|t| matches!(t, MeasureTool::Distance { .. }))
-                            .collect();
-                        if !sources.is_empty() {
-                            self.mutate(doc, |data| {
-                                for src in sources {
-                                    let MeasureTool::Distance {
-                                        p1,
-                                        p2,
-                                        group,
-                                        fit1,
-                                        fit2,
-                                        ..
-                                    } = src
-                                    else {
-                                        continue;
-                                    };
-                                    let id = data.next_id();
-                                    // 複製設定に従い、複製元と同じグループか
-                                    // 複製ごとの新しいグループへ入れる。
-                                    let group = data.group_for_duplicate(group);
-                                    data.tools.push(MeasureTool::Distance {
-                                        id,
-                                        p1: p1 + offset,
-                                        p2: p2 + offset,
-                                        group,
-                                        fit1,
-                                        fit2,
-                                    });
-                                }
-                            });
-                        }
-                    }
-                    self.drag_fitted = None;
+                    self.range_state = Some(RangeState::Duplicating {
+                        start,
+                        current,
+                        count,
+                        orig,
+                    });
                 }
                 None => {}
             }
         }
 
-        // クリック（ドラッグなし）: 選択解除。
-        if resp.clicked() {
-            self.range_selection = None;
-            self.range_state = None;
+        // クリック（ドラッグなし）。複製中なら 2 回目のクリックとして位置を
+        // 決定する。Ctrl+クリック（枠の内側）は複製を開始し、それ以外は
+        // 選択解除。
+        if resp.clicked()
+            && let Some(press) = press
+        {
+            let ctrl = resp.ctx.input(|i| i.modifiers.command);
+            if let Some(RangeState::Duplicating {
+                start,
+                current,
+                count,
+                orig,
+            }) = self.range_state.take()
+            {
+                let offset = press - start;
+                // 開始位置とほぼ同じ位置のクリックは無視して複製状態を
+                // 維持する（画面 3 px 未満の移動では複製しない）。
+                if (offset * zoom as f64).length() >= RANGE_DUP_MIN_PX {
+                    // 直線複製と同じく 4 方向固定を適用した位置へ複製する
+                    // （Shift で一時反転）。
+                    let shift = resp.ctx.input(|i| i.modifiers.shift);
+                    let current = self.resolve_angle(start, press, false, shift);
+                    self.commit_range_duplicate(doc, current - start, count, &orig);
+                } else {
+                    self.range_state = Some(RangeState::Duplicating {
+                        start,
+                        current,
+                        count,
+                        orig,
+                    });
+                }
+            } else if ctrl
+                && let Some(sel) = &self.range_selection
+                && matches!(Self::range_hit(sel, press, edge), RangeHit::Move)
+            {
+                // Ctrl+クリック: 選択測長の複製を開始する（位置は
+                // 2 回目のクリックで決める）。
+                self.scroll_accum = 0.0;
+                self.range_state = Some(RangeState::Duplicating {
+                    start: press,
+                    current: press,
+                    count: 1,
+                    orig: self.range_orig(),
+                });
+            } else {
+                self.range_selection = None;
+                self.range_state = None;
+            }
         }
+    }
+
+    /// 範囲選択の複製を確定する。`offset` を `count` で分割した位置へ、
+    /// 選択中の測長（二点間測長・角度）のコピーをまとめて配置する。
+    fn commit_range_duplicate(
+        &mut self,
+        doc: &mut Document,
+        offset: Pt2,
+        count: usize,
+        orig: &[(u64, Pt2, Pt2, Option<Pt2>)],
+    ) {
+        let sources: Vec<MeasureTool> = orig
+            .iter()
+            .filter_map(|(id, _, _, _)| self.data.tool_by_id(*id).cloned())
+            .filter(|t| matches!(t, MeasureTool::Distance { .. } | MeasureTool::Angle { .. }))
+            .collect();
+        if !sources.is_empty() {
+            self.mutate(doc, |data| {
+                for src in sources {
+                    for k in 1..=count {
+                        let off = offset * (k as f64 / count as f64);
+                        let id = data.next_id();
+                        match src {
+                            MeasureTool::Distance {
+                                p1,
+                                p2,
+                                group,
+                                fit1,
+                                fit2,
+                                ..
+                            } => {
+                                // 複製設定に従い、複製元と同じグループか
+                                // 複製ごとの新しいグループへ入れる。
+                                let group = data.group_for_duplicate(group);
+                                data.tools.push(MeasureTool::Distance {
+                                    id,
+                                    p1: p1 + off,
+                                    p2: p2 + off,
+                                    group,
+                                    fit1,
+                                    fit2,
+                                });
+                            }
+                            MeasureTool::Angle { p1, p2, p3, group, .. } => {
+                                let group = data.group_for_duplicate(group);
+                                data.tools.push(MeasureTool::Angle {
+                                    id,
+                                    p1: p1 + off,
+                                    p2: p2 + off,
+                                    p3: p3 + off,
+                                    group,
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            });
+        }
+        self.drag_fitted = None;
     }
 
     /// 削除ツールの画像上入力。クリック削除は on_click 側で行い、
@@ -3199,9 +3406,12 @@ impl MeasureMode {
             },
             Some(ToolButton::LinearDuplicate) => match self.in_progress.take() {
                 None => {
-                    // 複製元の測長・境界線を選ぶ。
+                    // 複製元の測長・角度・境界線を選ぶ。
                     if let Some(t) = nearest_tool(&computed, pos, pick_threshold, |t| {
-                        matches!(t.kind, ToolKind::Distance | ToolKind::Boundary)
+                        matches!(
+                            t.kind,
+                            ToolKind::Distance | ToolKind::Boundary | ToolKind::Angle
+                        )
                     }) {
                         self.selected = Some(t.id);
                         self.scroll_accum = 0.0;
@@ -3228,7 +3438,9 @@ impl MeasureMode {
                             self.selected = None;
                             return;
                         };
-                        let (base1, base2, group, fit1, fit2, is_boundary) = match source {
+                        // 角度は 3 点すべてを平行移動する。二点間測長・境界線は
+                        // p1/p2 のみ。
+                        let (base1, base2, base3, group, fit1, fit2, is_helper) = match source {
                             MeasureTool::Distance {
                                 p1,
                                 p2,
@@ -3236,10 +3448,19 @@ impl MeasureMode {
                                 fit1,
                                 fit2,
                                 ..
-                            } => (p1, p2, group, fit1, fit2, false),
+                            } => (p1, p2, None, group, fit1, fit2, false),
                             MeasureTool::Boundary {
                                 p1, p2, group, fit, ..
-                            } => (p1, p2, group, fit, fit, true),
+                            } => (p1, p2, None, group, fit, fit, true),
+                            MeasureTool::Angle { p1, p2, p3, group, .. } => (
+                                p1,
+                                p2,
+                                Some(p3),
+                                group,
+                                FitSettings::default(),
+                                FitSettings::default(),
+                                false,
+                            ),
                             _ => {
                                 self.selected = None;
                                 return;
@@ -3251,27 +3472,41 @@ impl MeasureMode {
                                 let id = data.next_id();
                                 let p1 = base1 + off;
                                 let p2 = base2 + off;
-                                if is_boundary {
-                                    // 補助線は結果リストに出ないのでグループは元のまま。
-                                    data.tools.push(MeasureTool::Boundary {
-                                        id,
-                                        p1,
-                                        p2,
-                                        group,
-                                        fit: fit1,
-                                    });
-                                } else {
-                                    // 複製設定に従い、複製元と同じグループか
-                                    // 複製ごとの新しいグループへ入れる。
-                                    let group = data.group_for_duplicate(group);
-                                    data.tools.push(MeasureTool::Distance {
-                                        id,
-                                        p1,
-                                        p2,
-                                        group,
-                                        fit1,
-                                        fit2,
-                                    });
+                                match base3 {
+                                    Some(p3) => {
+                                        // 角度は結果リストに出るので複製設定に従う。
+                                        let group = data.group_for_duplicate(group);
+                                        data.tools.push(MeasureTool::Angle {
+                                            id,
+                                            p1,
+                                            p2,
+                                            p3: p3 + off,
+                                            group,
+                                        });
+                                    }
+                                    None if is_helper => {
+                                        // 補助線は結果リストに出ないのでグループは元のまま。
+                                        data.tools.push(MeasureTool::Boundary {
+                                            id,
+                                            p1,
+                                            p2,
+                                            group,
+                                            fit: fit1,
+                                        });
+                                    }
+                                    None => {
+                                        // 複製設定に従い、複製元と同じグループか
+                                        // 複製ごとの新しいグループへ入れる。
+                                        let group = data.group_for_duplicate(group);
+                                        data.tools.push(MeasureTool::Distance {
+                                            id,
+                                            p1,
+                                            p2,
+                                            group,
+                                            fit1,
+                                            fit2,
+                                        });
+                                    }
                                 }
                             }
                         });
@@ -3720,6 +3955,89 @@ mod tests {
         let data_csv = group_data_csv(g, &data, &computed, None, 2);
         assert!(data_csv.contains("1, 45"), "{data_csv}");
         assert!(data_csv.contains("2, 90"), "{data_csv}");
+    }
+
+    /// 範囲選択に角度が含まれるかは 2 点目（頂点）の位置で決まること。
+    #[test]
+    fn range_select_includes_angle_by_vertex() {
+        let mut data = MeasureData::default();
+        let g = data.group_for_new_measurement(ToolKind::Angle);
+        data.tools.push(MeasureTool::Angle {
+            id: 1,
+            p1: pt(100.0, 0.0),
+            p2: pt(0.0, 0.0),
+            p3: pt(0.0, 100.0),
+            group: g,
+        });
+        let mut mode = MeasureMode::default();
+        mode.data = data;
+        // 頂点 (0,0) を含む枠 → 選択される。
+        assert_eq!(
+            mode.distance_ids_in(pt(-5.0, -5.0), pt(5.0, 5.0)),
+            vec![1]
+        );
+        // 頂点が枠外なら選択されない（p1 側が枠内でも）。
+        assert!(
+            mode.distance_ids_in(pt(50.0, 0.0), pt(110.0, 110.0))
+                .is_empty()
+        );
+    }
+
+    /// 範囲複製: 二点間測長と角度が複製数分だけ offset を分割して配置されること。
+    #[test]
+    fn range_duplicate_copies_distance_and_angle() {
+        let mut data = MeasureData::default();
+        let g = data.group_for_new_measurement(ToolKind::Distance);
+        data.tools.push(MeasureTool::Distance {
+            id: 1,
+            p1: pt(0.0, 0.0),
+            p2: pt(10.0, 0.0),
+            group: g,
+            fit1: crate::measure::FitSettings::default(),
+            fit2: crate::measure::FitSettings::default(),
+        });
+        let ga = data.group_for_new_measurement(ToolKind::Angle);
+        data.tools.push(MeasureTool::Angle {
+            id: 2,
+            p1: pt(0.0, 10.0),
+            p2: pt(5.0, 10.0),
+            p3: pt(5.0, 20.0),
+            group: ga,
+        });
+        let mut doc = Document::new("t");
+        doc.push_command(Command::Measure { data: data.clone() });
+        let mut mode = MeasureMode::default();
+        mode.index = 0;
+        mode.data = data;
+        let orig = vec![
+            (1, pt(0.0, 0.0), pt(10.0, 0.0), None),
+            (2, pt(0.0, 10.0), pt(5.0, 10.0), Some(pt(5.0, 20.0))),
+        ];
+        mode.commit_range_duplicate(&mut doc, pt(20.0, 20.0), 2, &orig);
+        // 元 2 + 複製 2 個 × 2 = 6 ツール（測長 k1/k2 → 角度 k1/k2 の順）。
+        assert_eq!(mode.data.tools.len(), 6);
+        let MeasureTool::Distance { p1, p2, .. } = mode.data.tools[3] else {
+            panic!("4 番目は測長の複製");
+        };
+        assert_eq!(
+            (p1, p2),
+            (pt(20.0, 20.0), pt(30.0, 20.0)),
+            "count=2 の 2 個目は offset 全体の位置"
+        );
+        let MeasureTool::Angle { p1, p2, p3, .. } = mode.data.tools[5] else {
+            panic!("6 番目は角度の複製");
+        };
+        assert_eq!(
+            (p1, p2, p3),
+            (pt(20.0, 30.0), pt(25.0, 30.0), pt(25.0, 40.0)),
+            "角度は 3 点とも offset 移動"
+        );
+        // doc 側のコマンドにも反映される。
+        let Command::Measure { data: d } = &doc.commands.get(0).expect("Measure のみ").command
+        else {
+            panic!("Measure のはず");
+        };
+        assert_eq!(d.tools.len(), 6);
     }
 
     /// 角度ツールが ▲▼移動・矩形削除の対象になること。
