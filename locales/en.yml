@@ -212,6 +212,7 @@ dlg:
 mm:
   tool:
     distance: "Two-point measurement"
+    angle: "Angle"
     boundary: "Boundary line"
     offset: "Offset line"
     duplicate: "Duplicate line"
@@ -228,6 +229,7 @@ mm:
   angle_label: "Angle:"
   angle_four: "4 directions"
   angle_free: "Free"
+  shift_angle_hint: "Hold Shift while drawing to temporarily invert 4-way ⇔ free"
   snap_label: "Snap:"
   new_measure_label: "New measurement:"
   duplicate_label: "Duplicate:"
@@ -245,6 +247,7 @@ mm:
   hint_duplicate: "Click a measurement or boundary line → move the mouse to set direction and distance → click to confirm. Wheel adjusts the copy count (1-20)"
   hint_range: "Drag to draw a rectangle and select all measurements whose center is inside. Drag inside the box to move together, drag an edge or corner to scale them together. Ctrl+drag duplicates the selected measurements"
   hint_delete: "Click a measurement or helper line to delete it. Drag a rectangle to delete everything inside at once"
+  hint_angle: "Click 3 points: 1st → vertex → 3rd. Measures the smaller angle (0–180°)"
   hint_none: "Drag measurements and boundary lines directly on the image to move them (Esc to deselect)"
   offset_label: "Offset:"
   results: "Results"

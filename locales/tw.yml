@@ -212,6 +212,7 @@ dlg:
 mm:
   tool:
     distance: "兩點測量"
+    angle: "角度"
     boundary: "邊界線"
     offset: "偏移線"
     duplicate: "直線複製"
@@ -228,6 +229,7 @@ mm:
   angle_label: "角度:"
   angle_four: "4方向"
   angle_free: "自由"
+  shift_angle_hint: "按住 Shift 繪製時，暫時反轉 4方向 ⇔ 自由"
   snap_label: "吸附:"
   new_measure_label: "新測量:"
   duplicate_label: "複製:"
@@ -245,6 +247,7 @@ mm:
   hint_duplicate: "按一下測量・邊界線 → 移動滑鼠指定方向和距離 → 按一下確認。滾輪調整複製數量 (1-20)"
   hint_range: "拖曳繪製矩形，選取中心位於框內的所有測量。在框內拖曳整體移動，拖曳框的邊・角連同測量一起縮放。Ctrl+拖曳複製選取的測量"
   hint_delete: "按一下測量・輔助線將其刪除。拖曳繪製矩形，批次刪除中心位於框內的物件"
+  hint_angle: "點擊三點（第一點→頂點→第三點），測量兩直線夾角（0–180°）"
   hint_none: "直接在影像上拖曳測量・邊界線進行移動（按 Esc 取消選取）"
   offset_label: "偏移:"
   results: "測量結果"

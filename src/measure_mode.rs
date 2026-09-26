@@ -22,8 +22,8 @@ use crate::frame::Scale;
 use crate::gray::Gray16;
 use crate::measure::{
     AngleMode, ComputedMeasure, ComputedTool, FitMode, FitSettings, FitSign, GroupMode,
-    MeasureData, MeasureTool, Pt2, SnapLine, ToolKind, format_measurement, snap_angle_four,
-    snap_distance,
+    MeasureData, MeasureTool, Pt2, SnapLine, ToolKind, angle_deg_between, format_angle,
+    format_measurement, snap_angle_four, snap_distance,
 };
 use crate::measure_fit::{self, FitRegion, GaussFit};
 use crate::settings::format_length;
@@ -99,6 +99,10 @@ enum InProgress {
     },
     /// 削除ツールの矩形ドラッグ中（この矩形内のツールを一括削除する）。
     DeleteRect { start: Pt2, current: Pt2 },
+    /// 角度測定: 1 点目を置いた状態。
+    Angle { p1: Pt2 },
+    /// 角度測定: 2 点目（共有頂点）まで置いた状態。
+    AngleSecond { p1: Pt2, p2: Pt2 },
 }
 
 /// ツールボタンの選択。None は非選択状態（Esc で解除、パンが使える）。
@@ -106,6 +110,7 @@ enum InProgress {
 pub enum ToolButton {
     #[default]
     Distance,
+    Angle,
     Boundary,
     Offset,
     LinearDuplicate,
@@ -119,6 +124,7 @@ impl ToolButton {
     pub fn label(self) -> Cow<'static, str> {
         match self {
             Self::Distance => t!("mm.tool.distance"),
+            Self::Angle => t!("mm.tool.angle"),
             Self::Boundary => t!("mm.tool.boundary"),
             Self::Offset => t!("mm.tool.offset"),
             Self::LinearDuplicate => t!("mm.tool.duplicate"),
@@ -196,6 +202,8 @@ enum RangeHit {
 enum EndpointWhich {
     P1,
     P2,
+    /// 角度測定の 3 点目（頂点 p2 の反対側）。
+    P3,
 }
 
 /// 非選択状態で選択したツールのドラッグ移動の状態。
@@ -209,6 +217,8 @@ enum Drag {
         start: Pt2,
         orig_p1: Pt2,
         orig_p2: Pt2,
+        /// 角度測定のみ。3 点目も同じ差分で動かす。
+        orig_p3: Option<Pt2>,
     },
 }
 
@@ -729,6 +739,7 @@ impl MeasureMode {
                 self.change_once(doc);
             }
         });
+        ui.weak(t!("mm.shift_angle_hint").as_ref());
         ui.horizontal(|ui| {
             ui.label(t!("mm.snap_label").as_ref());
             if ui
@@ -795,6 +806,7 @@ impl MeasureMode {
         ui.horizontal(|ui| {
             ui.add_space(12.0);
             self.tool_button(ui, ToolButton::Distance);
+            self.tool_button(ui, ToolButton::Angle);
         });
         ui.label(
             egui::RichText::new(t!("mm.section_helper").as_ref())
@@ -862,6 +874,9 @@ impl MeasureMode {
                 ui.weak(t!("mm.hint_boundary").as_ref());
                 let outcome = fit_settings_ui(ui, &mut self.data.boundary_fit);
                 self.handle_fit_outcome(doc, outcome);
+            }
+            Some(ToolButton::Angle) => {
+                ui.weak(t!("mm.hint_angle").as_ref());
             }
             Some(ToolButton::Offset) => {
                 ui.weak(t!("mm.hint_offset").as_ref());
@@ -1006,6 +1021,12 @@ impl MeasureMode {
                             if resp.double_clicked() {
                                 actions.push(ResultAction::BeginRename(gid));
                             }
+                            // グループの種類（距離 / 角度）を名前の隣に小さく示す。
+                            let kind_label = match g.kind() {
+                                ToolKind::Angle => t!("mm.tool.angle"),
+                                _ => t!("mm.tool.distance"),
+                            };
+                            ui.label(egui::RichText::new(kind_label.as_ref()).small().weak());
                             // 右クリックメニュー: クリップボードへのコピー。
                             resp.context_menu(|ui| {
                                 if ui.button(t!("mm.copy_stats").as_ref()).clicked() {
@@ -1077,10 +1098,17 @@ impl MeasureMode {
                             let num = computed.number(*tid).unwrap_or(0);
                             match computed.by_id(*tid) {
                                 Some(t) => {
-                                    let value = t
-                                        .length_px
-                                        .map(|l| format_measurement(l, scale, digits))
-                                        .unwrap_or_default();
+                                    // 角度はスケール換算せず表示桁数 + °。
+                                    let value = match t.kind {
+                                        ToolKind::Angle => t
+                                            .angle_deg
+                                            .map(|d| format_angle(d, digits))
+                                            .unwrap_or_default(),
+                                        _ => t
+                                            .length_px
+                                            .map(|l| format_measurement(l, scale, digits))
+                                            .unwrap_or_default(),
+                                    };
                                     ui.label(format!("#{num}  {value}"));
                                 }
                                 None => {
@@ -1226,7 +1254,7 @@ fn move_tool_in_group(data: &mut MeasureData, gid: u64, id: u64, delta: isize) {
     let step = delta.signum();
     let mut j = i as isize + step;
     while j >= 0 && (j as usize) < data.tools.len() {
-        if matches!(&data.tools[j as usize], MeasureTool::Distance { group, .. } if *group == gid) {
+        if data.tools[j as usize].is_measurement() && data.tools[j as usize].group() == Some(gid) {
             data.tools.swap(i, j as usize);
             return;
         }
@@ -1257,7 +1285,7 @@ fn sort_group(data: &mut MeasureData, computed: &ComputedMeasure, gid: u64, key:
         .collect();
     let mut it = members.into_iter();
     for t in &mut data.tools {
-        if matches!(t, MeasureTool::Distance { group, .. } if *group == gid) {
+        if t.is_measurement() && t.group() == Some(gid) {
             if let Some(m) = it.next() {
                 *t = m;
             }
@@ -1432,31 +1460,26 @@ fn stats_csv(
     let mut out = t!("mm.csv_stats_header").into_owned();
     out.push('\n');
     for g in &data.groups {
-        let values: Vec<f64> = computed
-            .tools
-            .iter()
-            .filter(|t| t.group == Some(g.id) && t.kind == ToolKind::Distance)
-            .filter_map(|t| t.length_px)
-            .collect();
+        let values = group_values(computed, g.id);
         if values.is_empty() {
             // 測長結果の無いグループは行を出さない。
             continue;
         }
+        let kind = group_kind_of(computed, g.id);
+        // 角度はスケール換算せず表示桁数で丸める（単位なし）。ヘッダーは共通。
+        let number = |v: f64| match kind {
+            ToolKind::Angle => format_length(v, digits),
+            _ => value_number(v, scale, digits),
+        };
         let n = values.len();
         let mean = values.iter().sum::<f64>() / n as f64;
         let sd = if n < 2 {
             String::new()
         } else {
             let var = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n - 1) as f64;
-            value_number(var.sqrt(), scale, digits)
+            number(var.sqrt())
         };
-        out += &format!(
-            "{}, {}, {}, {}\n",
-            csv_field(&g.name),
-            n,
-            value_number(mean, scale, digits),
-            sd,
-        );
+        out += &format!("{}, {}, {}, {}\n", csv_field(&g.name), n, number(mean), sd,);
     }
     out
 }
@@ -1473,14 +1496,51 @@ fn group_data_csv(
     let mut out = t!("mm.csv_data_header").into_owned();
     out.push('\n');
     for tid in data.group_tools(gid) {
-        if let Some(t) = computed.by_id(tid)
-            && let Some(len) = t.length_px
-        {
-            let n = computed.number(tid).unwrap_or(0);
-            out += &format!("{n}, {}\n", value_number(len, scale, digits));
+        if let Some(t) = computed.by_id(tid) {
+            let value = match t.kind {
+                // 角度はスケール換算せず表示桁数で丸める（単位なし）。
+                ToolKind::Angle => t.angle_deg.map(|d| format_length(d, digits)),
+                _ => t.length_px.map(|len| value_number(len, scale, digits)),
+            };
+            if let Some(v) = value {
+                let n = computed.number(tid).unwrap_or(0);
+                out += &format!("{n}, {v}\n");
+            }
         }
     }
     out
+}
+
+/// グループの測定値（Distance は長さ px、Angle は °）。統計と CSV で共用。
+fn group_values(computed: &ComputedMeasure, gid: u64) -> Vec<f64> {
+    computed
+        .tools
+        .iter()
+        .filter(|t| t.group == Some(gid))
+        .filter_map(|t| match t.kind {
+            ToolKind::Distance => t.length_px,
+            ToolKind::Angle => t.angle_deg,
+            _ => None,
+        })
+        .collect()
+}
+
+/// グループの測定種類（所属ツールの kind から）。空グループは Distance 扱い。
+fn group_kind_of(computed: &ComputedMeasure, gid: u64) -> ToolKind {
+    computed
+        .tools
+        .iter()
+        .find(|t| t.group == Some(gid))
+        .map(|t| t.kind)
+        .unwrap_or(ToolKind::Distance)
+}
+
+/// グループ統計の表示値。角度は表示桁数 + °、他はスケール換算表示。
+fn format_group_value(kind: ToolKind, v: f64, scale: Option<Scale>, digits: u8) -> String {
+    match kind {
+        ToolKind::Angle => format_angle(v, digits),
+        _ => format_measurement(v, scale, digits),
+    }
 }
 
 /// グループの平均と標準偏差（標本 n−1）をまとめた表示文字列。
@@ -1490,23 +1550,19 @@ fn group_stat(
     scale: Option<crate::frame::Scale>,
     digits: u8,
 ) -> Option<String> {
-    let values: Vec<f64> = computed
-        .tools
-        .iter()
-        .filter(|t| t.group == Some(gid) && t.kind == ToolKind::Distance)
-        .filter_map(|t| t.length_px)
-        .collect();
+    let values = group_values(computed, gid);
     if values.is_empty() {
         return None;
     }
+    let kind = group_kind_of(computed, gid);
     let n = values.len();
     let mean = values.iter().sum::<f64>() / n as f64;
-    let avg = format_measurement(mean, scale, digits);
+    let avg = format_group_value(kind, mean, scale, digits);
     if n < 2 {
         return Some(format!("{avg} (n=1)"));
     }
     let var = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n - 1) as f64;
-    let sigma = format_measurement(var.sqrt(), scale, digits);
+    let sigma = format_group_value(kind, var.sqrt(), scale, digits);
     Some(t!("mm.stat_format", avg = avg, sigma = sigma, n = n).into_owned())
 }
 
@@ -1567,6 +1623,26 @@ pub fn draw_computed(
                         None => format_measurement(len, scale, digits),
                     };
                     draw_value_label(painter, a, b, text, COLOR_DISTANCE);
+                }
+            }
+            ToolKind::Angle => {
+                // 頂点 p2 を共有する 2 線分。なす角を二等分線方向に表示する。
+                let (a, v, b) = match t.p3 {
+                    Some(p3) => (
+                        to_screen(info, t.p1),
+                        to_screen(info, t.p2),
+                        to_screen(info, p3),
+                    ),
+                    None => return,
+                };
+                painter.line_segment([a, v], Stroke::new(2.0, COLOR_DISTANCE));
+                painter.line_segment([v, b], Stroke::new(2.0, COLOR_DISTANCE));
+                if let Some(deg) = t.angle_deg {
+                    let text = match computed.number(t.id) {
+                        Some(n) => format!("#{n} {}", format_angle(deg, digits)),
+                        None => format_angle(deg, digits),
+                    };
+                    draw_angle_label(painter, a, v, b, text, COLOR_DISTANCE);
                 }
             }
             ToolKind::Boundary => {
@@ -1649,6 +1725,27 @@ fn draw_value_label(painter: &Painter, a: Pos2, b: Pos2, text: String, color: Co
     );
 }
 
+/// 角度のラベル。頂点から二等分線方向へ少し浮かせて描く。
+fn draw_angle_label(painter: &Painter, a: Pos2, v: Pos2, b: Pos2, text: String, color: Color32) {
+    let (u1, u2) = (a - v, b - v);
+    let bisect = {
+        let d = u1 / u1.length() + u2 / u2.length();
+        // 180° で二等分方向が打ち消し合うときは上方向にする。
+        if d.length() > 1e-6 {
+            d / d.length()
+        } else {
+            -Vec2::Y
+        }
+    };
+    painter.text(
+        v + bisect * 32.0,
+        Align2::CENTER_BOTTOM,
+        text,
+        FontId::proportional(12.0),
+        color,
+    );
+}
+
 /// 凸四角形（領域枠）の中に点があるか。
 fn point_in_quad(p: Pt2, q: [Pt2; 4]) -> bool {
     let mut pos = 0;
@@ -1667,6 +1764,7 @@ fn point_in_quad(p: Pt2, q: [Pt2; 4]) -> bool {
 }
 
 /// 動かす端点の反対側の端点（4 方向固定の基準点）。
+/// 角度には基準点が無い（4 方向固定を使わない）ので常に None。
 fn other_endpoint(data: &MeasureData, id: u64, which: EndpointWhich) -> Option<Pt2> {
     for t in &data.tools {
         match (t, which) {
@@ -1703,6 +1801,15 @@ fn set_endpoint(data: &mut MeasureData, id: u64, which: EndpointWhich, p: Pt2) {
             }
             (MeasureTool::Boundary { id: i, p2, .. }, EndpointWhich::P2) if *i == id => {
                 *p2 = p;
+            }
+            (MeasureTool::Angle { id: i, p1, .. }, EndpointWhich::P1) if *i == id => {
+                *p1 = p;
+            }
+            (MeasureTool::Angle { id: i, p2, .. }, EndpointWhich::P2) if *i == id => {
+                *p2 = p;
+            }
+            (MeasureTool::Angle { id: i, p3, .. }, EndpointWhich::P3) if *i == id => {
+                *p3 = p;
             }
             _ => {}
         }
@@ -1790,6 +1897,13 @@ impl MeasureMode {
                 [to_screen(info, t.p1), to_screen(info, t.p2)],
                 Stroke::new(3.0, COLOR_IN_PROGRESS),
             );
+            // 角度は頂点から 3 点目への線分もハイライトする。
+            if let Some(p3) = t.p3 {
+                painter.line_segment(
+                    [to_screen(info, t.p2), to_screen(info, p3)],
+                    Stroke::new(3.0, COLOR_IN_PROGRESS),
+                );
+            }
         }
 
         // 範囲選択: 選択中の測長のハイライトと選択枠。
@@ -1805,13 +1919,15 @@ impl MeasureMode {
             .ctx()
             .input(|i| i.pointer.hover_pos())
             .and_then(|p| to_image(info, p));
+        // Shift で 4 方向設定を一時的に反転（作成中のプレビューにも反映）。
+        let shift = painter.ctx().input(|i| i.modifiers.shift);
         match *prog {
             InProgress::Distance { p1, p1_line } => {
                 let Some(cursor) = cursor else { return };
                 let lines = self.snap_lines(&img, scale);
                 let (p1, p2, snapped) =
                     self.resolve_distance(p1, p1_line, cursor, &lines, info.zoom);
-                let p2 = self.resolve_angle(p1, p2, snapped);
+                let p2 = self.resolve_angle(p1, p2, snapped, shift);
                 let a = to_screen(info, p1);
                 let b = to_screen(info, p2);
                 draw_line_and_arrows(painter, a, b, COLOR_IN_PROGRESS);
@@ -1823,11 +1939,43 @@ impl MeasureMode {
             }
             InProgress::Boundary { p1 } => {
                 let Some(cursor) = cursor else { return };
-                let p2 = self.resolve_angle(p1, cursor, false);
+                let p2 = self.resolve_angle(p1, cursor, false, shift);
                 painter.line_segment(
                     [to_screen(info, p1), to_screen(info, p2)],
                     Stroke::new(2.0, COLOR_IN_PROGRESS),
                 );
+            }
+            InProgress::Angle { p1 } => {
+                let Some(cursor) = cursor else { return };
+                let p2 = self.resolve_angle(p1, cursor, false, shift);
+                painter.circle_filled(to_screen(info, p1), 3.0, COLOR_IN_PROGRESS);
+                painter.line_segment(
+                    [to_screen(info, p1), to_screen(info, p2)],
+                    Stroke::new(2.0, COLOR_IN_PROGRESS),
+                );
+            }
+            InProgress::AngleSecond { p1, p2 } => {
+                let Some(cursor) = cursor else { return };
+                let p3 = self.resolve_angle(p2, cursor, false, shift);
+                painter.circle_filled(to_screen(info, p2), 3.0, COLOR_IN_PROGRESS);
+                painter.line_segment(
+                    [to_screen(info, p1), to_screen(info, p2)],
+                    Stroke::new(2.0, COLOR_IN_PROGRESS),
+                );
+                painter.line_segment(
+                    [to_screen(info, p2), to_screen(info, p3)],
+                    Stroke::new(2.0, COLOR_IN_PROGRESS),
+                );
+                // 頂点横に現在のなす角をライブ表示する。
+                if let Some(deg) = angle_deg_between(p1, p2, p3) {
+                    painter.text(
+                        to_screen(info, p2) + Vec2::new(10.0, -8.0),
+                        Align2::LEFT_BOTTOM,
+                        format_angle(deg, digits),
+                        FontId::proportional(14.0),
+                        COLOR_IN_PROGRESS,
+                    );
+                }
             }
             InProgress::OffsetPick { source, distance } => {
                 if let Some(t) = computed.by_id(source) {
@@ -2086,6 +2234,7 @@ impl MeasureMode {
                     let p = match which {
                         EndpointWhich::P1 => t.p1,
                         EndpointWhich::P2 => t.p2,
+                        EndpointWhich::P3 => t.p3.unwrap_or(t.p2),
                     };
                     painter.circle_stroke(
                         to_screen(info, p),
@@ -2152,7 +2301,12 @@ impl MeasureMode {
             Some(ToolButton::Offset | ToolButton::LinearDuplicate | ToolButton::Delete) => {
                 self.in_progress.is_none()
             }
-            Some(ToolButton::Distance | ToolButton::Boundary | ToolButton::RangeSelect) => false,
+            Some(
+                ToolButton::Distance
+                | ToolButton::Boundary
+                | ToolButton::Angle
+                | ToolButton::RangeSelect,
+            ) => false,
         };
         if !picking {
             return;
@@ -2161,15 +2315,22 @@ impl MeasureMode {
             Some(ToolButton::Offset) => t.kind == ToolKind::Boundary,
             Some(ToolButton::Delete) => matches!(
                 t.kind,
-                ToolKind::Distance | ToolKind::Boundary | ToolKind::Offset
+                ToolKind::Distance | ToolKind::Boundary | ToolKind::Offset | ToolKind::Angle
             ),
-            _ => matches!(t.kind, ToolKind::Distance | ToolKind::Boundary),
+            _ => matches!(
+                t.kind,
+                ToolKind::Distance | ToolKind::Boundary | ToolKind::Angle
+            ),
         };
         let threshold = PICK_PX as f64 / zoom as f64;
         // 端点優先（クリック時の判定と同じ順序）。
         let mut best: Option<Pt2> = None;
         for t in computed.tools.iter().filter(|t| pred(t)) {
-            for p in [t.p1, t.p2] {
+            let mut pts = vec![t.p1, t.p2];
+            if let Some(p3) = t.p3 {
+                pts.push(p3);
+            }
+            for p in pts {
                 let d = (pos - p).length();
                 if d <= threshold && best.is_none_or(|bp| d < (pos - bp).length()) {
                     best = Some(p);
@@ -2366,7 +2527,8 @@ impl MeasureMode {
         if resp.clicked()
             && let (Some(img), Some(pos)) = (&img, click_pos)
         {
-            self.on_click(doc, img, pos, info.zoom);
+            let shift = ui.input(|i| i.modifiers.shift);
+            self.on_click(doc, img, pos, info.zoom, shift);
         }
 
         hover
@@ -2419,11 +2581,15 @@ impl MeasureMode {
                 start,
                 orig_p1,
                 orig_p2,
+                orig_p3,
             } => {
                 // 全体移動は 4 方向固定の対象外（平行移動のまま）。
                 let d = cursor - start;
                 set_endpoint(&mut self.data, id, EndpointWhich::P1, orig_p1 + d);
                 set_endpoint(&mut self.data, id, EndpointWhich::P2, orig_p2 + d);
+                if let Some(p3) = orig_p3 {
+                    set_endpoint(&mut self.data, id, EndpointWhich::P3, p3 + d);
+                }
                 self.apply_change(doc);
             }
         }
@@ -2724,11 +2890,12 @@ impl MeasureMode {
             .filter(|t| {
                 matches!(
                     t.kind,
-                    ToolKind::Distance | ToolKind::Boundary | ToolKind::Offset
+                    ToolKind::Distance | ToolKind::Boundary | ToolKind::Offset | ToolKind::Angle
                 )
             })
             .filter(|t| {
-                let c = (t.p1 + t.p2) * 0.5;
+                // 角度の代表座標は頂点（anchor_point）。
+                let c = t.anchor_point().unwrap_or((t.p1 + t.p2) * 0.5);
                 c.x >= min_x && c.x <= max_x && c.y >= min_y && c.y <= max_y
             })
             .map(|t| t.id)
@@ -2813,7 +2980,14 @@ impl MeasureMode {
         None
     }
 
-    fn on_click(&mut self, doc: &mut Document, img: &Arc<Gray16>, pos: Pt2, zoom: f32) {
+    fn on_click(
+        &mut self,
+        doc: &mut Document,
+        img: &Arc<Gray16>,
+        pos: Pt2,
+        zoom: f32,
+        shift: bool,
+    ) {
         let scale = doc.input_to(self.index).and_then(|f| f.scale);
         let computed = self.computed(img, scale);
         let snap_lines = if self.data.prefs.snap {
@@ -2845,7 +3019,7 @@ impl MeasureMode {
                     // 端点 2 を置いて確定。
                     let (p1, p2, snapped) =
                         self.resolve_distance(p1, p1_line, pos, &snap_lines, zoom);
-                    let p2 = self.resolve_angle(p1, p2, snapped);
+                    let p2 = self.resolve_angle(p1, p2, snapped, shift);
                     let (mut fit1, mut fit2) = (self.data.dist_fit1, self.data.dist_fit2);
                     // 片側だけスナップした端点はフィッティングせずクリック位置
                     // そのまま（補助線近傍の輝度でフィットが端点をずらすのを防ぐ）。
@@ -2860,7 +3034,7 @@ impl MeasureMode {
                     }
                     self.mutate(doc, |data| {
                         let id = data.next_id();
-                        let group = data.group_for_new_measurement();
+                        let group = data.group_for_new_measurement(ToolKind::Distance);
                         data.tools.push(MeasureTool::Distance {
                             id,
                             p1,
@@ -2874,10 +3048,45 @@ impl MeasureMode {
                 }
                 _ => self.in_progress = None,
             },
+            Some(ToolButton::Angle) => match self.in_progress.take() {
+                None => self.in_progress = Some(InProgress::Angle { p1: pos }),
+                Some(InProgress::Angle { p1 }) => {
+                    // 2 点目（共有頂点）。設定の 4 方向（Shift で一時反転）を適用。
+                    let p2 = self.resolve_angle(p1, pos, false, shift);
+                    // 退化クリック（1 点目と同位置）は無視して状態を維持する。
+                    if (p2 - p1).length() >= 1e-6 {
+                        self.in_progress = Some(InProgress::AngleSecond { p1, p2 });
+                    } else {
+                        self.in_progress = Some(InProgress::Angle { p1 });
+                    }
+                }
+                Some(InProgress::AngleSecond { p1, p2 }) => {
+                    // 3 点目。設定の 4 方向（Shift で一時反転）を適用。
+                    let p3 = self.resolve_angle(p2, pos, false, shift);
+                    // 頂点と同位置のクリックは無視して状態を維持する。
+                    if (p3 - p2).length() < 1e-6 {
+                        self.in_progress = Some(InProgress::AngleSecond { p1, p2 });
+                        return;
+                    }
+                    self.mutate(doc, |data| {
+                        let id = data.next_id();
+                        let group = data.group_for_new_measurement(ToolKind::Angle);
+                        data.tools.push(MeasureTool::Angle {
+                            id,
+                            p1,
+                            p2,
+                            p3,
+                            group,
+                        });
+                        data.apply_new_measure_mode();
+                    });
+                }
+                _ => self.in_progress = None,
+            },
             Some(ToolButton::Boundary) => match self.in_progress.take() {
                 None => self.in_progress = Some(InProgress::Boundary { p1: pos }),
                 Some(InProgress::Boundary { p1 }) => {
-                    let p2 = self.resolve_angle(p1, pos, false);
+                    let p2 = self.resolve_angle(p1, pos, false, shift);
                     let fit = self.data.boundary_fit;
                     self.mutate(doc, |data| {
                         let id = data.next_id();
@@ -3022,13 +3231,20 @@ impl MeasureMode {
                 let pred = |t: &ComputedTool| {
                     matches!(
                         t.kind,
-                        ToolKind::Distance | ToolKind::Boundary | ToolKind::Offset
+                        ToolKind::Distance
+                            | ToolKind::Boundary
+                            | ToolKind::Offset
+                            | ToolKind::Angle
                     )
                 };
                 let mut best: Option<u64> = None;
                 let mut best_d = f64::INFINITY;
                 for t in computed.tools.iter().filter(|t| pred(t)) {
-                    for p in [t.p1, t.p2] {
+                    let mut pts = vec![t.p1, t.p2];
+                    if let Some(p3) = t.p3 {
+                        pts.push(p3);
+                    }
+                    for p in pts {
                         let d = (pos - p).length();
                         if d <= pick_threshold && d < best_d {
                             best = Some(t.id);
@@ -3052,12 +3268,17 @@ impl MeasureMode {
     /// 線分上なら全体移動。どちらでもなければ選択解除。
     fn select_at(&mut self, computed: &Arc<ComputedMeasure>, pos: Pt2, threshold: f64) {
         let mut best: Option<(u64, EndpointWhich, f64)> = None;
-        for t in computed
-            .tools
-            .iter()
-            .filter(|t| matches!(t.kind, ToolKind::Distance | ToolKind::Boundary))
-        {
-            for (which, p) in [(EndpointWhich::P1, t.p1), (EndpointWhich::P2, t.p2)] {
+        for t in computed.tools.iter().filter(|t| {
+            matches!(
+                t.kind,
+                ToolKind::Distance | ToolKind::Boundary | ToolKind::Angle
+            )
+        }) {
+            let mut pts = vec![(EndpointWhich::P1, t.p1), (EndpointWhich::P2, t.p2)];
+            if let Some(p3) = t.p3 {
+                pts.push((EndpointWhich::P3, p3));
+            }
+            for (which, p) in pts {
                 let d = (pos - p).length();
                 if d <= threshold && best.map_or(true, |(_, _, bd)| d < bd) {
                     best = Some((t.id, which, d));
@@ -3071,7 +3292,10 @@ impl MeasureMode {
             return;
         }
         if let Some(t) = nearest_tool(computed, pos, threshold, |t| {
-            matches!(t.kind, ToolKind::Distance | ToolKind::Boundary)
+            matches!(
+                t.kind,
+                ToolKind::Distance | ToolKind::Boundary | ToolKind::Angle
+            )
         }) {
             self.selected = Some(t.id);
             self.drag = Some(Drag::Whole {
@@ -3079,6 +3303,7 @@ impl MeasureMode {
                 start: pos,
                 orig_p1: t.p1,
                 orig_p2: t.p2,
+                orig_p3: t.p3,
             });
             self.drag_fitted = Some(computed.clone());
         } else {
@@ -3107,8 +3332,15 @@ impl MeasureMode {
     }
 
     /// 角度 4 方向スナップ（スナップが効いていないときだけ）。
-    fn resolve_angle(&self, p1: Pt2, p2: Pt2, snapped: bool) -> Pt2 {
-        if !snapped && self.data.prefs.angle == AngleMode::FourDir {
+    /// `shift` が真なら設定を一時的に反転する（4 方向 ⇔ 自由）。
+    /// 名前は「角度ツール」の計算（`measure::angle_deg_between`）と
+    /// 似ているが無関係（こちらは 4 方向固定用）。
+    fn resolve_angle(&self, p1: Pt2, p2: Pt2, snapped: bool, shift: bool) -> Pt2 {
+        let four_dir = match (self.data.prefs.angle, shift) {
+            (AngleMode::FourDir, false) | (AngleMode::Free, true) => true,
+            _ => false,
+        };
+        if !snapped && four_dir {
             return snap_angle_four(p1, p2);
         }
         p2
@@ -3116,6 +3348,15 @@ impl MeasureMode {
 }
 
 /// `pos` に最も近い、条件を満たすツール（線分距離がしきい値以下）。
+/// 点からツールまでの距離（角度は 2 線分の近い方）。
+fn tool_distance(pos: Pt2, t: &ComputedTool) -> f64 {
+    let d = distance_to_segment(pos, t.p1, t.p2);
+    match t.p3 {
+        Some(p3) => d.min(distance_to_segment(pos, t.p2, p3)),
+        None => d,
+    }
+}
+
 fn nearest_tool(
     computed: &ComputedMeasure,
     pos: Pt2,
@@ -3126,10 +3367,10 @@ fn nearest_tool(
         .tools
         .iter()
         .filter(|t| pred(t))
-        .filter(|t| distance_to_segment(pos, t.p1, t.p2) <= threshold)
+        .filter(|t| tool_distance(pos, t) <= threshold)
         .min_by(|a, b| {
-            distance_to_segment(pos, a.p1, a.p2)
-                .partial_cmp(&distance_to_segment(pos, b.p1, b.p2))
+            tool_distance(pos, a)
+                .partial_cmp(&tool_distance(pos, b))
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
 }
@@ -3145,7 +3386,7 @@ mod tests {
     /// id 1..=3 の測長を持つグループを作る。中点は (100,15) / (20,50) / (55,5)。
     fn data_with_group() -> (MeasureData, u64) {
         let mut data = MeasureData::default();
-        let g = data.group_for_new_measurement();
+        let g = data.group_for_new_measurement(ToolKind::Distance);
         for (i, (p1, p2)) in [
             ((100.0, 10.0), (100.0, 20.0)),
             ((10.0, 50.0), (30.0, 50.0)),
@@ -3317,7 +3558,7 @@ mod tests {
     #[test]
     fn delete_tools_removes_tool_and_dependent_offsets() {
         let mut data = MeasureData::default();
-        let g = data.group_for_new_measurement();
+        let g = data.group_for_new_measurement(ToolKind::Distance);
         data.tools.push(MeasureTool::Distance {
             id: 1,
             p1: pt(0.0, 0.0),
@@ -3358,7 +3599,7 @@ mod tests {
     #[test]
     fn tools_in_rect_uses_center() {
         let mut data = MeasureData::default();
-        let g = data.group_for_new_measurement();
+        let g = data.group_for_new_measurement(ToolKind::Distance);
         data.tools.push(MeasureTool::Distance {
             id: 1,
             p1: pt(10.0, 10.0),
@@ -3381,5 +3622,99 @@ mod tests {
         assert_eq!(ids, vec![1], "枠内は測長 1 のみ（境界線の中心は枠外）");
         let ids = mode.tools_in_rect(&computed, pt(90.0, 90.0), pt(130.0, 130.0));
         assert_eq!(ids, vec![2], "境界線も対象");
+    }
+
+    /// 角度グループの統計・CSV（スケール換算なし・固定 1 桁）。
+    #[test]
+    fn angle_group_stat_and_csv() {
+        let mut data = MeasureData::default();
+        let g = data.group_for_new_measurement(ToolKind::Angle);
+        for (i, (p1, p3)) in [((10.0, 0.0), (10.0, 10.0)), ((20.0, 0.0), (0.0, 20.0))]
+            .iter()
+            .enumerate()
+        {
+            // 頂点 (0,0)。45° と 90°。
+            data.tools.push(MeasureTool::Angle {
+                id: i as u64 + 1,
+                p1: pt(p1.0, p1.1),
+                p2: pt(0.0, 0.0),
+                p3: pt(p3.0, p3.1),
+                group: g,
+            });
+        }
+        let computed = computed_of(&data);
+        // 統計: 平均 67.5°（単位付き・1 桁）。
+        let stat = group_stat(&computed, g, None, 2).unwrap();
+        assert!(stat.contains("67.5°"), "{stat}");
+        // 統計 CSV: 単位なし数値。
+        let csv = stats_csv(&data, &computed, None, 2);
+        assert!(csv.contains("67.5"), "{csv}");
+        // データ CSV: 番号と角度値（表示桁数で丸め、末尾ゼロは落ちる）。
+        let data_csv = group_data_csv(g, &data, &computed, None, 2);
+        assert!(data_csv.contains("1, 45"), "{data_csv}");
+        assert!(data_csv.contains("2, 90"), "{data_csv}");
+    }
+
+    /// 角度ツールが ▲▼移動・矩形削除の対象になること。
+    #[test]
+    fn angle_tool_move_and_delete() {
+        let mut data = MeasureData::default();
+        let g = data.group_for_new_measurement(ToolKind::Angle);
+        for (i, (p1, p3)) in [((20.0, 0.0), (20.0, 20.0)), ((10.0, 0.0), (10.0, 10.0))]
+            .iter()
+            .enumerate()
+        {
+            data.tools.push(MeasureTool::Angle {
+                id: i as u64 + 1,
+                p1: pt(p1.0, p1.1),
+                p2: pt(0.0, 0.0),
+                p3: pt(p3.0, p3.1),
+                group: g,
+            });
+        }
+        // ▲▼移動: グループ内の角度同士を swap。
+        move_tool_in_group(&mut data, g, 2, -1);
+        assert_eq!(data.group_tools(g), vec![2, 1]);
+        // 矩形削除の対象（代表座標 = 頂点 (0,0)）。
+        let computed = computed_of(&data);
+        let mut mode = MeasureMode::default();
+        mode.data = data;
+        let mut ids = mode.tools_in_rect(&computed, pt(-10.0, -10.0), pt(10.0, 10.0));
+        ids.sort();
+        assert_eq!(ids, vec![1, 2], "頂点が枠内なら角度も対象");
+    }
+
+    /// Shift で 4 方向設定が一時的に反転すること（作成時の resolve_angle）。
+    #[test]
+    fn resolve_angle_shift_inverts_four_dir() {
+        let mut mode = MeasureMode::default();
+        let p1 = pt(0.0, 0.0);
+        // 4 方向: 近い方向へ丸める。
+        mode.data.prefs.angle = AngleMode::FourDir;
+        assert_eq!(
+            mode.resolve_angle(p1, pt(100.0, 10.0), false, false),
+            pt(100.0, 0.0)
+        );
+        // Shift: 一時的に自由 → そのまま。
+        assert_eq!(
+            mode.resolve_angle(p1, pt(100.0, 10.0), false, true),
+            pt(100.0, 10.0)
+        );
+        // 自由 + Shift → 一時的に 4 方向。
+        mode.data.prefs.angle = AngleMode::Free;
+        assert_eq!(
+            mode.resolve_angle(p1, pt(100.0, 10.0), false, true),
+            pt(100.0, 0.0)
+        );
+        assert_eq!(
+            mode.resolve_angle(p1, pt(100.0, 10.0), false, false),
+            pt(100.0, 10.0)
+        );
+        // スナップが効いているときは 4 方向を適用しない（既存仕様のまま）。
+        mode.data.prefs.angle = AngleMode::FourDir;
+        assert_eq!(
+            mode.resolve_angle(p1, pt(100.0, 10.0), true, false),
+            pt(100.0, 10.0)
+        );
     }
 }

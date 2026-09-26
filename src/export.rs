@@ -24,7 +24,7 @@ use crate::command::Command;
 use crate::document::Document;
 use crate::frame::Scale;
 use crate::gray::Gray16;
-use crate::measure::{ComputedMeasure, Pt2, ToolKind, format_measurement};
+use crate::measure::{ComputedMeasure, Pt2, ToolKind, format_angle, format_measurement};
 use crate::measure_mode::{COLOR_DISTANCE, COLOR_GUIDE, region_edge_colors};
 
 /// 出力先テンプレートの既定値。`{dir}` / `{filename}` は保存時に画像パスから解決。
@@ -270,17 +270,32 @@ pub fn save_result_json(doc: &Document, index: usize) -> Result<Option<PathBuf>,
         let (data, computed) = (overlay.data, &overlay.computed);
         for g in &data.groups {
             // 表示用の丸めはせず、元の精度の数値のまま保存する。
+            // 値は種類（type）ごとに変わる: 距離はスケール換算した長さ、
+            // 角度はスケール換算しない °。いずれも values に並べる。
             let values: Vec<f64> = data
                 .group_tools(g.id)
                 .iter()
                 .filter_map(|tid| {
-                    computed
-                        .by_id(*tid)
-                        .and_then(|t| t.length_px)
-                        .map(|l| overlay.scale.map(|s| l * s.per_px()).unwrap_or(l))
+                    let t = computed.by_id(*tid)?;
+                    match t.kind {
+                        ToolKind::Angle => t.angle_deg,
+                        _ => t
+                            .length_px
+                            .map(|l| overlay.scale.map(|s| l * s.per_px()).unwrap_or(l)),
+                    }
                 })
                 .collect();
-            groups.push(serde_json::json!({ "name": g.name, "values": values }));
+            let type_name = match g.kind() {
+                ToolKind::Distance => "distance",
+                ToolKind::Angle => "angle",
+                ToolKind::Boundary => "boundary",
+                ToolKind::Offset => "offset",
+            };
+            groups.push(serde_json::json!({
+                "name": g.name,
+                "type": type_name,
+                "values": values,
+            }));
         }
     }
     let json = serde_json::json!({ "filename": filename, "unit": unit, "groups": groups });
@@ -422,6 +437,21 @@ fn draw_computed<P>(
                     draw_value_label(img, font, t.p1, t.p2, text, guide, f);
                 }
             }
+            ToolKind::Angle => {
+                // 頂点 p2 を共有する 2 線分。なす角を二等分線方向に表示する
+                // （画面版と同じ）。
+                let Some(p3) = t.p3 else { continue };
+                let color = P::from_screen(COLOR_DISTANCE);
+                draw_thick_line(img, t.p1, t.p2, (2.0 * f).max(1.0), color);
+                draw_thick_line(img, t.p2, p3, (2.0 * f).max(1.0), color);
+                if let Some(deg) = t.angle_deg {
+                    let text = match computed.number(t.id) {
+                        Some(n) => format!("#{n} {}", format_angle(deg, digits)),
+                        None => format_angle(deg, digits),
+                    };
+                    draw_angle_label(img, font, (t.p1, t.p2, p3), text, color, f);
+                }
+            }
         }
     }
 }
@@ -507,6 +537,42 @@ fn draw_value_label<P>(
         Pt2::new(0.0, 1.0)
     };
     let anchor = mid + n * 13.0 * f as f64;
+    let Some(font) = font else {
+        return;
+    };
+    let px = PxScale::from(12.0 * f);
+    let (w, h) = text_size(px, font, &text);
+    // draw_text_mut の y はテキスト上端。下端を anchor に合わせる。
+    let x = (anchor.x - w as f64 * 0.5).round() as i32;
+    let y = (anchor.y - h as f64).round() as i32;
+    draw_text_mut(img, color, x, y, px, font, &text);
+}
+
+/// 角度のラベル。頂点から二等分線方向へ少し浮かせて描く（画面版と同じ位置）。
+/// `pts` は (1 点目, 頂点, 3 点目)。
+fn draw_angle_label<P>(
+    img: &mut ImageBuffer<P, Vec<P::Subpixel>>,
+    font: Option<&FontArc>,
+    pts: (Pt2, Pt2, Pt2),
+    text: String,
+    color: P,
+    f: f32,
+) where
+    P: AnnotationPixel,
+    P::Subpixel: Into<f32> + Clamp<f32>,
+{
+    let (a, v, b) = pts;
+    let (u1, u2) = (a - v, b - v);
+    let bisect = {
+        let d = u1 / u1.length() + u2 / u2.length();
+        // 180° で二等分方向が打ち消し合うときは上方向にする。
+        if d.length() > 1e-6 {
+            d / d.length()
+        } else {
+            Pt2::new(0.0, -1.0)
+        }
+    };
+    let anchor = v + bisect * 16.0 * f as f64;
     let Some(font) = font else {
         return;
     };
@@ -619,7 +685,7 @@ mod tests {
     #[test]
     fn distance_line_is_drawn() {
         let mut data = MeasureData::default();
-        let g = data.group_for_new_measurement();
+        let g = data.group_for_new_measurement(ToolKind::Distance);
         let tool = MeasureTool::Distance {
             id: 1,
             p1: Pt2::new(10.0, 100.0),
@@ -641,7 +707,7 @@ mod tests {
     fn arrow_head_matches_screen_direction() {
         let img = Gray16::black(400, 400);
         let mut data = MeasureData::default();
-        let g = data.group_for_new_measurement();
+        let g = data.group_for_new_measurement(ToolKind::Distance);
         data.tools.push(MeasureTool::Distance {
             id: 1,
             p1: Pt2::new(100.0, 200.0),
@@ -677,7 +743,7 @@ mod tests {
     #[test]
     fn rgb_keeps_annotation_colors() {
         let mut data = MeasureData::default();
-        let g = data.group_for_new_measurement();
+        let g = data.group_for_new_measurement(ToolKind::Distance);
         let tool = MeasureTool::Distance {
             id: 1,
             p1: Pt2::new(10.0, 100.0),
@@ -738,7 +804,7 @@ mod tests {
         let img = crate::command::load_image(&src, &mut cache).expect("testdata が読める");
 
         let mut data = MeasureData::default();
-        let g = data.group_for_new_measurement();
+        let g = data.group_for_new_measurement(ToolKind::Distance);
         data.tools.push(MeasureTool::Distance {
             id: 1,
             p1: Pt2::new(10.0, 20.0),
@@ -794,7 +860,7 @@ mod tests {
     /// 3 本の測長を持つグループを作る（save_result_json のテスト用）。
     fn data_with_measurements() -> MeasureData {
         let mut data = MeasureData::default();
-        let g = data.group_for_new_measurement();
+        let g = data.group_for_new_measurement(ToolKind::Distance);
         let fit = crate::measure::FitSettings::default();
         for (id, x1, x2) in [(1, 10.0, 50.0), (2, 20.0, 60.0), (3, 30.0, 70.0)] {
             data.tools.push(MeasureTool::Distance {
@@ -841,6 +907,7 @@ mod tests {
         );
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["unit"], "px", "スケール未設定は px");
+        assert_eq!(v["groups"][0]["type"], "distance");
         assert_eq!(v["groups"][0]["values"].as_array().unwrap().len(), 3);
         // 表示用の丸めはせず、元の精度の数値で保存される。
         let first = v["groups"][0]["values"][0]
@@ -856,6 +923,56 @@ mod tests {
             output: String::new(),
         };
         assert!(save_result_json(&doc, 2).unwrap().is_none());
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(&img_path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    /// 角度グループの JSON 出力（type: angle / values は空 / angles に角度値）。
+    #[test]
+    fn save_result_json_outputs_angle_group() {
+        let dir =
+            std::env::temp_dir().join(format!("tem_measure_test_angle_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let img_path = dir.join("sample.tif");
+        image::GrayImage::from_raw(4, 4, vec![0u8; 16])
+            .unwrap()
+            .save(&img_path)
+            .unwrap();
+
+        let mut data = data_with_measurements();
+        // 距離グループがアクティブなので、角度は別グループが作られる。
+        let g = data.group_for_new_measurement(ToolKind::Angle);
+        data.tools.push(MeasureTool::Angle {
+            id: 10,
+            p1: Pt2::new(10.0, 0.0),
+            p2: Pt2::new(0.0, 0.0),
+            p3: Pt2::new(0.0, 10.0),
+            group: g,
+        });
+
+        let mut doc = Document::new("sample.tif");
+        doc.push_command(Command::InsertImage {
+            path: img_path.clone(),
+        });
+        doc.push_command(Command::Measure { data });
+        doc.push_command(Command::ExportResult {
+            output: "{dir}/{filename}_result.json".to_owned(),
+        });
+        doc.recompute(&mut SourceCache::new());
+
+        let path = save_result_json(&doc, 2).unwrap().expect("保存される");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        // グループ順: 距離（既存）→ 角度（新規作成）。
+        assert_eq!(v["groups"][0]["type"], "distance");
+        assert_eq!(v["groups"][1]["type"], "angle");
+        // 角度も values に格納（type で判別）。angles キーは無い。
+        let values = v["groups"][1]["values"].as_array().unwrap();
+        assert_eq!(values.len(), 1);
+        assert!((values[0].as_f64().unwrap() - 90.0).abs() < 1e-9);
+        assert!(v["groups"][1].get("angles").is_none(), "angles キーは廃止");
 
         std::fs::remove_file(&path).unwrap();
         std::fs::remove_file(&img_path).unwrap();

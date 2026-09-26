@@ -380,6 +380,7 @@ impl HistoryFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::measure::ToolKind;
 
     #[test]
     fn scale_command_converts_pixel_length_pair() {
@@ -493,7 +494,7 @@ mod tests {
     #[test]
     fn measure_command_round_trips() {
         let mut data = MeasureData::default();
-        data.group_for_new_measurement();
+        data.group_for_new_measurement(ToolKind::Distance);
         let cmd = Command::Measure { data: data.clone() };
         let json = serde_json::to_string(&cmd).unwrap();
         let back: Command = serde_json::from_str(&json).unwrap();

@@ -159,11 +159,21 @@ impl Default for FitSettings {
     }
 }
 
-/// 測定結果をまとめるグループ。
+/// 測定結果をまとめるグループ。1 グループには 1 種類の測定だけが入る。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MeasureGroup {
     pub id: u64,
     pub name: String,
+    /// グループに入る測定の種類。旧データ（キーなし）は None → Distance 扱い。
+    #[serde(default)]
+    pub kind: Option<ToolKind>,
+}
+
+impl MeasureGroup {
+    /// グループの測定種類。旧データのグループは二点間測長として扱う。
+    pub fn kind(&self) -> ToolKind {
+        self.kind.unwrap_or(ToolKind::Distance)
+    }
 }
 
 /// 測長モードの設定。デフォルトはすべて左側の選択（複製のみ右側）。
@@ -224,19 +234,41 @@ pub enum MeasureTool {
     /// オフセット線。境界線を法線方向へずらした補助線（無限直線、紫）。
     /// `distance` は符号付き px。法線 = 境界線方向を +90° 回転した側が正。
     Offset { id: u64, source: u64, distance: f64 },
+    /// 角度測定（3 点クリック。p2 が共有頂点、直線 p1→p2 と p2→p3 のなす角）。
+    /// スナップ・端点フィッティングは適用しない（クリック座標のまま）。
+    Angle {
+        id: u64,
+        p1: Pt2,
+        p2: Pt2,
+        p3: Pt2,
+        group: u64,
+    },
 }
 
 impl MeasureTool {
     pub fn id(&self) -> u64 {
         match self {
-            Self::Distance { id, .. } | Self::Boundary { id, .. } | Self::Offset { id, .. } => *id,
+            Self::Distance { id, .. }
+            | Self::Boundary { id, .. }
+            | Self::Offset { id, .. }
+            | Self::Angle { id, .. } => *id,
         }
     }
 
     /// 測定結果リストに出るツールか。境界線・オフセット線は補助線扱いなので
-    /// 出さない（二点間測長のみ）。
+    /// 出さない（二点間測長と角度のみ）。
     pub fn is_measurement(&self) -> bool {
-        matches!(self, Self::Distance { .. })
+        matches!(self, Self::Distance { .. } | Self::Angle { .. })
+    }
+
+    /// 所属グループの id。グループに入らない補助線は None。
+    pub fn group(&self) -> Option<u64> {
+        match self {
+            Self::Distance { group, .. }
+            | Self::Boundary { group, .. }
+            | Self::Angle { group, .. } => Some(*group),
+            Self::Offset { .. } => None,
+        }
     }
 }
 
@@ -286,14 +318,24 @@ impl MeasureData {
     }
 
     /// 新しい測定の入れ先グループ。None（new group）なら "group N" を
-    /// 生成してそちらを返し、生成したかどうかを併せて返す。
-    pub fn group_for_new_measurement(&mut self) -> u64 {
+    /// 生成してそちらを返す。アクティブグループが別の測定種類の場合は
+    /// 設定に関わらず新しいグループを作る（1 グループ 1 種類）。
+    pub fn group_for_new_measurement(&mut self, kind: ToolKind) -> u64 {
         match self.active_group {
-            Some(gid) if self.has_group(gid) => gid,
+            Some(gid)
+                if self.has_group(gid)
+                    && self.groups.iter().any(|g| g.id == gid && g.kind() == kind) =>
+            {
+                gid
+            }
             _ => {
                 let id = self.next_group_id();
                 let name = next_group_name(&self.groups);
-                self.groups.push(MeasureGroup { id, name });
+                self.groups.push(MeasureGroup {
+                    id,
+                    name,
+                    kind: Some(kind),
+                });
                 self.active_group = Some(id);
                 id
             }
@@ -316,7 +358,12 @@ impl MeasureData {
             GroupMode::NewGroup => {
                 let id = self.next_group_id();
                 let name = next_group_name(&self.groups);
-                self.groups.push(MeasureGroup { id, name });
+                self.groups.push(MeasureGroup {
+                    id,
+                    name,
+                    // 複製は二点間測長のみが対象。
+                    kind: Some(ToolKind::Distance),
+                });
                 id
             }
         }
@@ -326,12 +373,12 @@ impl MeasureData {
         self.groups.iter().map(|g| g.id).max().unwrap_or(0) + 1
     }
 
-    /// グループ内の、結果リストに出す測定ツール（二点間測長のみ）を
+    /// グループ内の、結果リストに出す測定ツール（二点間測長・角度）を
     /// ツール順に並べた ID 列。
     pub fn group_tools(&self, gid: u64) -> Vec<u64> {
         self.tools
             .iter()
-            .filter(|t| matches!(t, MeasureTool::Distance { group, .. } if *group == gid))
+            .filter(|t| t.is_measurement() && t.group() == Some(gid))
             .map(|t| t.id())
             .collect()
     }
@@ -373,7 +420,7 @@ impl MeasureData {
             }
         }
         // 表示番号: 結果リストと同じ並び（グループ順 → グループ内のツール順）で
-        // #1 から通しに振る（グループごとに振り直さない）。対象は二点間測長のみ。
+        // #1 から通しに振る（グループごとに振り直さない）。対象は二点間測長と角度。
         let mut numbers = HashMap::new();
         let mut n = 0usize;
         for g in &self.groups {
@@ -433,6 +480,8 @@ impl MeasureData {
                     group: Some(*group),
                     distance_px: None,
                     source: None,
+                    angle_deg: None,
+                    p3: None,
                     fit_regions: regions,
                 })
             }
@@ -459,6 +508,8 @@ impl MeasureData {
                         group: Some(*group),
                         distance_px: None,
                         source: None,
+                        angle_deg: None,
+                        p3: None,
                         fit_regions: vec![region],
                     });
                 }
@@ -474,6 +525,8 @@ impl MeasureData {
                     group: Some(*group),
                     distance_px: None,
                     source: None,
+                    angle_deg: None,
+                    p3: None,
                     fit_regions: vec![region],
                 })
             }
@@ -494,6 +547,30 @@ impl MeasureData {
                     group: None,
                     distance_px: Some(*distance),
                     source: Some(*source),
+                    angle_deg: None,
+                    p3: None,
+                    fit_regions: Vec::new(),
+                })
+            }
+            MeasureTool::Angle {
+                id,
+                p1,
+                p2,
+                p3,
+                group,
+            } => {
+                // スナップ・フィッティングは適用しない（クリック座標のまま）。
+                Some(ComputedTool {
+                    id: *id,
+                    kind: ToolKind::Angle,
+                    p1: *p1,
+                    p2: *p2,
+                    length_px: None,
+                    group: Some(*group),
+                    distance_px: None,
+                    source: None,
+                    angle_deg: angle_deg_between(*p1, *p2, *p3),
+                    p3: Some(*p3),
                     fit_regions: Vec::new(),
                 })
             }
@@ -524,9 +601,13 @@ fn fit_endpoint(
 }
 
 /// ツールの種類（計算結果側。描画の色・形の切り替えに使う）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// グループの測定種類としても共用する（グループに入るのは
+/// Distance / Angle のみ）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ToolKind {
     Distance,
+    Angle,
     Boundary,
     Offset,
 }
@@ -545,6 +626,10 @@ pub struct ComputedTool {
     pub distance_px: Option<f64>,
     /// Offset のみ。元の境界線の id（関係を示す矢印の描画に使う）。
     pub source: Option<u64>,
+    /// Angle のみ。なす角（°）。
+    pub angle_deg: Option<f64>,
+    /// Angle のみ。3 点目（p2 が共有頂点）。
+    pub p3: Option<Pt2>,
     /// フィッティング領域の枠（オーバーレイ描画用）。Off なら空。
     pub fit_regions: Vec<FitRegion>,
 }
@@ -552,7 +637,7 @@ pub struct ComputedTool {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ComputedMeasure {
     pub tools: Vec<ComputedTool>,
-    /// 表示番号（結果リスト・画像ラベル共通）。二点間測長のみに
+    /// 表示番号（結果リスト・画像ラベル共通）。二点間測長と角度にのみ
     /// グループ順の通し番号が入る。補助線には番号が無い。
     pub numbers: HashMap<u64, usize>,
 }
@@ -574,6 +659,7 @@ impl ComputedTool {
     pub fn anchor_point(&self) -> Option<Pt2> {
         match self.kind {
             ToolKind::Distance | ToolKind::Boundary => Some((self.p1 + self.p2) * 0.5),
+            ToolKind::Angle => Some(self.p2),
             ToolKind::Offset => None,
         }
     }
@@ -658,6 +744,21 @@ pub fn snap_angle_four(p1: Pt2, cursor: Pt2) -> Pt2 {
     p1 + dir * t
 }
 
+/// 角度測定（3 点クリック）のなす角。`vertex` を共有頂点とする
+/// 2 直線 (p1→vertex, p3→vertex) の小さい方の角を 0..=180° で返す。
+/// どちらかの脚が退化（長さ < 1e-9 px）なら None。
+/// `|cross|` を取るため p1 / p3 を入れ替えても同じ値になる。
+pub fn angle_deg_between(p1: Pt2, vertex: Pt2, p3: Pt2) -> Option<f64> {
+    let v1 = p1 - vertex;
+    let v2 = p3 - vertex;
+    if v1.length() < 1e-9 || v2.length() < 1e-9 {
+        return None;
+    }
+    let dot = v1.x * v2.x + v1.y * v2.y;
+    let cross = v1.x * v2.y - v1.y * v2.x;
+    Some(cross.abs().atan2(dot).to_degrees())
+}
+
 /// 既存の "group N" と重ならない最小の N で "group N" を作る。
 pub fn next_group_name(groups: &[MeasureGroup]) -> String {
     let taken: HashSet<u64> = groups
@@ -679,6 +780,12 @@ pub fn format_measurement(px: f64, scale: Option<Scale>, digits: u8) -> String {
         ),
         None => format!("{} px", format_length(px, digits)),
     }
+}
+
+/// 角度値の表示。無次元なのでスケール換算はしない。
+/// `digits` は小数点以下桁数（format_length と同じ丸め）。
+pub fn format_angle(deg: f64, digits: u8) -> String {
+    format!("{}°", format_length(deg, digits))
 }
 
 #[cfg(test)]
@@ -766,6 +873,7 @@ mod tests {
                 .map(|(i, n)| MeasureGroup {
                     id: i as u64,
                     name: n.to_string(),
+                    kind: None,
                 })
                 .collect::<Vec<_>>()
         };
@@ -780,13 +888,13 @@ mod tests {
     #[test]
     fn new_group_auto_generates_and_apply_mode_resets() {
         let mut data = MeasureData::default();
-        let g1 = data.group_for_new_measurement();
+        let g1 = data.group_for_new_measurement(ToolKind::Distance);
         assert_eq!(data.groups.len(), 1);
         assert_eq!(data.groups[0].name, "group 1");
         // NewGroup モード（デフォルト）: 測定後は new group に戻る。
         data.apply_new_measure_mode();
         assert_eq!(data.active_group, None);
-        let g2 = data.group_for_new_measurement();
+        let g2 = data.group_for_new_measurement(ToolKind::Distance);
         assert_ne!(g1, g2);
         // Keep モードではそのまま。
         data.prefs.new_measure = GroupMode::Keep;
@@ -799,7 +907,7 @@ mod tests {
     #[test]
     fn duplicate_group_mode() {
         let mut data = MeasureData::default();
-        let g = data.group_for_new_measurement();
+        let g = data.group_for_new_measurement(ToolKind::Distance);
         data.active_group = None;
         // 既定（そのまま）: 複製元のグループへ。
         assert_eq!(data.group_for_duplicate(g), g);
@@ -820,7 +928,7 @@ mod tests {
     fn compute_numbers_increment_across_groups() {
         let fit = FitSettings::default();
         let mut data = MeasureData::default();
-        let g1 = data.group_for_new_measurement();
+        let g1 = data.group_for_new_measurement(ToolKind::Distance);
         data.tools.push(MeasureTool::Distance {
             id: 1,
             p1: Pt2::new(0.0, 0.0),
@@ -840,7 +948,7 @@ mod tests {
         // 2 つ目のグループを作って測長を追加。
         data.prefs.new_measure = GroupMode::NewGroup;
         data.apply_new_measure_mode();
-        let g2 = data.group_for_new_measurement();
+        let g2 = data.group_for_new_measurement(ToolKind::Distance);
         data.tools.push(MeasureTool::Distance {
             id: 3,
             p1: Pt2::new(0.0, 20.0),
@@ -875,7 +983,7 @@ mod tests {
     #[test]
     fn json_round_trip() {
         let mut data = MeasureData::default();
-        let g = data.group_for_new_measurement();
+        let g = data.group_for_new_measurement(ToolKind::Distance);
         data.tools.push(MeasureTool::Distance {
             id: 1,
             p1: pt(12.5, 34.25),
@@ -901,7 +1009,7 @@ mod tests {
     fn compute_distance_without_fit_is_straight_line() {
         let img = Gray16::black(100, 100);
         let mut data = MeasureData::default();
-        let g = data.group_for_new_measurement();
+        let g = data.group_for_new_measurement(ToolKind::Distance);
         data.tools.push(MeasureTool::Distance {
             id: 1,
             p1: pt(10.0, 10.0),
@@ -923,7 +1031,7 @@ mod tests {
     fn boundary_mode1_is_user_segment() {
         let img = Gray16::black(100, 100);
         let mut data = MeasureData::default();
-        let g = data.group_for_new_measurement();
+        let g = data.group_for_new_measurement(ToolKind::Distance);
         data.tools.push(MeasureTool::Boundary {
             id: 1,
             p1: pt(0.0, 0.0),
@@ -949,7 +1057,7 @@ mod tests {
             }
         }
         let mut data = MeasureData::default();
-        let g = data.group_for_new_measurement();
+        let g = data.group_for_new_measurement(ToolKind::Distance);
         // 線方向は水平（二点目が右）。エッジから 1 px ずらして置く。
         let fit = FitSettings {
             mode: FitMode::DerivativeGaussian,
@@ -1000,7 +1108,7 @@ mod tests {
             }
         }
         let mut data = MeasureData::default();
-        let g = data.group_for_new_measurement();
+        let g = data.group_for_new_measurement(ToolKind::Distance);
         let fit = FitSettings {
             mode: FitMode::DerivativeGaussian,
             sign: FitSign::Positive,
@@ -1024,5 +1132,95 @@ mod tests {
         assert!((t.p1.x - 29.5).abs() < 0.5, "{}", t.p1.x);
         assert!((t.p2.x - 169.5).abs() < 0.5, "{}", t.p2.x);
         assert!((t.length_px.unwrap() - 140.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn angle_deg_between_measures_smaller_angle() {
+        // 直角: 頂点から右と下。
+        assert!(
+            (angle_deg_between(pt(20.0, 0.0), pt(0.0, 0.0), pt(0.0, 20.0)).unwrap() - 90.0).abs()
+                < 1e-9
+        );
+        // 鋭角 45°。
+        assert!(
+            (angle_deg_between(pt(10.0, 0.0), pt(0.0, 0.0), pt(10.0, 10.0)).unwrap() - 45.0).abs()
+                < 1e-9
+        );
+        // p1 / p3 を入れ替えても同じ値（小さい方の角）。
+        let a = angle_deg_between(pt(10.0, 0.0), pt(0.0, 0.0), pt(10.0, 10.0)).unwrap();
+        let b = angle_deg_between(pt(10.0, 10.0), pt(0.0, 0.0), pt(10.0, 0.0)).unwrap();
+        assert!((a - b).abs() < 1e-9);
+        // 同一直線・同一方向 → 0°。
+        assert!(
+            (angle_deg_between(pt(10.0, 0.0), pt(0.0, 0.0), pt(20.0, 0.0)).unwrap() - 0.0).abs()
+                < 1e-9
+        );
+        // 同一直線・反対方向 → 180°。
+        assert!(
+            (angle_deg_between(pt(10.0, 0.0), pt(0.0, 0.0), pt(-20.0, 0.0)).unwrap() - 180.0).abs()
+                < 1e-9
+        );
+        // 退化（脚の長さ 0）→ None。
+        assert_eq!(
+            angle_deg_between(pt(0.0, 0.0), pt(0.0, 0.0), pt(10.0, 0.0)),
+            None
+        );
+        assert_eq!(
+            angle_deg_between(pt(10.0, 0.0), pt(0.0, 0.0), pt(0.0, 0.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn group_kind_separates_measurement_types() {
+        let mut data = MeasureData::default();
+        let d1 = data.group_for_new_measurement(ToolKind::Distance);
+        // 同種なら同じグループへ。
+        assert_eq!(data.group_for_new_measurement(ToolKind::Distance), d1);
+        // 別種なら設定に関わらず新グループ（active が切り替わる）。
+        let a1 = data.group_for_new_measurement(ToolKind::Angle);
+        assert_ne!(a1, d1);
+        assert_eq!(
+            data.groups.iter().find(|g| g.id == a1).unwrap().kind(),
+            ToolKind::Angle
+        );
+        // 角度同士は同じグループへ。
+        assert_eq!(data.group_for_new_measurement(ToolKind::Angle), a1);
+    }
+
+    #[test]
+    fn legacy_group_without_kind_is_distance() {
+        let g: MeasureGroup = serde_json::from_str(r#"{"id":1,"name":"group 1"}"#).unwrap();
+        assert_eq!(g.kind(), ToolKind::Distance);
+    }
+
+    #[test]
+    fn compute_angle_tool_has_angle_and_number() {
+        let img = Gray16::black(100, 100);
+        let mut data = MeasureData::default();
+        let g = data.group_for_new_measurement(ToolKind::Angle);
+        data.tools.push(MeasureTool::Angle {
+            id: 1,
+            p1: pt(10.0, 0.0),
+            p2: pt(0.0, 0.0),
+            p3: pt(0.0, 10.0),
+            group: g,
+        });
+        let c = data.compute(&img, None);
+        let t = c.by_id(1).unwrap();
+        assert!((t.angle_deg.unwrap() - 90.0).abs() < 1e-9);
+        assert_eq!(t.p3, Some(pt(0.0, 10.0)));
+        assert_eq!(t.length_px, None);
+        // 通し番号が距離と角度をまたいで振られること。
+        assert_eq!(c.number(1), Some(1));
+        // 代表座標は頂点。
+        assert_eq!(t.anchor_point(), Some(pt(0.0, 0.0)));
+    }
+
+    #[test]
+    fn format_angle_uses_digits() {
+        assert_eq!(format_angle(45.0, 1), "45°");
+        assert_eq!(format_angle(45.5, 2), "45.5°");
+        assert_eq!(format_angle(45.678, 3), "45.678°");
     }
 }

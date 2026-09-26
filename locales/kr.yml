@@ -212,6 +212,7 @@ dlg:
 mm:
   tool:
     distance: "두 점 측정"
+    angle: "각도"
     boundary: "경계선"
     offset: "오프셋 선"
     duplicate: "직선 복제"
@@ -228,6 +229,7 @@ mm:
   angle_label: "각도:"
   angle_four: "4방향"
   angle_free: "자유"
+  shift_angle_hint: "Shift를 누른 채 그리면 4방향 ⇔ 자유가 일시적으로 반전됩니다"
   snap_label: "스냅:"
   new_measure_label: "새 측정:"
   duplicate_label: "복제:"
@@ -245,6 +247,7 @@ mm:
   hint_duplicate: "측정·경계선을 클릭 → 마우스 이동으로 방향과 거리 지정 → 클릭으로 확정. 휠로 복제 수(1-20)"
   hint_range: "드래그로 사각형을 만들면 중심이 상자 안에 있는 측정을 모두 선택. 상자 안 드래그로 일괄 이동, 상자의 변·모서리 드래그로 측정째 확대/축소. Ctrl+드래그로 선택 측정 복제"
   hint_delete: "측정·보조선을 클릭으로 삭제. 드래그로 사각형을 만들면 중심이 상자 안에 있는 것을 일괄 삭제"
+  hint_angle: "세 점(첫 점 → 꼭짓점 → 셋째 점)을 클릭하여 두 직선이 이루는 작은 각(0–180°)을 측정"
   hint_none: "이미지 위의 측정·경계선을 직접 드래그로 이동（Esc로 해제）"
   offset_label: "오프셋:"
   results: "측정 결과"
