@@ -399,6 +399,39 @@ fn csv_escape(s: &str) -> String {
     }
 }
 
+/// グループの値の統計量。`values` が空のときは `Null` を返す。
+/// sigma は標本標準偏差（n-1）。3sigma は sigma の 3 倍。
+fn group_stats(values: &[f64]) -> serde_json::Value {
+    let n = values.len();
+    if n == 0 {
+        return serde_json::Value::Null;
+    }
+    let mean = values.iter().sum::<f64>() / n as f64;
+    let sigma = if n >= 2 {
+        let var = values
+            .iter()
+            .map(|v| (v - mean).powi(2))
+            .sum::<f64>()
+            / (n - 1) as f64;
+        Some(var.sqrt())
+    } else {
+        None
+    };
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = if n % 2 == 1 {
+        sorted[n / 2]
+    } else {
+        (sorted[n / 2 - 1] + sorted[n / 2]) * 0.5
+    };
+    serde_json::json!({
+        "mean": mean,
+        "sigma": sigma,
+        "3sigma": sigma.map(|s| s * 3.0),
+        "median": median,
+    })
+}
+
 /// 測定結果をまとめて JSON で保存する。`index` は結果出力コマンドの位置。
 /// 同じフレームに効いている測長コマンド（画像の `Arc` が一致するもの）を
 /// パイプライン順に集め、グループを連結した 1 つの JSON を書き出す。
@@ -434,10 +467,12 @@ pub fn save_result_json(doc: &Document, index: usize) -> Result<Option<PathBuf>,
                 ToolKind::Boundary => "boundary",
                 ToolKind::Offset => "offset",
             };
+            let stats = group_stats(&values);
             groups.push(serde_json::json!({
                 "name": g.name,
                 "type": type_name,
                 "values": values,
+                "stats": stats,
             }));
         }
     }
@@ -1132,6 +1167,12 @@ mod tests {
         assert!(v["exported_at"].as_str().is_some_and(|s| !s.is_empty()));
         assert_eq!(v["groups"][0]["type"], "distance");
         assert_eq!(v["groups"][0]["values"].as_array().unwrap().len(), 3);
+        // 全測定値が同値なら mean = median = 値、sigma = 0。
+        let stats = &v["groups"][0]["stats"];
+        assert!((stats["mean"].as_f64().unwrap() - 40.0).abs() < 1e-9);
+        assert!((stats["sigma"].as_f64().unwrap() - 0.0).abs() < 1e-9);
+        assert!((stats["3sigma"].as_f64().unwrap() - 0.0).abs() < 1e-9);
+        assert!((stats["median"].as_f64().unwrap() - 40.0).abs() < 1e-9);
         // 表示用の丸めはせず、元の精度の数値で保存される。
         let first = v["groups"][0]["values"][0]
             .as_f64()
@@ -1203,6 +1244,28 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         std::fs::remove_file(&img_path).unwrap();
         std::fs::remove_dir(&dir).unwrap();
+    }
+
+    /// グループ統計量の計算（値のばらつきがある場合）。
+    #[test]
+    fn group_stats_computes_statistics() {
+        // mean = 4, 標本分散 = ((3-4)^2+(4-4)^2+(5-4)^2)/2 = 1, sigma = 1。
+        let stats = group_stats(&[3.0, 4.0, 5.0]);
+        assert!((stats["mean"].as_f64().unwrap() - 4.0).abs() < 1e-9);
+        assert!((stats["sigma"].as_f64().unwrap() - 1.0).abs() < 1e-9);
+        assert!((stats["3sigma"].as_f64().unwrap() - 3.0).abs() < 1e-9);
+        assert!((stats["median"].as_f64().unwrap() - 4.0).abs() < 1e-9);
+        // 偶数個の中央値は中央 2 つの平均。
+        let stats = group_stats(&[1.0, 2.0, 3.0, 4.0]);
+        assert!((stats["median"].as_f64().unwrap() - 2.5).abs() < 1e-9);
+        // 1 個では標本標準偏差が出ない（null）。
+        let stats = group_stats(&[7.0]);
+        assert_eq!(stats["mean"].as_f64().unwrap(), 7.0);
+        assert!(stats["sigma"].is_null(), "n=1 の sigma は null");
+        assert!(stats["3sigma"].is_null(), "n=1 の 3sigma は null");
+        assert_eq!(stats["median"].as_f64().unwrap(), 7.0);
+        // 空なら stats 自体が null。
+        assert!(group_stats(&[]).is_null());
     }
 
     /// 結果出力コマンドが測定結果を CSV で保存すること
