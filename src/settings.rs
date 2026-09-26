@@ -170,22 +170,22 @@ mod tests {
 
     #[test]
     fn language_default_and_roundtrip() {
-        assert_eq!(Settings::default().language, Language::Ja);
+        assert_eq!(Settings::default().language, Language::En);
         let json = serde_json::to_string(&Settings::default()).unwrap();
         let s: Settings = serde_json::from_str(&json).unwrap();
-        assert_eq!(s.language, Language::Ja);
+        assert_eq!(s.language, Language::En);
     }
 
     #[test]
-    fn unknown_language_falls_back_to_ja() {
+    fn unknown_language_falls_back_to_en() {
         // 手で書き換えられた保存ファイルでも、他の設定は壊さず読み込む。
         let s: Settings =
             serde_json::from_str(r#"{"language": "fr", "length_digits": 3}"#).unwrap();
-        assert_eq!(s.language, Language::Ja);
+        assert_eq!(s.language, Language::En);
         assert_eq!(s.length_digits, 3);
         // 言語フィールドが無い（旧バージョンの）保存データも読める。
         let s: Settings = serde_json::from_str(r#"{"length_digits": 2}"#).unwrap();
-        assert_eq!(s.language, Language::Ja);
+        assert_eq!(s.language, Language::En);
     }
 
     /// eframe の persistence は RON。unit バリアントが識別子として書かれると
@@ -194,9 +194,9 @@ mod tests {
     fn language_ron_roundtrip() {
         let s = Settings::default();
         let ron_text = ron::to_string(&s).unwrap();
-        assert!(ron_text.contains("language:\"ja\""), "got: {ron_text}");
+        assert!(ron_text.contains("language:\"en\""), "got: {ron_text}");
         let back: Settings = ron::from_str(&ron_text).unwrap();
-        assert_eq!(back.language, Language::Ja);
+        assert_eq!(back.language, Language::En);
         assert_eq!(back.length_digits, s.length_digits);
     }
 }

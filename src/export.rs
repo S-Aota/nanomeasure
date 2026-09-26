@@ -705,7 +705,8 @@ mod tests {
     /// 矢印頭が画面と同じ向きに開くこと（羽は線の内側へ折り返す）。
     #[test]
     fn arrow_head_matches_screen_direction() {
-        let img = Gray16::black(400, 400);
+        // base_scale は長辺 1024px で 1.0 になるので、f=1.0 の幾何で検証できる。
+        let img = Gray16::black(1024, 1024);
         let mut data = MeasureData::default();
         let g = data.group_for_new_measurement(ToolKind::Distance);
         data.tools.push(MeasureTool::Distance {
