@@ -1,5 +1,5 @@
 app:
-  title: "tem_measurer - TEM 画像解析"
+  title: "NanoMeasure - TEM 画像解析"
 
 menu:
   file: "ファイル"
@@ -86,7 +86,7 @@ dialogs:
   filter_image: "画像"
   title_insert: "画像を挿入"
   title_change_file: "読み込むファイルを変更"
-  filter_history: "コマンド履歴 (.tmrjson)"
+  filter_history: "コマンド履歴 (.nmjson)"
   filter_reg: "レジストリ ファイル"
   title_save_history: "コマンド履歴を保存"
   title_open_history: "コマンド履歴を開く"
@@ -96,7 +96,7 @@ dialogs:
 help:
   title: "操作方法"
   drag_drop: "・画像表示領域にファイルをドラッグ&ドロップすると画像を挿入します。"
-  history_files: "・コマンド履歴は .tmrjson ファイル（中身は JSON）に保存します。.tmrjson のダブルクリックやドラッグ&ドロップで履歴を開けます（関連付けの登録は ヘルプ → ファイル関連付け）。"
+  history_files: "・コマンド履歴は .nmjson ファイル（中身は JSON）に保存します。.nmjson のダブルクリックやドラッグ&ドロップで履歴を開けます（関連付けの登録は ヘルプ → ファイル関連付け）。"
   zoom: "・マウスホイールで拡大縮小（カーソル位置を中心）。"
   pan: "・右ドラッグでパン。"
   reopen_params: "・右のリストの行をダブルクリックすると、その処理のパラメータを再編集できます。"
@@ -140,10 +140,10 @@ license:
 
 assoc:
   title: "ファイルの関連付け"
-  intro: "アプリはレジストリを書き換えません。.tmrjson ファイルをダブルクリックで開けるようにするには、次の手順で関連付けを登録してください。"
+  intro: "アプリはレジストリを書き換えません。.nmjson ファイルをダブルクリックで開けるようにするには、次の手順で関連付けを登録してください。"
   step1: "1. 「関連付け用 .reg ファイルを保存...」で .reg ファイルを保存します。"
   step2: "2. 保存した .reg ファイルをエクスプローラでダブルクリックし、レジストリへの登録を確定します。"
-  step3: "3. 登録後は .tmrjson ファイルをダブルクリックすると、コマンド履歴を開いた状態で tem_measurer が起動します。"
+  step3: "3. 登録後は .nmjson ファイルをダブルクリックすると、コマンド履歴を開いた状態で NanoMeasure が起動します。"
   dev_warning: "注意: 現在は開発ビルドから登録しています。配布版の exe を置いた状態で登録し直してください。"
   exe_label: "登録される実行ファイル:"
   exe_unavailable: "実行ファイルのパスを取得できませんでした。"

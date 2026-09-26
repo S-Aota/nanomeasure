@@ -2510,6 +2510,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "nanomeasure"
+version = "1.0.0"
+dependencies = [
+ "ab_glyph",
+ "chrono",
+ "eframe",
+ "egui",
+ "egui_extras",
+ "image",
+ "imageproc",
+ "rayon",
+ "rfd",
+ "ron",
+ "rust-i18n",
+ "serde",
+ "serde_json",
+ "tiff",
+]
+
+[[package]]
 name = "ndk"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4240,26 +4260,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.6",
-]
-
-[[package]]
-name = "tem_measurer"
-version = "1.0.0"
-dependencies = [
- "ab_glyph",
- "chrono",
- "eframe",
- "egui",
- "egui_extras",
- "image",
- "imageproc",
- "rayon",
- "rfd",
- "ron",
- "rust-i18n",
- "serde",
- "serde_json",
- "tiff",
 ]
 
 [[package]]

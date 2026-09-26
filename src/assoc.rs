@@ -1,4 +1,4 @@
-//! .tmrjson ファイル関連付け用の .reg ファイル生成。
+//! .nmjson ファイル関連付け用の .reg ファイル生成。
 //!
 //! アプリ自身はレジストリを書き換えない。ヘルプメニューの「ファイルの
 //! 関連付け」ダイアログから .reg ファイルを保存し、ユーザーがエクスプローラで
@@ -21,16 +21,16 @@ pub fn reg_file_content(exe_path: &Path) -> String {
     format!(
         "Windows Registry Editor Version 5.00\r\n\
          \r\n\
-         [HKEY_CURRENT_USER\\Software\\Classes\\.tmrjson]\r\n\
-         @=\"tem_measurer.tmrjson\"\r\n\
+         [HKEY_CURRENT_USER\\Software\\Classes\\.nmjson]\r\n\
+         @=\"nanomeasure.nmjson\"\r\n\
          \r\n\
-         [HKEY_CURRENT_USER\\Software\\Classes\\tem_measurer.tmrjson]\r\n\
-         @=\"tem_measurer Command History\"\r\n\
+         [HKEY_CURRENT_USER\\Software\\Classes\\nanomeasure.nmjson]\r\n\
+         @=\"NanoMeasure Command History\"\r\n\
          \r\n\
-         [HKEY_CURRENT_USER\\Software\\Classes\\tem_measurer.tmrjson\\DefaultIcon]\r\n\
+         [HKEY_CURRENT_USER\\Software\\Classes\\nanomeasure.nmjson\\DefaultIcon]\r\n\
          @=\"\\\"{exe}\\\",0\"\r\n\
          \r\n\
-         [HKEY_CURRENT_USER\\Software\\Classes\\tem_measurer.tmrjson\\shell\\open\\command]\r\n\
+         [HKEY_CURRENT_USER\\Software\\Classes\\nanomeasure.nmjson\\shell\\open\\command]\r\n\
          @=\"\\\"{exe}\\\" \\\"%1\\\"\"\r\n",
         exe = exe,
     )
@@ -52,22 +52,22 @@ mod tests {
     /// .reg の文字列値内のエスケープ（`\` と `"` の二重化）。
     #[test]
     fn escapes_backslashes_and_quotes() {
-        let content = reg_file_content(Path::new(r"C:\My App\tem_measurer.exe"));
+        let content = reg_file_content(Path::new(r"C:\My App\nanomeasure.exe"));
         assert!(
-            content.contains("@=\"\\\"C:\\\\My App\\\\tem_measurer.exe\\\" \\\"%1\\\"\""),
+            content.contains("@=\"\\\"C:\\\\My App\\\\nanomeasure.exe\\\" \\\"%1\\\"\""),
             "コマンド行がエスケープされる: {content}"
         );
     }
 
-    /// 生成される .reg が .tmrjson の関連付け一式を含むこと。
+    /// 生成される .reg が .nmjson の関連付け一式を含むこと。
     #[test]
     fn contains_expected_keys() {
-        let content = reg_file_content(Path::new(r"C:\app\tem_measurer.exe"));
+        let content = reg_file_content(Path::new(r"C:\app\nanomeasure.exe"));
         assert!(content.contains("Windows Registry Editor Version 5.00"));
-        assert!(content.contains(r"[HKEY_CURRENT_USER\Software\Classes\.tmrjson]"));
-        assert!(content.contains(r#"@="tem_measurer.tmrjson""#));
+        assert!(content.contains(r"[HKEY_CURRENT_USER\Software\Classes\.nmjson]"));
+        assert!(content.contains(r#"@="nanomeasure.nmjson""#));
         assert!(content.contains(
-            r"[HKEY_CURRENT_USER\Software\Classes\tem_measurer.tmrjson\shell\open\command]"
+            r"[HKEY_CURRENT_USER\Software\Classes\nanomeasure.nmjson\shell\open\command]"
         ));
         assert!(content.contains(r#"\"%1\""#), "%1 がエスケープ付きで入る");
     }
@@ -76,14 +76,14 @@ mod tests {
     /// （UTF-16LE で書き出すので regedit がそのまま読める）。
     #[test]
     fn non_ascii_path_kept_verbatim() {
-        let content = reg_file_content(Path::new(r"C:\日本語\tem_measurer.exe"));
+        let content = reg_file_content(Path::new(r"C:\日本語\nanomeasure.exe"));
         assert!(content.contains("日本語"));
     }
 
     /// バイト列は BOM 付き UTF-16LE で、テキストとラウンドトリップすること。
     #[test]
     fn utf16le_with_bom() {
-        let path = Path::new(r"C:\日本語\tem_measurer.exe");
+        let path = Path::new(r"C:\日本語\nanomeasure.exe");
         let bytes = reg_file_bytes(&path);
         assert_eq!(&bytes[..2], &[0xFF, 0xFE], "先頭は UTF-16LE BOM");
         let text = reg_file_content(&path);
@@ -103,7 +103,7 @@ mod tests {
     /// 行末は CRLF のみ（単独の LF を含まない）こと。
     #[test]
     fn crlf_line_endings() {
-        let content = reg_file_content(Path::new(r"C:\app\tem_measurer.exe"));
+        let content = reg_file_content(Path::new(r"C:\app\nanomeasure.exe"));
         assert!(content.contains("\r\n"));
         let bare_lf = content
             .as_bytes()

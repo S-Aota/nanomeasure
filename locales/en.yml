@@ -1,5 +1,5 @@
 app:
-  title: "tem_measurer - TEM Image Analysis"
+  title: "NanoMeasure - TEM Image Analysis"
 
 menu:
   file: "File"
@@ -86,7 +86,7 @@ dialogs:
   filter_image: "Image"
   title_insert: "Insert Image"
   title_change_file: "Change File to Load"
-  filter_history: "Command History (.tmrjson)"
+  filter_history: "Command History (.nmjson)"
   filter_reg: "Registry File"
   title_save_history: "Save Command History"
   title_open_history: "Open Command History"
@@ -96,7 +96,7 @@ dialogs:
 help:
   title: "How to Use"
   drag_drop: "・Drag & drop a file onto the image area to insert the image."
-  history_files: "・Command histories are saved as .tmrjson files (JSON inside). Double-click a .tmrjson file or drop it onto the window to open the history (to register the association, see Help → File Association)."
+  history_files: "・Command histories are saved as .nmjson files (JSON inside). Double-click a .nmjson file or drop it onto the window to open the history (to register the association, see Help → File Association)."
   zoom: "・Mouse wheel zooms in/out (centered on the cursor)."
   pan: "・Right-drag to pan."
   reopen_params: "・Double-click a row in the right-hand list to edit that process's parameters again."
@@ -140,10 +140,10 @@ license:
 
 assoc:
   title: "File Association"
-  intro: "The app does not modify the registry. To open .tmrjson files by double-clicking, register the association with the steps below."
+  intro: "The app does not modify the registry. To open .nmjson files by double-clicking, register the association with the steps below."
   step1: "1. Click \"Save .reg File...\" to save a .reg file."
   step2: "2. Double-click the saved .reg file in Explorer and confirm the registration."
-  step3: "3. Afterwards, double-clicking a .tmrjson file starts tem_measurer with the command history opened."
+  step3: "3. Afterwards, double-clicking a .nmjson file starts NanoMeasure with the command history opened."
   dev_warning: "Note: you are registering from a development build. Re-register using the installed release exe."
   exe_label: "Executable to register:"
   exe_unavailable: "Could not get the executable path."

@@ -84,7 +84,7 @@ pub struct TemApp {
     about_open: bool,
     /// ライセンス全文の表示。
     license_open: bool,
-    /// .tmrjson ファイル関連付けの案内ダイアログ。
+    /// .nmjson ファイル関連付けの案内ダイアログ。
     assoc_open: bool,
     /// 編集中にタブ切り替えを試みたときの警告。編集中なら切り替えず、
     /// ポップアップを出して操作を無効化する。
@@ -737,7 +737,7 @@ impl TemApp {
             .open(&mut about_open)
             .resizable(false)
             .show(ctx, |ui| {
-                ui.label(format!("tem_measurer {}", env!("CARGO_PKG_VERSION")));
+                ui.label(format!("NanoMeasure {}", env!("CARGO_PKG_VERSION")));
                 ui.label(t!("about.description").as_ref());
                 ui.label(t!("about.bit_depth").as_ref());
                 ui.label(t!("about.license").as_ref());
@@ -1124,8 +1124,8 @@ impl TemApp {
 
     fn save_history(&mut self) {
         let Some(path) = rfd::FileDialog::new()
-            .add_filter(t!("dialogs.filter_history").as_ref(), &["tmrjson"])
-            .set_file_name("history.tmrjson")
+            .add_filter(t!("dialogs.filter_history").as_ref(), &["nmjson"])
+            .set_file_name("history.nmjson")
             .set_title(t!("dialogs.title_save_history").as_ref())
             .save_file()
         else {
@@ -1153,7 +1153,7 @@ impl TemApp {
         };
         let Some(path) = rfd::FileDialog::new()
             .add_filter(t!("dialogs.filter_reg").as_ref(), &["reg"])
-            .set_file_name("tem_measurer_association.reg")
+            .set_file_name("nanomeasure_association.reg")
             .set_title(t!("assoc.title").as_ref())
             .save_file()
         else {
@@ -1179,7 +1179,7 @@ impl TemApp {
 
     fn open_history(&mut self) {
         let Some(path) = rfd::FileDialog::new()
-            .add_filter(t!("dialogs.filter_history").as_ref(), &["tmrjson"])
+            .add_filter(t!("dialogs.filter_history").as_ref(), &["nmjson"])
             .set_title(t!("dialogs.title_open_history").as_ref())
             .pick_file()
         else {
@@ -1224,7 +1224,7 @@ impl TemApp {
 
     fn apply_history(&mut self) {
         let Some(path) = rfd::FileDialog::new()
-            .add_filter(t!("dialogs.filter_history").as_ref(), &["tmrjson"])
+            .add_filter(t!("dialogs.filter_history").as_ref(), &["nmjson"])
             .set_title(t!("dialogs.title_apply_history").as_ref())
             .pick_file()
         else {
@@ -1480,10 +1480,10 @@ fn file_label(path: &std::path::Path) -> String {
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
-/// コマンド履歴ファイル（.tmrjson）かどうか。
+/// コマンド履歴ファイル（.nmjson）かどうか。
 fn is_history_file(path: &std::path::Path) -> bool {
     path.extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case("tmrjson"))
+        .is_some_and(|e| e.eq_ignore_ascii_case("nmjson"))
 }
 
 #[cfg(test)]
@@ -1532,22 +1532,22 @@ mod i18n_tests {
             }
             let copied = t!("status.copied_count", count = 3).into_owned();
             assert!(!copied.contains("status.copied_count"));
-            // 履歴フィルタは .tmrjson 表記（旧 .json への後退防止）。
+            // 履歴フィルタは .nmjson 表記（旧 .json への後退防止）。
             let filter = t!("dialogs.filter_history").into_owned();
             assert!(
-                filter.contains("tmrjson"),
-                "locale {locale}: filter_history に .tmrjson が入ること: {filter}"
+                filter.contains("nmjson"),
+                "locale {locale}: filter_history に .nmjson が入ること: {filter}"
             );
         }
         // 他のテストに影響しないよう、既定の言語へ戻す。
         rust_i18n::set_locale(crate::settings::Language::default().code());
     }
 
-    /// 履歴ファイル判定は .tmrjson のみ（大文字小文字は無視）。
+    /// 履歴ファイル判定は .nmjson のみ（大文字小文字は無視）。
     #[test]
-    fn is_history_file_matches_tmrjson_only() {
-        assert!(super::is_history_file(std::path::Path::new("a.tmrjson")));
-        assert!(super::is_history_file(std::path::Path::new("A.TMRJSON")));
+    fn is_history_file_matches_nmjson_only() {
+        assert!(super::is_history_file(std::path::Path::new("a.nmjson")));
+        assert!(super::is_history_file(std::path::Path::new("A.NMJSON")));
         assert!(!super::is_history_file(std::path::Path::new("a.json")));
         assert!(!super::is_history_file(std::path::Path::new("a.tif")));
         assert!(!super::is_history_file(std::path::Path::new("noext")));

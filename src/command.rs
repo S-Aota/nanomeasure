@@ -347,7 +347,7 @@ impl CommandItem {
     }
 }
 
-/// `.tmrjson`（中身は JSON）に書き出すコマンド履歴。
+/// `.nmjson`（中身は JSON）に書き出すコマンド履歴。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HistoryFile {
     pub app: String,
@@ -357,7 +357,7 @@ pub struct HistoryFile {
 impl HistoryFile {
     pub fn new(commands: Vec<CommandItem>) -> Self {
         Self {
-            app: "tem_measurer".to_owned(),
+            app: "nanomeasure".to_owned(),
             commands,
         }
     }
@@ -506,7 +506,7 @@ mod tests {
     #[test]
     fn history_without_measure_commands_still_loads() {
         let json = r#"{
-            "app": "tem_measurer",
+            "app": "nanomeasure",
             "version": 3,
             "commands": [
                 {"enabled": true, "command": {"type": "InsertImage", "path": "a.tif"}},

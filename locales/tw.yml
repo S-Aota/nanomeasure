@@ -1,5 +1,5 @@
 app:
-  title: "tem_measurer - TEM 影像分析"
+  title: "NanoMeasure - TEM 影像分析"
 
 menu:
   file: "檔案"
@@ -86,7 +86,7 @@ dialogs:
   filter_image: "影像"
   title_insert: "插入影像"
   title_change_file: "變更要讀取的檔案"
-  filter_history: "命令紀錄 (.tmrjson)"
+  filter_history: "命令紀錄 (.nmjson)"
   filter_reg: "登錄檔"
   title_save_history: "儲存命令紀錄"
   title_open_history: "開啟命令紀錄"
@@ -96,7 +96,7 @@ dialogs:
 help:
   title: "操作方法"
   drag_drop: "・將檔案拖放到影像顯示區域即可插入影像。"
-  history_files: "・命令紀錄儲存為 .tmrjson 檔案（內容為 JSON）。按兩下 .tmrjson 或將其拖放到視窗中即可開啟紀錄（關聯的登錄方法見 說明 → 檔案關聯）。"
+  history_files: "・命令紀錄儲存為 .nmjson 檔案（內容為 JSON）。按兩下 .nmjson 或將其拖放到視窗中即可開啟紀錄（關聯的登錄方法見 說明 → 檔案關聯）。"
   zoom: "・使用滑鼠滾輪放大縮小（以游標位置為中心）。"
   pan: "・右鍵拖曳平移。"
   reopen_params: "・在右側清單的列上按兩下，可重新編輯該處理的參數。"
@@ -140,10 +140,10 @@ license:
 
 assoc:
   title: "檔案關聯"
-  intro: "本應用程式不會修改登錄檔。要透過按兩下開啟 .tmrjson 檔案，請依下列步驟登錄關聯。"
+  intro: "本應用程式不會修改登錄檔。要透過按兩下開啟 .nmjson 檔案，請依下列步驟登錄關聯。"
   step1: "1. 按一下「儲存關聯用 .reg 檔案...」儲存 .reg 檔案。"
   step2: "2. 在檔案總管中按兩下儲存的 .reg 檔案，確認登錄檔登錄。"
-  step3: "3. 登錄後，按兩下 .tmrjson 檔案即可啟動 tem_measurer 並開啟命令紀錄。"
+  step3: "3. 登錄後，按兩下 .nmjson 檔案即可啟動 NanoMeasure 並開啟命令紀錄。"
   dev_warning: "注意: 目前是從開發版登錄。請使用已安裝的發行版 exe 重新登錄。"
   exe_label: "要登錄的可執行檔:"
   exe_unavailable: "無法取得可執行檔路徑。"
