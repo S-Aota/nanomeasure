@@ -122,7 +122,7 @@ help:
   measure_duplicate_ctrl: "・範囲選択の枠の中を Ctrl キーを押しながらドラッグすると、選択中の測長を複製します（設定の「複製」に従います）。"
   measure_delete: "・削除: ツールの「削除」で、測長・補助線をクリックで削除、ドラッグで矩形内のものを一括削除します。"
   export_image_note: "・画像出力: コマンド → 出力 → 画像出力... でアノテーション付き画像の保存先を設定します（tif / png / jpg）。「再計算」(F5) で保存されます。"
-  export_result_note: "・結果出力: コマンド → 出力 → 結果出力... で測定結果 JSON の保存先を設定します。「再計算」(F5) で保存されます。"
+  export_result_note: "・結果出力: コマンド → 出力 → 結果出力... で測定結果 JSON / CSV の保存先と形式を設定します。「再計算」(F5) で保存されます。"
   pan_zoom_again: "・右ドラッグでパン、ホイールでズームできます（測長モード中も同じ）。"
 
 about:
@@ -159,7 +159,7 @@ cmd:
   filter: "フィルタ: %{name}"
   measure: "測長: グループ %{groups} 件 / 測定 %{count} 件"
   export_image: "画像出力: %{output}%{mode}"
-  export_result: "結果出力: %{output}"
+  export_result: "結果出力 (%{format}): %{output}"
   color_suffix: "（カラー）"
   scale_positive: "画素数と実寸法には正の値を入れてください"
   no_input: "入力画像がありません（先に画像を挿入してください）"
@@ -197,7 +197,8 @@ dlg:
   annotation_scale: "アノテーション倍率"
   annotation_scale_hint: "線の太さや文字の大きさは画像の解像度に合わせて自動調整されます。この値はそれに掛ける係数です。"
   result_title: "結果出力"
-  result_intro: "測長の測定結果を JSON で保存します。"
+  result_intro: "測長の測定結果を JSON または CSV で保存します。"
+  result_format: "形式:"
   filter_title: "フィルタ"
   filter_intro: "画像を整える前処理フィルタです。端は最外周の画素値で埋めて計算します。"
   filter_gaussian: "ガウシアンぼかし"

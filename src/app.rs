@@ -7,7 +7,8 @@ use egui::Ui;
 use rust_i18n::t;
 
 use crate::command::{
-    Command, CommandCategory, CommandItem, Filter, FilterKind, HistoryFile, load_image,
+    Command, CommandCategory, CommandItem, Filter, FilterKind, HistoryFile, ResultFormat,
+    load_image,
 };
 use crate::dialogs::{
     ExportDialog, ExportResultDialog, FilterDialog, LevelsDialog, RotateDialog, ScaleDialog,
@@ -1022,7 +1023,10 @@ impl TemApp {
                 Command::ExportImage { .. } => {
                     crate::export::save_image_export(doc, i, skip, digits)
                 }
-                Command::ExportResult { .. } => crate::export::save_result_json(doc, i),
+                Command::ExportResult { format, .. } => match format {
+                    ResultFormat::Json => crate::export::save_result_json(doc, i),
+                    ResultFormat::Csv => crate::export::save_result_csv(doc, i),
+                },
                 _ => continue,
             };
             match result {

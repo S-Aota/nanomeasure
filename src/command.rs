@@ -147,12 +147,36 @@ pub enum Command {
         #[serde(default)]
         color: bool,
     },
-    /// 測定結果 JSON の書き出し。画像は変えず、出力先テンプレートを保持する。
+    /// 測定結果の書き出し。画像は変えず、出力先テンプレートと形式を保持する。
     /// ファイル保存は「再計算」(F5) のときにアプリ側で行う（画像出力コマンドと同じ）。
     ExportResult {
         /// 出力先テンプレート。`{dir}` / `{filename}` は保存時に画像パスから解決。
         output: String,
+        /// 出力形式。旧データ（キーなし）は JSON 扱い。
+        #[serde(default)]
+        format: ResultFormat,
     },
+}
+
+/// 測定結果の出力形式。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResultFormat {
+    /// グループごとにまとめた JSON。
+    #[default]
+    Json,
+    /// 先頭にメタデータ行を持つ CSV。
+    Csv,
+}
+
+impl ResultFormat {
+    /// コマンドラベルなどに出す短い名前。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Json => "JSON",
+            Self::Csv => "CSV",
+        }
+    }
 }
 
 fn default_annotation_scale() -> f32 {
@@ -208,7 +232,10 @@ impl Command {
                 };
                 t!("cmd.export_image", output = output, mode = mode).into_owned()
             }
-            Self::ExportResult { output } => t!("cmd.export_result", output = output).into_owned(),
+            Self::ExportResult { output, format } => {
+                t!("cmd.export_result", output = output, format = format.label())
+                    .into_owned()
+            }
         }
     }
 
@@ -436,6 +463,7 @@ mod tests {
         assert_eq!(export.category(), CommandCategory::Output);
         let result = Command::ExportResult {
             output: "a.json".into(),
+            format: ResultFormat::Json,
         };
         assert_eq!(result.category(), CommandCategory::Output);
         let filter = Command::Filter {
@@ -529,15 +557,28 @@ mod tests {
         );
     }
 
-    /// 結果出力コマンドの JSON ラウンドトリップ。
+    /// 結果出力コマンドの JSON ラウンドトリップ。format が無い JSON は
+    /// 既定値（JSON）で読めること。
     #[test]
     fn export_result_command_round_trips() {
-        let cmd = Command::ExportResult {
-            output: "{dir}/{filename}_result.json".to_owned(),
-        };
-        let json = serde_json::to_string(&cmd).unwrap();
-        let back: Command = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, cmd);
+        for format in [ResultFormat::Json, ResultFormat::Csv] {
+            let cmd = Command::ExportResult {
+                output: "{dir}/{filename}_result.json".to_owned(),
+                format,
+            };
+            let json = serde_json::to_string(&cmd).unwrap();
+            let back: Command = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, cmd);
+        }
+        let missing: Command =
+            serde_json::from_str(r#"{"type":"ExportResult","output":"a.json"}"#).unwrap();
+        assert_eq!(
+            missing,
+            Command::ExportResult {
+                output: "a.json".to_owned(),
+                format: ResultFormat::Json,
+            }
+        );
     }
 
     /// 8bit の入力画像は 16bit へ拡張されず、8bit のまま読み込まれること。

@@ -122,7 +122,7 @@ help:
   measure_duplicate_ctrl: "・Ctrl-drag inside the range-select box to duplicate the selected measurements (follows the \"Duplicate\" setting)."
   measure_delete: "・Delete: with the \"Delete\" tool, click a measurement or helper line to delete it, or drag to delete everything inside the rectangle at once."
   export_image_note: "・Image Output: set the save destination for the annotated image via Command → Output → Image Output... (tif / png / jpg). Saved when you press \"Recompute\" (F5)."
-  export_result_note: "・Result Output: set the save destination for the measurement result JSON via Command → Output → Result Output... Saved when you press \"Recompute\" (F5)."
+  export_result_note: "・Result Output: set the save destination and format (JSON / CSV) for the measurement results via Command → Output → Result Output... Saved when you press \"Recompute\" (F5)."
   pan_zoom_again: "・Right-drag to pan and use the wheel to zoom (same in measure mode)."
 
 about:
@@ -159,7 +159,7 @@ cmd:
   filter: "Filter: %{name}"
   measure: "Measure: %{groups} groups / %{count} measurements"
   export_image: "Image output: %{output}%{mode}"
-  export_result: "Result output: %{output}"
+  export_result: "Result output (%{format}): %{output}"
   color_suffix: " (color)"
   scale_positive: "Enter positive values for pixels and real length"
   no_input: "No input image (insert an image first)"
@@ -197,7 +197,8 @@ dlg:
   annotation_scale: "Annotation scale"
   annotation_scale_hint: "Line thickness and text size are adjusted automatically to the image resolution. This value is the factor applied on top of that."
   result_title: "Result Output"
-  result_intro: "Saves measurement results as JSON."
+  result_intro: "Saves measurement results as JSON or CSV."
+  result_format: "Format:"
   filter_title: "Filter"
   filter_intro: "A preprocessing filter to condition the image. The edges are filled with the outermost pixel values during computation."
   filter_gaussian: "Gaussian blur"

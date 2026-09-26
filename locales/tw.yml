@@ -122,7 +122,7 @@ help:
   measure_duplicate_ctrl: "・在範圍選取的框內按住 Ctrl 鍵拖曳，可複製選取的測量（遵循設定中的「複製」）。"
   measure_delete: "・刪除: 使用工具的「刪除」，按一下測量・輔助線將其刪除，拖曳可批次刪除矩形內的物件。"
   export_image_note: "・影像輸出: 透過 命令 → 輸出 → 影像輸出... 設定含標註影像的儲存位置（tif / png / jpg）。按下「重新計算」(F5) 後儲存。"
-  export_result_note: "・結果輸出: 透過 命令 → 輸出 → 結果輸出... 設定測量結果 JSON 的儲存位置。按下「重新計算」(F5) 後儲存。"
+  export_result_note: "・結果輸出: 透過 命令 → 輸出 → 結果輸出... 設定測量結果 JSON / CSV 的儲存位置與格式。按下「重新計算」(F5) 後儲存。"
   pan_zoom_again: "・右鍵拖曳平移，滾輪縮放（測量模式中亦同）。"
 
 about:
@@ -159,7 +159,7 @@ cmd:
   filter: "濾鏡: %{name}"
   measure: "測量: %{groups} 個群組 / %{count} 個測量"
   export_image: "影像輸出: %{output}%{mode}"
-  export_result: "結果輸出: %{output}"
+  export_result: "結果輸出 (%{format}): %{output}"
   color_suffix: "（彩色）"
   scale_positive: "像素數與實際尺寸請使用正值"
   no_input: "沒有輸入影像（請先插入影像）"
@@ -197,7 +197,8 @@ dlg:
   annotation_scale: "標註倍率"
   annotation_scale_hint: "線條粗細和文字大小會根據影像解析度自動調整。此值為疊加的係數。"
   result_title: "結果輸出"
-  result_intro: "將測量結果儲存為 JSON。"
+  result_intro: "將測量結果儲存為 JSON 或 CSV。"
+  result_format: "格式:"
   filter_title: "濾鏡"
   filter_intro: "用於整理影像的前處理濾鏡。計算時邊緣以最外圈的像素值填補。"
   filter_gaussian: "高斯模糊"

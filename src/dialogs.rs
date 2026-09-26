@@ -10,7 +10,7 @@ use egui::{Color32, Context, Sense, Vec2};
 
 use rust_i18n::t;
 
-use crate::command::{Command, Filter, FilterKind};
+use crate::command::{Command, Filter, FilterKind, ResultFormat};
 use crate::document::Document;
 use crate::frame::LengthUnit;
 use crate::gray::Gray16;
@@ -718,7 +718,8 @@ impl ExportDialog {
 
 // -------------------------------------------------------------- 結果出力
 
-/// 測定結果 JSON の出力先テンプレートを入力する（画像出力と同じ方式）。
+/// 測定結果（JSON / CSV）の出力先テンプレートと形式を入力する
+/// （画像出力と同じ方式）。
 #[derive(Default)]
 pub struct ExportResultDialog {
     pub open: bool,
@@ -726,12 +727,14 @@ pub struct ExportResultDialog {
     created: bool,
     original: Option<Command>,
     output: String,
+    format: ResultFormat,
 }
 
 impl ExportResultDialog {
     pub fn open_new(&mut self, doc: &mut Document) {
         let index = doc.push_command(Command::ExportResult {
             output: crate::export::DEFAULT_RESULT_PATH.to_owned(),
+            format: ResultFormat::Json,
         });
         self.start(doc, index, true);
     }
@@ -742,10 +745,16 @@ impl ExportResultDialog {
 
     fn start(&mut self, doc: &Document, index: usize, created: bool) {
         let original = doc.commands.get(index).map(|c| c.command.clone());
-        self.output = match &original {
-            Some(Command::ExportResult { output }) => output.clone(),
-            _ => crate::export::DEFAULT_RESULT_PATH.to_owned(),
-        };
+        match &original {
+            Some(Command::ExportResult { output, format }) => {
+                self.output = output.clone();
+                self.format = *format;
+            }
+            _ => {
+                self.output = crate::export::DEFAULT_RESULT_PATH.to_owned();
+                self.format = ResultFormat::Json;
+            }
+        }
         self.index = Some(index);
         self.created = created;
         self.original = original;
@@ -778,10 +787,14 @@ impl ExportResultDialog {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     ui.label(t!("dlg.output_path").as_ref());
+                    let hint = match self.format {
+                        ResultFormat::Json => crate::export::DEFAULT_RESULT_PATH,
+                        ResultFormat::Csv => crate::export::DEFAULT_CSV_PATH,
+                    };
                     ui.add(
                         egui::TextEdit::singleline(&mut self.output)
                             .desired_width(330.0)
-                            .hint_text(crate::export::DEFAULT_RESULT_PATH),
+                            .hint_text(hint),
                     );
                 });
                 ui.label(t!("dlg.template_hint").as_ref());
@@ -791,6 +804,35 @@ impl ExportResultDialog {
                         t!("dlg.enter_output").as_ref(),
                     );
                 }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label(t!("dlg.result_format").as_ref());
+                    let before = self.format;
+                    egui::ComboBox::from_id_salt("result_format")
+                        .selected_text(self.format.label())
+                        .show_ui(ui, |ui| {
+                            for format in [ResultFormat::Json, ResultFormat::Csv] {
+                                ui.selectable_value(&mut self.format, format, format.label());
+                            }
+                        });
+                    if self.format != before {
+                        // 形式が変わったらテンプレート末尾の拡張子を合わせる
+                        // （既定の拡張子のままのときだけ書き換える）。
+                        let (ext, other) = match self.format {
+                            ResultFormat::Csv => (".csv", ".json"),
+                            ResultFormat::Json => (".json", ".csv"),
+                        };
+                        if self
+                            .output
+                            .trim_end()
+                            .to_ascii_lowercase()
+                            .ends_with(other)
+                        {
+                            let cut = self.output[..self.output.len() - other.len()].to_owned();
+                            self.output = format!("{cut}{ext}");
+                        }
+                    }
+                });
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     let valid = !self.output.trim().is_empty();
@@ -812,6 +854,7 @@ impl ExportResultDialog {
             index,
             Command::ExportResult {
                 output: self.output.clone(),
+                format: self.format,
             },
         );
 

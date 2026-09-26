@@ -122,7 +122,7 @@ help:
   measure_duplicate_ctrl: "・범위 선택 상자 안에서 Ctrl 키를 누른 채 드래그하면 선택 중인 측정을 복제합니다(설정의 「복제」를 따릅니다)."
   measure_delete: "・삭제: 도구의 「삭제」로 측정·보조선을 클릭으로 삭제, 드래그로 사각형 안의 것을 일괄 삭제합니다."
   export_image_note: "・이미지 출력: 명령 → 출력 → 이미지 출력... 으로 주석 있는 이미지의 저장 위치를 설정합니다(tif / png / jpg). 「다시 계산」(F5)으로 저장됩니다."
-  export_result_note: "・결과 출력: 명령 → 출력 → 결과 출력... 으로 측정 결과 JSON의 저장 위치를 설정합니다. 「다시 계산」(F5)으로 저장됩니다."
+  export_result_note: "・결과 출력: 명령 → 출력 → 결과 출력... 으로 측정 결과 JSON / CSV의 저장 위치와 형식을 설정합니다. 「다시 계산」(F5)으로 저장됩니다."
   pan_zoom_again: "・오른쪽 드래그로 팬, 휠로 줌할 수 있습니다(측정 모드 중에도 동일)."
 
 about:
@@ -159,7 +159,7 @@ cmd:
   filter: "필터: %{name}"
   measure: "측정: 그룹 %{groups}개 / 측정 %{count}개"
   export_image: "이미지 출력: %{output}%{mode}"
-  export_result: "결과 출력: %{output}"
+  export_result: "결과 출력 (%{format}): %{output}"
   color_suffix: "（컬러）"
   scale_positive: "화소 수와 실제 치수에는 양수를 입력하세요"
   no_input: "입력 이미지가 없습니다（먼저 이미지를 삽입하세요）"
@@ -197,7 +197,8 @@ dlg:
   annotation_scale: "주석 배율"
   annotation_scale_hint: "선 굵기와 글자 크기는 이미지 해상도에 맞게 자동 조정됩니다. 이 값은 거기에 곱하는 계수입니다."
   result_title: "결과 출력"
-  result_intro: "측정 결과를 JSON으로 저장합니다."
+  result_intro: "측정 결과를 JSON 또는 CSV로 저장합니다."
+  result_format: "형식:"
   filter_title: "필터"
   filter_intro: "이미지를 다듬는 전처리 필터입니다. 가장자리는 최외곽 화소 값으로 채워 계산합니다."
   filter_gaussian: "가우시안 블러"

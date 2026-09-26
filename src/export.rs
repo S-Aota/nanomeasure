@@ -22,7 +22,7 @@ use rust_i18n::t;
 
 use crate::command::Command;
 use crate::document::Document;
-use crate::frame::Scale;
+use crate::frame::{Frame, Scale};
 use crate::gray::Gray16;
 use crate::measure::{ComputedMeasure, Pt2, ToolKind, format_angle, format_measurement};
 use crate::measure_mode::{COLOR_DISTANCE, COLOR_GUIDE, region_edge_colors};
@@ -32,6 +32,9 @@ pub const DEFAULT_EXPORT_PATH: &str = "{dir}/{filename}_result.jpg";
 
 /// 測定結果 JSON の出力先テンプレートの既定値。
 pub const DEFAULT_RESULT_PATH: &str = "{dir}/{filename}_result.json";
+
+/// 測定結果 CSV の出力先テンプレートの既定値。
+pub const DEFAULT_CSV_PATH: &str = "{dir}/{filename}_result.csv";
 
 /// 対応している出力形式の拡張子。拡張子の大文字小文字は無視する。
 pub const SUPPORTED_EXTENSIONS: &[&str] = &["tif", "tiff", "png", "jpg", "jpeg"];
@@ -229,16 +232,16 @@ pub fn save_image_export(
     Ok(Some(path))
 }
 
-/// 測定結果をまとめて JSON で保存する。`index` は結果出力コマンドの位置。
-/// 同じフレームに効いている測長コマンド（画像の `Arc` が一致するもの）を
-/// パイプライン順に集め、グループを連結した 1 つの JSON を書き出す。
-/// 出力先は `output` テンプレート（`{dir}` / `{filename}` は画像パスから
-/// 解決）。空文字列のときは保存しない（Ok(None)）。戻り値は実際に保存したパス。
-pub fn save_result_json(doc: &Document, index: usize) -> Result<Option<PathBuf>, String> {
+/// 結果出力コマンド（JSON / CSV 共通）の出力先と入力フレームを解決する。
+/// 出力先テンプレートが空のときは保存しない（Ok(None)）。
+fn result_target(
+    doc: &Document,
+    index: usize,
+) -> Result<Option<(PathBuf, PathBuf, &Frame)>, String> {
     let Some(item) = doc.commands.get(index) else {
         return Err(t!("exp.not_result_command").into_owned());
     };
-    let Command::ExportResult { output } = &item.command else {
+    let Command::ExportResult { output, .. } = &item.command else {
         return Err(t!("exp.not_result_command").into_owned());
     };
     let template = output.trim();
@@ -249,22 +252,162 @@ pub fn save_result_json(doc: &Document, index: usize) -> Result<Option<PathBuf>,
         .image_path_at(index)
         .ok_or_else(|| t!("exp.no_image").into_owned())?
         .to_path_buf();
-    let Some(frame) = doc.input_to(index) else {
-        return Err(t!("exp.no_result").into_owned());
-    };
+    let frame = doc
+        .input_to(index)
+        .ok_or_else(|| t!("exp.no_result").into_owned())?;
     let path = resolve_output_path(template, &img_path);
-    // JSON の先頭にはファイル名を出す。
+    Ok(Some((path, img_path, frame)))
+}
+
+/// 結果ファイル（JSON / CSV 共通）のメタデータ。
+/// キー名は CSV のメタデータ行と JSON のキーの両方にそのまま使う。
+struct ResultMeta {
+    filename: String,
+    /// 出力日時（ローカル時刻の RFC 3339）。
+    exported_at: String,
+    /// 1 画素の実寸法（nm）。スケール未設定なら `None`。
+    scale_nm_per_px: Option<f64>,
+    image_width: u32,
+    image_height: u32,
+    /// 画素値のビット深度（8 または 16）。
+    bit_depth: u8,
+    /// 画像全体の実寸法（例: "95.76 x 95.76 nm"）。スケール未設定なら `None`。
+    image_extent: Option<String>,
+    /// 距離の単位（スケール未設定なら "px"）。
+    unit: String,
+    /// 測定値の総数（表示番号の付いた二点間測長・角度）。
+    measurement_count: usize,
+    app: &'static str,
+    app_version: &'static str,
+}
+
+impl ResultMeta {
+    /// CSV 先頭のメタデータ行（キーと値の列）。
+    fn csv_rows(&self) -> Vec<(String, String)> {
+        let opt = |v: &Option<String>| v.clone().unwrap_or_default();
+        vec![
+            ("filename".to_owned(), self.filename.clone()),
+            ("exported_at".to_owned(), self.exported_at.clone()),
+            (
+                "scale_nm_per_px".to_owned(),
+                self.scale_nm_per_px.map(|v| v.to_string()).unwrap_or_default(),
+            ),
+            ("image_width".to_owned(), self.image_width.to_string()),
+            ("image_height".to_owned(), self.image_height.to_string()),
+            ("bit_depth".to_owned(), self.bit_depth.to_string()),
+            ("image_extent".to_owned(), opt(&self.image_extent)),
+            ("unit".to_owned(), self.unit.clone()),
+            ("measurement_count".to_owned(), self.measurement_count.to_string()),
+            ("app".to_owned(), self.app.to_owned()),
+            ("app_version".to_owned(), self.app_version.to_owned()),
+        ]
+    }
+}
+
+fn result_meta(img_path: &Path, frame: &Frame, measurement_count: usize) -> ResultMeta {
     let filename = img_path
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "image".to_owned());
-    // 単位は JSON 先頭の unit にまとめ、各測定値からは落とす。
     // スケールはパイプラインを前方へ伝播するので、結果出力コマンドの
     // フレームのスケールは各測長コマンドのものと一致する。
     let unit = frame
         .scale
         .map(|s| s.unit.label().to_owned())
         .unwrap_or_else(|| "px".to_owned());
+    let image_extent = frame.scale.map(|s| {
+        let (u, w, h) = s.extent(frame.image.width, frame.image.height);
+        format!("{} x {} {}", w, h, u.label())
+    });
+    ResultMeta {
+        filename,
+        exported_at: chrono::Local::now().to_rfc3339(),
+        scale_nm_per_px: frame.scale.map(|s| s.nm_per_px),
+        image_width: frame.image.width,
+        image_height: frame.image.height,
+        bit_depth: frame.image.depth,
+        image_extent,
+        unit,
+        measurement_count,
+        app: env!("CARGO_PKG_NAME"),
+        app_version: env!("CARGO_PKG_VERSION"),
+    }
+}
+
+/// 結果ファイルの表部分の 1 行（測定値 1 つ。二点間測長・角度のみ）。
+struct ResultRow {
+    /// 所属グループの名前。
+    group: String,
+    /// 結果リストの表示番号（# の後ろに続く番号）。
+    number: Option<usize>,
+    /// 測定タイプ（グループの種類）。
+    kind: ToolKind,
+    /// 測定値。距離はスケール換算した長さ、角度は °。
+    value: f64,
+    /// 値の単位。距離はスケールの単位（未設定なら "px"）、角度は "°"。
+    unit: String,
+}
+
+/// 表示番号の付いた測定値（二点間測長・角度）を、グループ順 → 番号順に集める。
+fn result_rows(doc: &Document, frame: &Frame) -> Vec<ResultRow> {
+    let mut rows = Vec::new();
+    for overlay in doc.measure_overlays(&frame.image, None) {
+        let (data, computed) = (overlay.data, &overlay.computed);
+        for g in &data.groups {
+            for tid in data.group_tools(g.id) {
+                let Some(t) = computed.by_id(tid) else {
+                    continue;
+                };
+                let (value, unit) = match t.kind {
+                    ToolKind::Angle => {
+                        let Some(deg) = t.angle_deg else { continue };
+                        (deg, "°".to_owned())
+                    }
+                    _ => {
+                        let Some(len) = t.length_px else { continue };
+                        let value = overlay
+                            .scale
+                            .map(|s| len * s.per_px())
+                            .unwrap_or(len);
+                        let unit = overlay
+                            .scale
+                            .map(|s| s.unit.label().to_owned())
+                            .unwrap_or_else(|| "px".to_owned());
+                        (value, unit)
+                    }
+                };
+                rows.push(ResultRow {
+                    group: g.name.clone(),
+                    number: computed.number(tid),
+                    kind: g.kind(),
+                    value,
+                    unit,
+                });
+            }
+        }
+    }
+    rows
+}
+
+/// CSV の 1 フィールドをエスケープする。コンマ・引用符・改行を含むときは
+/// 引用符で囲み、中の引用符は 2 重にする（RFC 4180）。
+fn csv_escape(s: &str) -> String {
+    if s.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_owned()
+    }
+}
+
+/// 測定結果をまとめて JSON で保存する。`index` は結果出力コマンドの位置。
+/// 同じフレームに効いている測長コマンド（画像の `Arc` が一致するもの）を
+/// パイプライン順に集め、グループを連結した 1 つの JSON を書き出す。
+/// 出力先は `output` テンプレート（`{dir}` / `{filename}` は画像パスから
+/// 解決）。空文字列のときは保存しない（Ok(None)）。戻り値は実際に保存したパス。
+pub fn save_result_json(doc: &Document, index: usize) -> Result<Option<PathBuf>, String> {
+    let Some((path, img_path, frame)) = result_target(doc, index)? else {
+        return Ok(None);
+    };
     let mut groups: Vec<serde_json::Value> = Vec::new();
     for overlay in doc.measure_overlays(&frame.image, None) {
         let (data, computed) = (overlay.data, &overlay.computed);
@@ -298,12 +441,81 @@ pub fn save_result_json(doc: &Document, index: usize) -> Result<Option<PathBuf>,
             }));
         }
     }
-    let json = serde_json::json!({ "filename": filename, "unit": unit, "groups": groups });
+    // 測定値の総数（CSV の表の行数と同じ）。
+    let count = groups
+        .iter()
+        .map(|g| g["values"].as_array().map_or(0, |v| v.len()))
+        .sum();
+    let meta = result_meta(&img_path, frame, count);
+    let json = serde_json::json!({
+        "filename": meta.filename,
+        "exported_at": meta.exported_at,
+        "scale_nm_per_px": meta.scale_nm_per_px,
+        "image_width": meta.image_width,
+        "image_height": meta.image_height,
+        "bit_depth": meta.bit_depth,
+        "image_extent": meta.image_extent,
+        "unit": meta.unit,
+        "measurement_count": meta.measurement_count,
+        "app": meta.app,
+        "app_version": meta.app_version,
+        "groups": groups,
+    });
     std::fs::write(
         &path,
         serde_json::to_string_pretty(&json).map_err(|e| e.to_string())?,
     )
     .map_err(|e| {
+        t!(
+            "cmd.cannot_save",
+            path = path.to_string_lossy(),
+            error = format!("{e}")
+        )
+        .into_owned()
+    })?;
+    Ok(Some(path))
+}
+
+/// 測定結果をまとめて CSV で保存する。`index` は結果出力コマンドの位置。
+/// 先頭にメタデータ行（キー, 値）、空行のあとに表
+/// （`group,number,type,value,unit` の 1 行 1 測定値）が続く。
+/// 値は表示用の丸めをしない。空文字列のときは保存しない（Ok(None)）。
+pub fn save_result_csv(doc: &Document, index: usize) -> Result<Option<PathBuf>, String> {
+    let Some((path, img_path, frame)) = result_target(doc, index)? else {
+        return Ok(None);
+    };
+    let rows = result_rows(doc, frame);
+    let meta = result_meta(&img_path, frame, rows.len());
+
+    let mut out = String::new();
+    // Excel で UTF-8 のグループ名を正しく読めるよう BOM を付ける。
+    out.push('\u{FEFF}');
+    for (key, value) in meta.csv_rows() {
+        out.push_str(&csv_escape(&key));
+        out.push(',');
+        out.push_str(&csv_escape(&value));
+        out.push('\n');
+    }
+    out.push('\n');
+    out.push_str("group,number,type,value,unit\n");
+    for row in &rows {
+        let type_name = match row.kind {
+            ToolKind::Distance => "distance",
+            ToolKind::Angle => "angle",
+            ToolKind::Boundary => "boundary",
+            ToolKind::Offset => "offset",
+        };
+        let fields = [
+            csv_escape(&row.group),
+            row.number.map(|n| n.to_string()).unwrap_or_default(),
+            type_name.to_owned(),
+            row.value.to_string(),
+            csv_escape(&row.unit),
+        ];
+        out.push_str(&fields.join(","));
+        out.push('\n');
+    }
+    std::fs::write(&path, out).map_err(|e| {
         t!(
             "cmd.cannot_save",
             path = path.to_string_lossy(),
@@ -664,8 +876,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command::Command;
+    use crate::command::{Command, ResultFormat};
     use crate::document::{Document, SourceCache};
+    use crate::frame::LengthUnit;
     use crate::measure::{MeasureData, MeasureTool};
 
     fn computed_with_tool(tool: MeasureTool, data: &MeasureData) -> ComputedMeasure {
@@ -896,6 +1109,7 @@ mod tests {
         });
         doc.push_command(Command::ExportResult {
             output: "{dir}/{filename}_result.json".to_owned(),
+            format: ResultFormat::Json,
         });
         doc.recompute(&mut SourceCache::new());
 
@@ -908,6 +1122,14 @@ mod tests {
         );
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["unit"], "px", "スケール未設定は px");
+        assert_eq!(v["scale_nm_per_px"], serde_json::Value::Null);
+        assert_eq!(v["image_width"], 4);
+        assert_eq!(v["image_height"], 4);
+        assert_eq!(v["bit_depth"], 8);
+        assert_eq!(v["measurement_count"], 3);
+        assert_eq!(v["app"], env!("CARGO_PKG_NAME"));
+        assert_eq!(v["app_version"], env!("CARGO_PKG_VERSION"));
+        assert!(v["exported_at"].as_str().is_some_and(|s| !s.is_empty()));
         assert_eq!(v["groups"][0]["type"], "distance");
         assert_eq!(v["groups"][0]["values"].as_array().unwrap().len(), 3);
         // 表示用の丸めはせず、元の精度の数値で保存される。
@@ -922,6 +1144,7 @@ mod tests {
         // 出力先が空なら保存しない。
         doc.commands.get_mut(2).expect("結果出力コマンド").command = Command::ExportResult {
             output: String::new(),
+            format: ResultFormat::Json,
         };
         assert!(save_result_json(&doc, 2).unwrap().is_none());
 
@@ -960,6 +1183,7 @@ mod tests {
         doc.push_command(Command::Measure { data });
         doc.push_command(Command::ExportResult {
             output: "{dir}/{filename}_result.json".to_owned(),
+            format: ResultFormat::Json,
         });
         doc.recompute(&mut SourceCache::new());
 
@@ -974,6 +1198,91 @@ mod tests {
         assert_eq!(values.len(), 1);
         assert!((values[0].as_f64().unwrap() - 90.0).abs() < 1e-9);
         assert!(v["groups"][1].get("angles").is_none(), "angles キーは廃止");
+        assert_eq!(v["measurement_count"], 4, "距離 3 + 角度 1");
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(&img_path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    /// 結果出力コマンドが測定結果を CSV で保存すること
+    /// （メタデータ行 → 空行 → group,number,type,value,unit の表）。
+    #[test]
+    fn save_result_csv_writes_metadata_and_rows() {
+        let dir =
+            std::env::temp_dir().join(format!("tem_measure_test_csv_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let img_path = dir.join("sample.tif");
+        image::GrayImage::from_raw(4, 4, vec![0u8; 16])
+            .unwrap()
+            .save(&img_path)
+            .unwrap();
+
+        let mut doc = Document::new("sample.tif");
+        doc.push_command(Command::InsertImage {
+            path: img_path.clone(),
+        });
+        // スケール設定: 100 px = 10 nm → 1 px = 0.1 nm。
+        doc.push_command(Command::SetScale {
+            pixels: 100.0,
+            length: 10.0,
+            unit: LengthUnit::Nanometer,
+        });
+        doc.push_command(Command::Measure {
+            data: data_with_measurements(),
+        });
+        doc.push_command(Command::ExportResult {
+            output: "{dir}/{filename}_result.csv".to_owned(),
+            format: ResultFormat::Csv,
+        });
+        doc.recompute(&mut SourceCache::new());
+
+        let path = save_result_csv(&doc, 3).unwrap().expect("保存される");
+        assert_eq!(path, dir.join("sample_result.csv"));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text
+            .lines()
+            .map(|l| l.strip_prefix('\u{FEFF}').unwrap_or(l))
+            .collect();
+        // 先頭はメタデータ行（BOM 付き）。
+        assert_eq!(lines[0], "filename,sample.tif");
+        let meta: Vec<(&str, &str)> = lines[..11]
+            .iter()
+            .map(|l| l.split_once(',').expect("キー,値 の並び: {l}"))
+            .collect();
+        assert_eq!(meta[0], ("filename", "sample.tif"));
+        assert!(meta[1].0 == "exported_at" && !meta[1].1.is_empty(), "出力日時");
+        assert_eq!(meta[2], ("scale_nm_per_px", "0.1"));
+        assert_eq!(meta[3], ("image_width", "4"));
+        assert_eq!(meta[4], ("image_height", "4"));
+        assert_eq!(meta[5], ("bit_depth", "8"));
+        assert!(meta[6].0 == "image_extent" && meta[6].1.ends_with("nm"));
+        assert_eq!(meta[7], ("unit", "nm"));
+        assert_eq!(meta[8], ("measurement_count", "3"));
+        assert_eq!(meta[9], ("app", env!("CARGO_PKG_NAME")));
+        assert_eq!(meta[10], ("app_version", env!("CARGO_PKG_VERSION")));
+        // 空行のあとに表のヘッダと 1 行 1 測定値。
+        let header = lines.iter().position(|l| l.is_empty()).expect("空行") + 1;
+        assert_eq!(lines[header], "group,number,type,value,unit");
+        assert_eq!(lines.len(), header + 1 + 3, "3 測定値ぶんの行");
+        let row1: Vec<&str> = lines[header + 1].split(',').collect();
+        assert_eq!(row1.len(), 5, "5 列: {row1:?}");
+        assert!(!row1[0].is_empty(), "グループ名が入る: {row1:?}");
+        assert_eq!(row1[1], "1", "# の後ろの番号");
+        assert_eq!(row1[2], "distance");
+        let value: f64 = row1[3].parse().expect("数値");
+        assert!((value - 4.0).abs() < 1e-9, "40 px * 0.1 nm/px = 4.0: {value}");
+        assert_eq!(row1[4], "nm");
+        let row3: Vec<&str> = lines[header + 3].split(',').collect();
+        assert_eq!(row3[1], "3", "通し番号が続く");
+        assert!((row3[3].parse::<f64>().unwrap() - 4.0).abs() < 1e-9);
+
+        // 出力先が空なら保存しない。
+        doc.commands.get_mut(3).expect("結果出力コマンド").command = Command::ExportResult {
+            output: String::new(),
+            format: ResultFormat::Csv,
+        };
+        assert!(save_result_csv(&doc, 3).unwrap().is_none());
 
         std::fs::remove_file(&path).unwrap();
         std::fs::remove_file(&img_path).unwrap();
