@@ -1,5 +1,5 @@
 app:
-  title: "tem_measure - TEM 画像解析"
+  title: "tem_measurer - TEM 画像解析"
 
 menu:
   file: "ファイル"
@@ -36,6 +36,7 @@ menu:
   reload_hover: "ディスク上の画像が更新されたときに使います"
   help: "ヘルプ"
   how_to: "操作方法"
+  association: "ファイル関連付け..."
   about: "バージョン情報"
 
 tab:
@@ -84,7 +85,8 @@ dialogs:
   filter_image: "画像"
   title_insert: "画像を挿入"
   title_change_file: "読み込むファイルを変更"
-  filter_history: "コマンド履歴 (JSON)"
+  filter_history: "コマンド履歴 (.tmrjson)"
+  filter_reg: "レジストリ ファイル"
   title_save_history: "コマンド履歴を保存"
   title_open_history: "コマンド履歴を開く"
   title_apply_history: "コマンド履歴を現在の画像に適用"
@@ -93,6 +95,7 @@ dialogs:
 help:
   title: "操作方法"
   drag_drop: "・画像表示領域にファイルをドラッグ&ドロップすると画像を挿入します。"
+  history_files: "・コマンド履歴は .tmrjson ファイル（中身は JSON）に保存します。.tmrjson のダブルクリックやドラッグ&ドロップで履歴を開けます（関連付けの登録は ヘルプ → ファイル関連付け）。"
   zoom: "・マウスホイールで拡大縮小（カーソル位置を中心）。"
   pan: "・右ドラッグでパン。"
   reopen_params: "・右のリストの行をダブルクリックすると、その処理のパラメータを再編集できます。"
@@ -129,6 +132,18 @@ about:
   title: "バージョン情報"
   description: "TEM 画像の解析用ツール"
   bit_depth: "内部処理は 16bit グレースケールで行います。"
+
+assoc:
+  title: "ファイルの関連付け"
+  intro: "アプリはレジストリを書き換えません。.tmrjson ファイルをダブルクリックで開けるようにするには、次の手順で関連付けを登録してください。"
+  step1: "1. 「関連付け用 .reg ファイルを保存...」で .reg ファイルを保存します。"
+  step2: "2. 保存した .reg ファイルをエクスプローラでダブルクリックし、レジストリへの登録を確定します。"
+  step3: "3. 登録後は .tmrjson ファイルをダブルクリックすると、コマンド履歴を開いた状態で tem_measurer が起動します。"
+  dev_warning: "注意: 現在は開発ビルドから登録しています。配布版の exe を置いた状態で登録し直してください。"
+  exe_label: "登録される実行ファイル:"
+  exe_unavailable: "実行ファイルのパスを取得できませんでした。"
+  save_reg: "関連付け用 .reg ファイルを保存..."
+  close: "閉じる"
 
 tabswitch:
   title: "タブの切り替え"

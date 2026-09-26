@@ -1,5 +1,5 @@
 app:
-  title: "tem_measure - TEM 이미지 분석"
+  title: "tem_measurer - TEM 이미지 분석"
 
 menu:
   file: "파일"
@@ -36,6 +36,7 @@ menu:
   reload_hover: "디스크의 이미지가 갱신되었을 때 사용합니다"
   help: "도움말"
   how_to: "사용 방법"
+  association: "파일 연결..."
   about: "버전 정보"
 
 tab:
@@ -84,7 +85,8 @@ dialogs:
   filter_image: "이미지"
   title_insert: "이미지 삽입"
   title_change_file: "읽을 파일 변경"
-  filter_history: "명령 기록 (JSON)"
+  filter_history: "명령 기록 (.tmrjson)"
+  filter_reg: "레지스트리 파일"
   title_save_history: "명령 기록 저장"
   title_open_history: "명령 기록 열기"
   title_apply_history: "명령 기록을 현재 이미지에 적용"
@@ -93,6 +95,7 @@ dialogs:
 help:
   title: "사용 방법"
   drag_drop: "・이미지 표시 영역에 파일을 끌어다 놓으면 이미지가 삽입됩니다."
+  history_files: "・명령 기록은 .tmrjson 파일(내용은 JSON)로 저장됩니다. .tmrjson을 더블클릭하거나 창에 끌어다 놓으면 기록을 열 수 있습니다(연결 등록은 도움말 → 파일 연결)."
   zoom: "・마우스 휠로 확대/축소(커서 위치가 중심)."
   pan: "・오른쪽 드래그로 팬."
   reopen_params: "・오른쪽 목록의 행을 더블클릭하면 그 처리의 파라미터를 다시 편집할 수 있습니다."
@@ -129,6 +132,18 @@ about:
   title: "버전 정보"
   description: "TEM 이미지 해석용 도구"
   bit_depth: "내부 처리는 16bit 그레이스케일로 수행합니다."
+
+assoc:
+  title: "파일 연결"
+  intro: "앱은 레지스트리를 변경하지 않습니다. .tmrjson 파일을 더블클릭으로 열려면 다음 순서로 연결을 등록하세요."
+  step1: "1. 「연결용 .reg 파일 저장...」으로 .reg 파일을 저장합니다."
+  step2: "2. 저장한 .reg 파일을 탐색기에서 더블클릭하여 레지스트리 등록을 확인합니다."
+  step3: "3. 등록 후에는 .tmrjson 파일을 더블클릭하면 명령 기록을 연 상태로 tem_measurer가 시작됩니다."
+  dev_warning: "주의: 현재 개발 빌드에서 등록하고 있습니다. 배포판 exe로 다시 등록하세요."
+  exe_label: "등록할 실행 파일:"
+  exe_unavailable: "실행 파일 경로를 가져올 수 없습니다."
+  save_reg: "연결용 .reg 파일 저장..."
+  close: "닫기"
 
 tabswitch:
   title: "탭 전환"

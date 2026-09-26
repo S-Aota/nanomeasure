@@ -1,5 +1,5 @@
 app:
-  title: "tem_measure - TEM 图像分析"
+  title: "tem_measurer - TEM 图像分析"
 
 menu:
   file: "文件"
@@ -36,6 +36,7 @@ menu:
   reload_hover: "当磁盘上的图像已更新时使用"
   help: "帮助"
   how_to: "操作方法"
+  association: "文件关联..."
   about: "版本信息"
 
 tab:
@@ -84,7 +85,8 @@ dialogs:
   filter_image: "图像"
   title_insert: "插入图像"
   title_change_file: "更改要读取的文件"
-  filter_history: "命令历史 (JSON)"
+  filter_history: "命令历史 (.tmrjson)"
+  filter_reg: "注册表文件"
   title_save_history: "保存命令历史"
   title_open_history: "打开命令历史"
   title_apply_history: "将命令历史应用到当前图像"
@@ -93,6 +95,7 @@ dialogs:
 help:
   title: "操作方法"
   drag_drop: "・将文件拖放到图像显示区域即可插入图像。"
+  history_files: "・命令历史保存为 .tmrjson 文件（内容为 JSON）。双击 .tmrjson 或将其拖放到窗口中即可打开历史记录（关联的注册方法见 帮助 → 文件关联）。"
   zoom: "・使用鼠标滚轮放大缩小（以光标位置为中心）。"
   pan: "・右键拖动平移。"
   reopen_params: "・双击右侧列表中的行，可重新编辑该处理的参数。"
@@ -129,6 +132,18 @@ about:
   title: "版本信息"
   description: "TEM 图像分析工具"
   bit_depth: "内部处理以 16bit 灰度进行。"
+
+assoc:
+  title: "文件关联"
+  intro: "本应用不会修改注册表。要通过双击打开 .tmrjson 文件，请按以下步骤注册关联。"
+  step1: "1. 点击「保存关联用 .reg 文件...」保存 .reg 文件。"
+  step2: "2. 在资源管理器中双击保存的 .reg 文件，确认注册表注册。"
+  step3: "3. 注册后，双击 .tmrjson 文件即可启动 tem_measurer 并打开命令历史。"
+  dev_warning: "注意: 当前是从开发版注册。请使用已安装的发布版 exe 重新注册。"
+  exe_label: "要注册的可执行文件:"
+  exe_unavailable: "无法获取可执行文件路径。"
+  save_reg: "保存关联用 .reg 文件..."
+  close: "关闭"
 
 tabswitch:
   title: "切换标签页"

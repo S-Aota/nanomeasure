@@ -82,6 +82,8 @@ pub struct TemApp {
     settings_dialog: SettingsDialog,
     help_open: bool,
     about_open: bool,
+    /// .tmrjson ファイル関連付けの案内ダイアログ。
+    assoc_open: bool,
     /// 編集中にタブ切り替えを試みたときの警告。編集中なら切り替えず、
     /// ポップアップを出して操作を無効化する。
     tab_switch_warning: Option<usize>,
@@ -116,6 +118,7 @@ impl TemApp {
             settings_dialog: SettingsDialog::default(),
             help_open: false,
             about_open: false,
+            assoc_open: false,
             tab_switch_warning: None,
             status: t!("status.initial").into_owned(),
             error: None,
@@ -342,6 +345,10 @@ impl TemApp {
                 ui.menu_button(t!("menu.help").as_ref(), |ui| {
                     if ui.button(t!("menu.how_to").as_ref()).clicked() {
                         self.help_open = true;
+                        ui.close();
+                    }
+                    if ui.button(t!("menu.association").as_ref()).clicked() {
+                        self.assoc_open = true;
                         ui.close();
                     }
                     if ui.button(t!("menu.about").as_ref()).clicked() {
@@ -679,6 +686,7 @@ impl TemApp {
             .default_width(700.0)
             .show(ctx, |ui| {
                 ui.label(t!("help.drag_drop").as_ref());
+                ui.label(t!("help.history_files").as_ref());
                 ui.label(t!("help.zoom").as_ref());
                 ui.label(t!("help.pan").as_ref());
                 ui.label(t!("help.reopen_params").as_ref());
@@ -722,11 +730,61 @@ impl TemApp {
             .open(&mut about_open)
             .resizable(false)
             .show(ctx, |ui| {
-                ui.label(format!("tem_measure {}", env!("CARGO_PKG_VERSION")));
+                ui.label(format!("tem_measurer {}", env!("CARGO_PKG_VERSION")));
                 ui.label(t!("about.description").as_ref());
                 ui.label(t!("about.bit_depth").as_ref());
             });
         self.about_open = about_open;
+
+        let mut assoc_open = self.assoc_open;
+        let mut save_requested = false;
+        let mut close_requested = false;
+        egui::Window::new(t!("assoc.title").as_ref())
+            .open(&mut assoc_open)
+            .resizable(false)
+            .default_width(560.0)
+            .show(ctx, |ui| {
+                ui.label(t!("assoc.intro").as_ref());
+                ui.add_space(4.0);
+                ui.label(t!("assoc.step1").as_ref());
+                ui.label(t!("assoc.step2").as_ref());
+                ui.label(t!("assoc.step3").as_ref());
+                if cfg!(debug_assertions) {
+                    ui.add_space(4.0);
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 170, 90),
+                        t!("assoc.dev_warning").as_ref(),
+                    );
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(t!("assoc.exe_label").as_ref());
+                    match std::env::current_exe() {
+                        Ok(exe) => {
+                            ui.monospace(exe.to_string_lossy());
+                        }
+                        Err(_) => {
+                            ui.weak(t!("assoc.exe_unavailable").as_ref());
+                        }
+                    }
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button(t!("assoc.save_reg").as_ref()).clicked() {
+                        save_requested = true;
+                    }
+                    if ui.button(t!("assoc.close").as_ref()).clicked() {
+                        close_requested = true;
+                    }
+                });
+            });
+        self.assoc_open = assoc_open;
+        if close_requested {
+            self.assoc_open = false;
+        }
+        if save_requested {
+            self.save_assoc_reg();
+        }
     }
 
     // ------------------------------------------------------- アクション処理
@@ -953,10 +1011,7 @@ impl TemApp {
 
     /// 起動引数やドロップで渡されたパスを、拡張子で振り分けて開く。
     fn open_path(&mut self, path: PathBuf) {
-        let is_history = path
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("json"));
-        if is_history {
+        if is_history_file(&path) {
             self.open_history_path(path);
         } else {
             self.insert_image(path);
@@ -1048,8 +1103,8 @@ impl TemApp {
 
     fn save_history(&mut self) {
         let Some(path) = rfd::FileDialog::new()
-            .add_filter(t!("dialogs.filter_history").as_ref(), &["json"])
-            .set_file_name("history.json")
+            .add_filter(t!("dialogs.filter_history").as_ref(), &["tmrjson"])
+            .set_file_name("history.tmrjson")
             .set_title(t!("dialogs.title_save_history").as_ref())
             .save_file()
         else {
@@ -1065,9 +1120,45 @@ impl TemApp {
         }
     }
 
+    /// ファイル関連付け用の .reg を rfd で保存する。実行ファイルのパスは
+    /// その場で取得して埋め込む（アプリ自身はレジストリを書き換えない）。
+    fn save_assoc_reg(&mut self) {
+        let exe = match std::env::current_exe() {
+            Ok(path) => path,
+            Err(_) => {
+                self.error = Some(t!("assoc.exe_unavailable").into_owned());
+                return;
+            }
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter(t!("dialogs.filter_reg").as_ref(), &["reg"])
+            .set_file_name("tem_measurer_association.reg")
+            .set_title(t!("assoc.title").as_ref())
+            .save_file()
+        else {
+            return;
+        };
+        match std::fs::write(&path, crate::assoc::reg_file_bytes(&exe)) {
+            Ok(()) => {
+                self.error = None;
+                self.status = t!("status.saved_to", path = file_label(&path)).into_owned();
+            }
+            Err(e) => {
+                self.error = Some(
+                    t!(
+                        "cmd.cannot_save",
+                        path = path.to_string_lossy(),
+                        error = format!("{e}")
+                    )
+                    .into_owned(),
+                );
+            }
+        }
+    }
+
     fn open_history(&mut self) {
         let Some(path) = rfd::FileDialog::new()
-            .add_filter(t!("dialogs.filter_history").as_ref(), &["json"])
+            .add_filter(t!("dialogs.filter_history").as_ref(), &["tmrjson"])
             .set_title(t!("dialogs.title_open_history").as_ref())
             .pick_file()
         else {
@@ -1112,7 +1203,7 @@ impl TemApp {
 
     fn apply_history(&mut self) {
         let Some(path) = rfd::FileDialog::new()
-            .add_filter(t!("dialogs.filter_history").as_ref(), &["json"])
+            .add_filter(t!("dialogs.filter_history").as_ref(), &["tmrjson"])
             .set_title(t!("dialogs.title_apply_history").as_ref())
             .pick_file()
         else {
@@ -1368,6 +1459,12 @@ fn file_label(path: &std::path::Path) -> String {
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
+/// コマンド履歴ファイル（.tmrjson）かどうか。
+fn is_history_file(path: &std::path::Path) -> bool {
+    path.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("tmrjson"))
+}
+
 #[cfg(test)]
 mod i18n_tests {
     use rust_i18n::t;
@@ -1380,8 +1477,10 @@ mod i18n_tests {
             rust_i18n::set_locale(locale);
             for key in [
                 "menu.file",
+                "menu.association",
                 "panel.row_hover",
                 "help.measure_duplicate",
+                "help.history_files",
                 "cmd.category.input",
                 "cmd.measure",
                 "dlg.ok",
@@ -1396,13 +1495,40 @@ mod i18n_tests {
                 "exp.no_image",
                 "view.drop_hint",
                 "fonts.not_found",
+                "dialogs.filter_reg",
+                "assoc.title",
+                "assoc.intro",
+                "assoc.step1",
+                "assoc.step2",
+                "assoc.step3",
+                "assoc.dev_warning",
+                "assoc.exe_label",
+                "assoc.exe_unavailable",
+                "assoc.save_reg",
+                "assoc.close",
             ] {
                 assert_ne!(t!(key).as_ref(), key, "locale {locale}: missing {key}");
             }
             let copied = t!("status.copied_count", count = 3).into_owned();
             assert!(!copied.contains("status.copied_count"));
+            // 履歴フィルタは .tmrjson 表記（旧 .json への後退防止）。
+            let filter = t!("dialogs.filter_history").into_owned();
+            assert!(
+                filter.contains("tmrjson"),
+                "locale {locale}: filter_history に .tmrjson が入ること: {filter}"
+            );
         }
         // 他のテストに影響しないよう、既定の言語へ戻す。
         rust_i18n::set_locale(crate::settings::Language::default().code());
+    }
+
+    /// 履歴ファイル判定は .tmrjson のみ（大文字小文字は無視）。
+    #[test]
+    fn is_history_file_matches_tmrjson_only() {
+        assert!(super::is_history_file(std::path::Path::new("a.tmrjson")));
+        assert!(super::is_history_file(std::path::Path::new("A.TMRJSON")));
+        assert!(!super::is_history_file(std::path::Path::new("a.json")));
+        assert!(!super::is_history_file(std::path::Path::new("a.tif")));
+        assert!(!super::is_history_file(std::path::Path::new("noext")));
     }
 }

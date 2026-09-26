@@ -997,7 +997,7 @@ mod tests {
             data: vec![0, 100, 200, 255],
         };
         let out = render8(&img, &[], 1.0, 5);
-        let dir = std::env::temp_dir().join(format!("tem_measure_8bit_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tem_measurer_8bit_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("out.png");
         save8(out, &path).expect("保存できる");
@@ -1042,7 +1042,7 @@ mod tests {
         let computed = data.compute(&img, None);
         let out = render(&img, &[(&computed, None)], 1.5, 5);
 
-        let dir = std::env::temp_dir().join(format!("tem_measure_smoke_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tem_measurer_smoke_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         for (name, tolerance) in [("out.tif", 32i32), ("out.png", 32), ("out.jpg", 5000)] {
             let path = dir.join(name);
@@ -1092,7 +1092,7 @@ mod tests {
     /// 結果出力コマンドが測長結果を JSON で保存すること。
     #[test]
     fn save_result_json_writes_filename_first() {
-        let dir = std::env::temp_dir().join(format!("tem_measure_test_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tem_measurer_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let img_path = dir.join("sample.tif");
         image::GrayImage::from_raw(4, 4, vec![0u8; 16])
@@ -1157,7 +1157,7 @@ mod tests {
     #[test]
     fn save_result_json_outputs_angle_group() {
         let dir =
-            std::env::temp_dir().join(format!("tem_measure_test_angle_{}", std::process::id()));
+            std::env::temp_dir().join(format!("tem_measurer_test_angle_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let img_path = dir.join("sample.tif");
         image::GrayImage::from_raw(4, 4, vec![0u8; 16])
@@ -1210,7 +1210,7 @@ mod tests {
     #[test]
     fn save_result_csv_writes_metadata_and_rows() {
         let dir =
-            std::env::temp_dir().join(format!("tem_measure_test_csv_{}", std::process::id()));
+            std::env::temp_dir().join(format!("tem_measurer_test_csv_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let img_path = dir.join("sample.tif");
         image::GrayImage::from_raw(4, 4, vec![0u8; 16])

@@ -4243,7 +4243,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tem_measure"
+name = "tem_measurer"
 version = "1.0.0"
 dependencies = [
  "ab_glyph",
